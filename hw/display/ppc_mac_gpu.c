@@ -57,9 +57,9 @@ uint32_t uninorth_get_agp_gart_gen(void);
  * buffers): in the guest's byte order, big-endian for a PowerPC guest,
  * little-endian for an x86 one.
  */
-static inline uint32_t gpu_guest_dw(uint32_t raw)
+static inline uint32_t gpu_guest_dw(PPCMacGPUState *s, uint32_t raw)
 {
-    return target_words_bigendian() ? be32_to_cpu(raw) : le32_to_cpu(raw);
+    return s->swap ? be32_to_cpu(raw) : le32_to_cpu(raw);
 }
 
 /* The page table entry the last successful GART translation read (address and
@@ -1332,6 +1332,9 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     uint32_t h_total_disp = s->regs.crtc_h_total_disp;
     uint32_t v_total_disp = s->regs.crtc_v_total_disp;
     uint32_t pitch = s->regs.crtc_pitch;
+    /* VRAM pixel byte order: a big-endian guest's XRGB is [X, R, G, B] in memory */
+    const pixman_format_code_t fmt32 = s->swap ? PIXMAN_BE_x8r8g8b8 : PIXMAN_x8r8g8b8;
+    const pixman_format_code_t fmt24 = s->swap ? PIXMAN_BE_r8g8b8 : PIXMAN_r8g8b8;
 
     /* Check if CRTC is enabled in extended mode */
     if (!(crtc_gen & R200_CRTC_EN) && !(crtc_gen & R200_CRTC_EXT_DISP_EN)) {
@@ -1342,7 +1345,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
             m->bpp = 32;
             m->stride = 640 * 4;
             m->offset = 0;
-            m->format = PIXMAN_BE_x8r8g8b8;
+            m->format = fmt32;
         }
         m->crtc_ext = false;
         return false;
@@ -1368,7 +1371,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     case R200_CRTC_PIX_WIDTH_8BPP:
         m->bpp = 8;
         /* 8bpp uses palette; for surface we expand to 32bpp */
-        m->format = PIXMAN_BE_x8r8g8b8;
+        m->format = fmt32;
         break;
     case R200_CRTC_PIX_WIDTH_15BPP:
         m->bpp = 15;
@@ -1380,7 +1383,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         break;
     case R200_CRTC_PIX_WIDTH_24BPP:
         m->bpp = 24;
-        m->format = PIXMAN_BE_r8g8b8;
+        m->format = fmt24;
         break;
     case R200_CRTC_PIX_WIDTH_32BPP:
         m->bpp = 32;
@@ -1392,11 +1395,11 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
          *
          * For now, we assume big-endian VRAM from the PPC guest.
          */
-        m->format = PIXMAN_BE_x8r8g8b8;
+        m->format = fmt32;
         break;
     default:
         m->bpp = 32;
-        m->format = PIXMAN_BE_x8r8g8b8;
+        m->format = fmt32;
         break;
     }
 
@@ -1505,10 +1508,10 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
  * expecting LE XRGB: bytes [B, G, R, X] in memory.
  * A bswap32 per pixel converts between the two.
  */
-static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src,
-                                     int width)
+static void ppc_mac_gpu_bswap_line32(bool swap, uint32_t *dst,
+                                     const uint32_t *src, int width)
 {
-    if (!target_words_bigendian()) {
+    if (!swap) {
         /* A little-endian (x86) guest writes XRGB as [B, G, R, X] already. */
         memcpy(dst, src, (size_t)width * 4);
         return;
@@ -1687,7 +1690,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
                 uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
                 for (uint32_t x = 0; x < width; x++) {
-                    uint32_t v = (sp[2 * x] << 8) | sp[2 * x + 1];
+                    uint32_t v = s->swap ? (uint32_t)((sp[2 * x] << 8) | sp[2 * x + 1])
+                                         : (uint32_t)(sp[2 * x] | (sp[2 * x + 1] << 8));
                     uint32_t r, g, b;
                     if (is565) {
                         r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31;
@@ -1980,7 +1984,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     uint32_t *tmp = g_new(uint32_t, width);
     for (y = 0; y < (int)height; y++) {
         uint32_t *row = dst + (size_t)y * stride_u32;
-        ppc_mac_gpu_bswap_line32(tmp, src + (size_t)y * stride_u32, width);
+        ppc_mac_gpu_bswap_line32(s->swap, tmp, src + (size_t)y * stride_u32, width);
         if (surface_replaced || memcmp(row, tmp, (size_t)width * 4)) {
             memcpy(row, tmp, (size_t)width * 4);
             if (lo < 0) {
@@ -3658,7 +3662,7 @@ static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
 
         /* PM4 commands are written in the guest CPU's byte order (big-endian
          * for PowerPC, little-endian for x86); convert for parsing. */
-        buf[i] = gpu_guest_dw(raw);
+        buf[i] = gpu_guest_dw(s, raw);
     }
     return buf;
 }
@@ -4285,7 +4289,7 @@ static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
                                 uint64_t addr, uint32_t color, uint32_t bpp)
 {
     if (bpp == 4) {
-        mc_vram_write32(s, vram, addr, be32_to_cpu(color));
+        mc_vram_write32(s, vram, addr, s->swap ? be32_to_cpu(color) : color);
     } else if (addr + bpp <= s->vram_size) {
         if (bpp == 2) {
             stw_be_p(vram + addr, color);
@@ -5626,7 +5630,7 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
      * flush is a no-op there), so a hit is trusted only if the entry it came
      * from still holds the value it had when the translation was made.
      */
-    bool ppc = target_words_bigendian();
+    bool ppc = s->swap;
     uint32_t page = gpu_addr >> 12;
     uint32_t i = page & (ARRAY_SIZE(r200_agp_tc) - 1);
     if (ppc) {
@@ -7482,7 +7486,7 @@ static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
              * but GPU (and our renderer) expects LE floats.
              * The AGP bridge normally does this swap in hardware.
              */
-            for (uint32_t dw = 0; dw < total_dw; dw++) {
+            for (uint32_t dw = 0; dw < total_dw && s->swap; dw++) {
                 gart_vb_data[dw] = bswap32(gart_vb_data[dw]);
             }
 
@@ -9014,7 +9018,7 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
         }
 
         /* Ring buffer data is written in the guest CPU's byte order */
-        rb_data[i] = gpu_guest_dw(raw);
+        rb_data[i] = gpu_guest_dw(s, raw);
     }
 
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
@@ -9470,7 +9474,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     case R200_MC_STATUS:
         /* Report memory controller idle */
         val = R200_MC_IDLE;
-        if (s->r300 && !target_words_bigendian()) {
+        if (s->r300 && !s->swap) {
             /*
              * R300's idle bit is bit 4, not the older chips' bit 2.  Linux's
              * radeon (r300_mc_wait_for_idle) and the X radeon DDX (the wait in
@@ -10412,7 +10416,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_MC_AGP_LOCATION:
         s->regs.mc_agp_location = val;
-        if (!target_words_bigendian()) {
+        if (!s->swap) {
             r200_agp_tc_flush();        /* the aperture moved: translations differ */
         }
         break;
@@ -10924,28 +10928,28 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* GART (AGP Intelligent Controller) registers */
     case R200_AIC_CTRL:           /* 0x01D0 */
         s->regs.aic_ctrl = val;
-        if (!target_words_bigendian()) {
+        if (!s->swap) {
             r200_agp_tc_flush();        /* the aperture moved: translations differ */
         }
         gpu_debug_log("GART AIC_CTRL=0x%x (enabled=%d)", val, val & 1);
         break;
     case R200_AIC_PT_BASE:        /* 0x01D8 */
         s->regs.aic_pt_base = val;
-        if (!target_words_bigendian()) {
+        if (!s->swap) {
             r200_agp_tc_flush();        /* the aperture moved: translations differ */
         }
         gpu_debug_log("GART PT_BASE=0x%x", val);
         break;
     case R200_AIC_LO_ADDR:        /* 0x01DC */
         s->regs.aic_lo_addr = val;
-        if (!target_words_bigendian()) {
+        if (!s->swap) {
             r200_agp_tc_flush();        /* the aperture moved: translations differ */
         }
         gpu_debug_log("GART LO_ADDR=0x%x", val);
         break;
     case R200_AIC_HI_ADDR:        /* 0x01E0 */
         s->regs.aic_hi_addr = val;
-        if (!target_words_bigendian()) {
+        if (!s->swap) {
             r200_agp_tc_flush();        /* the aperture moved: translations differ */
         }
         gpu_debug_log("GART HI_ADDR=0x%x", val);
@@ -11750,6 +11754,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
     Object *obj = OBJECT(dev);
 
+    s->swap = s->byte_swap_prop == ON_OFF_AUTO_ON ||
+              (s->byte_swap_prop == ON_OFF_AUTO_AUTO && target_words_bigendian());
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
     s->r300 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9700) != NULL;
     s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
@@ -12262,6 +12268,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
+    DEFINE_PROP_ON_OFF_AUTO("byte-swap", PPCMacGPUState, byte_swap_prop, ON_OFF_AUTO_AUTO),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
     DEFINE_PROP_STRING("renderer", PPCMacGPUState, renderer_name),
 };

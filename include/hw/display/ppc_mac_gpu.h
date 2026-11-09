@@ -18,6 +18,7 @@
 #include "hw/display/i2c-ddc.h"
 #include "ui/console.h"
 #include "qom/object.h"
+#include "qapi/qapi-types-common.h"
 
 /* Defined in hw/display/ppc_mac_gpu_renderer.h, private to the device. */
 struct R200Vertex;
@@ -820,6 +821,17 @@ struct PPCMacGPUState {
     uint32_t hwc_pix[64 * 64];
     uint32_t hwc_w, hwc_h, hwc_idx;
     bool host_aspect_modes;       /* EDID offers the patched NDRV's 1.545 modes */
+    /*
+     * The guest CPU's byte order, as the model has to treat it: the CP ring,
+     * indirect buffers, the 32bpp scanout, pixel formats, the 2D fill colour
+     * and the old vertex path all follow it.  Property "byte-swap": "on" treats
+     * the guest as big-endian (PowerPC: words are swapped), "off" as
+     * little-endian (x86: no swapping), "auto" (default) by the machine.
+     * Behaviour driven by the card's own swap registers (SURFACE endian, the
+     * second VRAM aperture) is not affected.
+     */
+    OnOffAuto byte_swap_prop;
+    bool swap;                    /* resolved at realize */
     int32_t hwc_x, hwc_y;
     bool hwc_visible;
     /* A woken machine's window has never been told what the pointer looks
