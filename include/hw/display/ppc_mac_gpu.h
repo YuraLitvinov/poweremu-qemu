@@ -833,6 +833,9 @@ struct PPCMacGPUState {
      * Behaviour driven by the card's own swap registers (SURFACE endian, the
      * second VRAM aperture) is not affected.
      */
+    bool legacy_vga;                /* property: standard VGA registers and text modes */
+    bool vga_shown;                 /* the legacy VGA is what the screen shows */
+    struct VGACommonState *vga;
     OnOffAuto byte_swap_prop;
     bool swap;                    /* resolved at realize */
     int32_t hwc_x, hwc_y;

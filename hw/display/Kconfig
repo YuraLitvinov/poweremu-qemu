@@ -154,6 +154,7 @@ config PPC_MAC_GPU
     bool
     default y if PCI_DEVICES
     depends on PCI
+    select VGA
 
 config POWEREMU_GPU
     bool

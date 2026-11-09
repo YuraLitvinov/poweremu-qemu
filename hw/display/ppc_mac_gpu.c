@@ -38,6 +38,7 @@
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 #include "exec/tswap.h"
+#include "vga_int.h"
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_renderer.h"
@@ -1524,6 +1525,27 @@ static void ppc_mac_gpu_bswap_line32(bool swap, uint32_t *dst,
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
+
+    if (s->legacy_vga) {
+        if (!(s->regs.crtc_gen_cntl & R200_CRTC_EXT_DISP_EN)) {
+            if (!s->vga_shown) {
+                /* back to VGA: it must redraw into a fresh surface */
+                s->vga_shown = true;
+                s->vga->graphic_mode = -1;
+                s->vga->last_width = s->vga->last_height = 0;
+                s->vga->last_scr_width = s->vga->last_scr_height = 0;
+                s->vga->last_depth = 0;
+            }
+            s->vga->hw_ops->gfx_update(s->vga);
+            return;
+        }
+        if (s->vga_shown) {
+            /* the card's own scanout takes over: make a new surface for it */
+            s->vga_shown = false;
+            s->disp.width = s->disp.height = s->disp.stride = 0;
+            s->display_invalid = true;
+        }
+    }
 
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
@@ -12074,6 +12096,11 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
             (uint16_t)(s->vram_size >> 16);
     }
 
+    if (s->legacy_vga) {
+        s->regs.crtc_gen_cntl = 0;      /* VGA mode until a driver sets one */
+        s->vga_shown = false;
+        vga_common_reset(s->vga);
+    }
     s->mode = PPC_MAC_GPU_MODE_EXT;
     s->display_invalid = true;
 
@@ -12162,6 +12189,20 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     /* Create graphics console */
     s->con = graphic_console_init(DEVICE(dev), 0,
                                   &ppc_mac_gpu_gfx_ops, s);
+
+    if (s->legacy_vga) {
+        /* The standard VGA core: ports 3b0-3df, the 0xa0000 window and the text
+         * and planar modes, drawn into this console while the guest has not
+         * switched the card's own CRTC to an extended mode. */
+        s->vga = g_new0(VGACommonState, 1);
+        s->vga->vram_size_mb = 8;
+        if (!vga_common_init(s->vga, OBJECT(s), errp)) {
+            return;
+        }
+        vga_init(s->vga, OBJECT(s), pci_address_space(dev),
+                 pci_address_space_io(dev), true);
+        s->vga->con = s->con;
+    }
 
     /*
      * The renderer ("renderer" property).  Unset means Metal on macOS,
@@ -12306,8 +12347,10 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                 gpu_debug_log("BIOS ROM load failed: %s", path);
             }
             g_free(resolved);
-        } else if (dev->romfile && dev->romfile[0]) {
-            /* Fallback: copy romfile to VRAM if no separate biosrom */
+        } else if (dev->romfile && dev->romfile[0] && s->swap) {
+            /* Fallback: copy romfile to VRAM if no separate biosrom (PowerMac
+             * only: an x86 guest would see the ROM as pixels at the top of the
+             * screen) */
             gchar *rom_data = NULL;
             gsize rom_len = 0;
             char *rom_path = qemu_find_file(QEMU_FILE_TYPE_BIOS, dev->romfile);
@@ -12646,6 +12689,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
+    DEFINE_PROP_BOOL("legacy-vga", PPCMacGPUState, legacy_vga, false),
     DEFINE_PROP_ON_OFF_AUTO("byte-swap", PPCMacGPUState, byte_swap_prop, ON_OFF_AUTO_AUTO),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
     DEFINE_PROP_STRING("renderer", PPCMacGPUState, renderer_name),
