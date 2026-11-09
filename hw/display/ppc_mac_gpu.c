@@ -10103,6 +10103,10 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     case R200_CP_RB_WPTR:
         val = s->regs.cp_rb_wptr;
         break;
+    case R200_CP_RB_RPTR_ADDR:
+        /* Linux reads this back to place SCRATCH_ADDR; a card returns what was written. */
+        val = s->swap ? 0 : s->regs.cp_rb_rptr_addr;
+        break;
     case R200_CP_ME_CNTL:
         val = s->regs.cp_me_cntl;
         break;
