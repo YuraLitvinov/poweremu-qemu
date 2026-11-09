@@ -8,9 +8,8 @@
  * (base 0) makes the model fall back to the card's own PCI GART (AIC_PT_BASE),
  * which is what a Linux guest programs.
  *
- * Note: the generation never changes here, so the model's AGP page cache is
- * not flushed when a guest rewrites its GART; the card's own GART flush
- * (AIC registers) would have to bump it.
+ * The generation never changes here: for a little-endian guest the model does
+ * not cache GART translations at all (see r200_agp_page).
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  */

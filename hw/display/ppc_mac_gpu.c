@@ -62,6 +62,12 @@ static inline uint32_t gpu_guest_dw(uint32_t raw)
     return target_words_bigendian() ? be32_to_cpu(raw) : le32_to_cpu(raw);
 }
 
+/* The page table entry the last successful GART translation read (address and
+ * raw value): the AGP page cache of a little-endian guest checks it again before
+ * trusting a cached translation. */
+static hwaddr r200_last_pte_addr;
+static uint32_t r200_last_pte_raw;
+
 #ifndef CONFIG_DARWIN
 /*
  * g_frame_tracker (declared extern in ppc_mac_gpu_surface.h) is defined in
@@ -3492,6 +3498,8 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
     if (r != MEMTX_OK) {
         return false;
     }
+    r200_last_pte_addr = pte_addr;
+    r200_last_pte_raw = pte_raw;
 
     /* The Mac OS X AGP GART driver writes PTEs as little-endian physical
      * page addresses (GPU-native LE format). The PCI bridge performs byte
@@ -3581,6 +3589,8 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
     if (r != MEMTX_OK) {
         return false;
     }
+    r200_last_pte_addr = pte_addr;
+    r200_last_pte_raw = pte_raw;
 
     /*
      * PTE endianness: GART PTEs are stored in little-endian format.
@@ -5593,7 +5603,7 @@ static inline float r200_f32(uint32_t bits)
  * invalidates the GART after changing it, as real hardware requires) and at
  * every fence.
  */
-static struct { uint32_t tag; uint8_t *host; } r200_agp_tc[1024];
+static struct { uint32_t tag; uint8_t *host; hwaddr pte; uint32_t pte_raw; } r200_agp_tc[1024];
 static uint32_t r200_agp_tc_gen;
 
 static void r200_agp_tc_flush(void)
@@ -5603,15 +5613,33 @@ static void r200_agp_tc_flush(void)
 
 static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
 {
-    uint32_t g = uninorth_get_agp_gart_gen();
-    if (g != r200_agp_tc_gen) {
-        r200_agp_tc_gen = g;
-        r200_agp_tc_flush();
-    }
+    /*
+     * PowerMac: the AGP bridge says when the GART changes
+     * (uninorth_get_agp_gart_gen) and the Apple driver flushes at its fences,
+     * so a hit is trusted.  A little-endian (x86) guest has neither: Linux
+     * rewrites its PCI GART entries and tells the card nothing (the card's own
+     * flush is a no-op there), so a hit is trusted only if the entry it came
+     * from still holds the value it had when the translation was made.
+     */
+    bool ppc = target_words_bigendian();
     uint32_t page = gpu_addr >> 12;
     uint32_t i = page & (ARRAY_SIZE(r200_agp_tc) - 1);
-    if (r200_agp_tc[i].tag == page + 1) {
-        return r200_agp_tc[i].host;
+    if (ppc) {
+        uint32_t g = uninorth_get_agp_gart_gen();
+        if (g != r200_agp_tc_gen) {
+            r200_agp_tc_gen = g;
+            r200_agp_tc_flush();
+        }
+        if (r200_agp_tc[i].tag == page + 1) {
+            return r200_agp_tc[i].host;
+        }
+    } else if (r200_agp_tc[i].tag == page + 1) {
+        uint32_t cur = 0;
+        if (address_space_read(&address_space_memory, r200_agp_tc[i].pte,
+                               MEMTXATTRS_UNSPECIFIED, &cur, 4) == MEMTX_OK &&
+            cur == r200_agp_tc[i].pte_raw) {
+            return r200_agp_tc[i].host;
+        }
     }
     hwaddr phys;
     if (!ppc_mac_gpu_agp_translate(s, page << 12, &phys) &&
@@ -5630,6 +5658,8 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
     uint8_t *h = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
     r200_agp_tc[i].tag = page + 1;
     r200_agp_tc[i].host = h;
+    r200_agp_tc[i].pte = r200_last_pte_addr;
+    r200_agp_tc[i].pte_raw = r200_last_pte_raw;
     return h;
 }
 
@@ -10368,6 +10398,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_MC_AGP_LOCATION:
         s->regs.mc_agp_location = val;
+        if (!target_words_bigendian()) {
+            r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        }
         break;
 
     /* Bus */
@@ -10877,18 +10910,30 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* GART (AGP Intelligent Controller) registers */
     case R200_AIC_CTRL:           /* 0x01D0 */
         s->regs.aic_ctrl = val;
+        if (!target_words_bigendian()) {
+            r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        }
         gpu_debug_log("GART AIC_CTRL=0x%x (enabled=%d)", val, val & 1);
         break;
     case R200_AIC_PT_BASE:        /* 0x01D8 */
         s->regs.aic_pt_base = val;
+        if (!target_words_bigendian()) {
+            r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        }
         gpu_debug_log("GART PT_BASE=0x%x", val);
         break;
     case R200_AIC_LO_ADDR:        /* 0x01DC */
         s->regs.aic_lo_addr = val;
+        if (!target_words_bigendian()) {
+            r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        }
         gpu_debug_log("GART LO_ADDR=0x%x", val);
         break;
     case R200_AIC_HI_ADDR:        /* 0x01E0 */
         s->regs.aic_hi_addr = val;
+        if (!target_words_bigendian()) {
+            r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        }
         gpu_debug_log("GART HI_ADDR=0x%x", val);
         break;
 
