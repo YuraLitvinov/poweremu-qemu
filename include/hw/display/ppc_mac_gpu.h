@@ -29,6 +29,9 @@ struct R200Vertex;
 #define PPC_MAC_GPU_PCI_VENDOR_ID      0x1002  /* ATI Technologies */
 #define PPC_MAC_GPU_PCI_DEVICE_ID      0x5960  /* RV280 [Radeon 9200 PRO] */
 #define PPC_MAC_GPU_PCI_REVISION       0x01
+
+/* ATI Radeon 9700 PRO Mac Edition (R300 "ND", FCode ATY,GoldenEye). */
+#define PPC_MAC_GPU_R300_DEVICE_ID     0x4E44
 #define PPC_MAC_GPU_PCI_CLASS          PCI_CLASS_DISPLAY_VGA  /* 0x0300 */
 
 /* ========================================================================
@@ -615,7 +618,10 @@ typedef struct PPCMacGPUDisplayMode {
     bool crtc_ext;       /* true when CRTC extended mode active (kext) */
 } PPCMacGPUDisplayMode;
 
+#include "../../../hw/display/r300/r300_draw.h"
+
 #define TYPE_PPC_MAC_GPU "ppc-mac-gpu"
+#define TYPE_ATI_RADEON_9700 "ati-radeon-9700"
 OBJECT_DECLARE_SIMPLE_TYPE(PPCMacGPUState, PPC_MAC_GPU)
 
 struct PPCMacGPUState {
@@ -645,6 +651,12 @@ struct PPCMacGPUState {
 
     /* Memory regions */
     MemoryRegion vram;          /* BAR0: VRAM aperture */
+    MemoryRegion vram_bar;      /* r300: BAR0 = aperture 0 (vram) + aperture 1 */
+    MemoryRegion vram_ap1;      /* r300: aperture 1, byte-swapping view of vram */
+    uint32_t r300_surf[32];     /* r300: SURFACE0..7 regs (0x0B00 + 4*i) */
+    MemoryRegion r300_watch;    /* $R300_SURFWATCH: logs CPU access to surface 0 */
+    bool r300_watch_on;
+    uint32_t r300_watch_base, r300_watch_logged;
     MemoryRegion io;            /* BAR1: I/O register alias */
     MemoryRegion mmio;          /* BAR2: MMIO register space */
     MemoryRegion rom_mr;        /* ROM BAR: traced expansion ROM */
@@ -656,7 +668,28 @@ struct PPCMacGPUState {
     /* Full BIOS ROM path (separate from romfile which has the NDRV) */
     char *biosrom;
 
+    /* "renderer" property: metal, vulkan, or unset (the host's default) */
+    char *renderer_name;
+
     /* Device configuration */
+    bool r300;                  /* ati-radeon-9700: R300 instead of RV280 */
+    struct R300State *r3;       /* R300 3D register file (r300 only) */
+    struct R300Arrays r3_arrays;    /* last 3D_LOAD_VBPNTR */
+    FILE *r3_dump;              /* $R300_DUMP: state dumps at draws */
+    uint32_t r3_trace_lines;    /* register trace after the first draw */
+    uint32_t r300_src_swap;     /* 0x15D4: 2D upload source endian swap */
+    bool r3_zpass_active;       /* ZB_ZPASS_DATA written, count Z-pass samples */
+    uint32_t r3_indx_vf;        /* DRAW_INDX_2 waiting for INDX_BUFFER (0: none) */
+    uint32_t r3_indx_buf[3];    /* INDX_BUFFER waiting for its DRAW_INDX_2 */
+    bool r3_indx_buf_pending;
+    uint32_t r3_zb_offset, r3_zb_height;   /* depth buffer extent seen at draws */
+    uint32_t r3_zb_ns;          /* GB_AA_CONFIG samples at the last depth draw */
+    uint32_t r3_cb_aa_off, r3_cb_aa_ns; /* last multisampled colour buffer, samples */
+    bool r3_zconv;              /* depth buffer currently in the card's MSAA layout */
+    bool r3_zconv_rows_ns;      /* ... converted from one row per sample (else
+                                   from one sample, which all samples copy) */
+    uint32_t r3_zconv_off, r3_zconv_pitch, r3_zconv_rows, r3_zconv_ns;
+    uint32_t r300_aic_pt_base;  /* PCI GART table base (0x0AB0) */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
     uint64_t vram_size;         /* VRAM size in bytes (computed) */
 
@@ -710,6 +743,9 @@ struct PPCMacGPUState {
     uint32_t surface_width, surface_height, surface_stride;
     void *surface_data;
     uint32_t shadow_buf_size;
+    /* the frame-rate meter's counters (ppc_mac_gpu_display_update) */
+    uint32_t *fps_frames_ptr;
+    uint32_t *fps_rows_ptr;
 
     /* Compositor-direct display: instead of reading the framebuffer
      * (which may have gaps during drag due to missing screen-to-screen
@@ -793,9 +829,10 @@ struct PPCMacGPUState {
     bool hwc_announce;
 
     /*
-     * Zero-copy VRAM: when VRAM is backed by a shared Metal buffer,
-     * metal_vram_ptr is the host mapping and metal_vram_opaque is the
-     * handle to release it with.  Both NULL on the fallback path.
+     * VRAM from the renderer: a shared Metal buffer (zero-copy) or
+     * host-visible Vulkan memory.  metal_vram_ptr is the host mapping and
+     * metal_vram_opaque the backend's handle.  Both NULL on the fallback
+     * path (QEMU-managed RAM).
      */
     void *metal_vram_ptr;
     void *metal_vram_opaque;

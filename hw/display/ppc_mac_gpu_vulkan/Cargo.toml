@@ -1,0 +1,21 @@
+[package]
+name = "ppc_mac_gpu_vulkan"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "ppc_mac_gpu_vulkan"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+ash = "0.37"
+
+# The C types (renderer vtable, R300 draw packet, uniforms, ...) are
+# generated from QEMU's own headers at build time, so a change to them
+# cannot silently shift the layout this crate relies on.
+[build-dependencies]
+bindgen = "0.72"
+
+[profile.release]
+panic = "abort"
+debug = 1

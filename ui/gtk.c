@@ -206,7 +206,16 @@ static void gd_update_cursor(VirtualConsole *vc)
 
     window = gtk_widget_get_window(GTK_WIDGET(vc->gfx.drawing_area));
     if (s->full_screen || qemu_input_is_absolute(vc->gfx.dcl.con) || s->ptr_owner == vc) {
-        gdk_window_set_cursor(window, s->null_cursor);
+        /*
+         * The host pointer is hidden because the guest is expected to draw
+         * its own.  A guest with a hardware cursor (the emulated Radeon)
+         * never draws it into the screen: it hands QEMU the image, and
+         * hiding the pointer here made it vanish at every input-mode
+         * change until the guest next redefined it.  Keep the guest's
+         * cursor when there is one.
+         */
+        gdk_window_set_cursor(window, vc->gfx.guest_cursor ?
+                                      vc->gfx.guest_cursor : s->null_cursor);
     } else {
         gdk_window_set_cursor(window, NULL);
     }
@@ -487,6 +496,10 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
         (gtk_widget_get_display(vc->gfx.drawing_area),
          pixbuf, c->hot_x, c->hot_y);
     gdk_window_set_cursor(gtk_widget_get_window(vc->gfx.drawing_area), cursor);
+    if (vc->gfx.guest_cursor) {
+        g_object_unref(vc->gfx.guest_cursor);
+    }
+    vc->gfx.guest_cursor = g_object_ref(cursor);
     g_object_unref(pixbuf);
     g_object_unref(cursor);
 }
@@ -1579,7 +1592,7 @@ static void gd_grab_update(VirtualConsole *vc, bool kbd, bool ptr)
     }
     if (ptr) {
         caps |= GDK_SEAT_CAPABILITY_ALL_POINTING;
-        cursor = vc->s->null_cursor;
+        cursor = vc->gfx.guest_cursor ? vc->gfx.guest_cursor : vc->s->null_cursor;
     }
 
     if (caps) {

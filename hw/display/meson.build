@@ -61,11 +61,69 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
+# The R300 fragment programs are generated as GLSL and compiled at run time
+# with shaderc (GLSL -> SPIR-V); SPIRV-Cross turns SPIR-V into MSL for the
+# Metal backend.  Homebrew ships SPIRV-Cross's C API only as static
+# libraries, which need its other parts and the C++ runtime.
+r300_shader_deps = []
+if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
+  shaderc = dependency('shaderc', required: true, method: 'pkg-config')
+  spirv_cross = dependency('spirv-cross-c-shared', required: false, method: 'pkg-config')
+  if spirv_cross.found()
+    r300_shader_deps = [shaderc, spirv_cross]
+  else
+    spirv_cross = dependency('spirv-cross-c', required: true, method: 'pkg-config')
+    spvc_libdir = spirv_cross.get_variable(pkgconfig: 'libdir')
+    spvc_libs = [spirv_cross]
+    foreach l : ['msl', 'hlsl', 'cpp', 'reflect', 'glsl', 'util', 'core']
+      spvc_libs += cc.find_library('spirv-cross-' + l, dirs: [spvc_libdir], required: true)
+    endforeach
+    spvc_libs += declare_dependency(link_args: host_os == 'darwin' ? ['-lc++'] : ['-lstdc++'])
+    r300_shader_deps = [shaderc] + spvc_libs
+  endif
+endif
+
 system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu.c',
+  'r300/r300_state.c',
+  'r300/r300_pvs.c',
+  'r300/r300_us.c',
+  'r300/r300_spirv.c',
+  'r300/r300_draw.c',
   'ppc_mac_gpu_renderer_sw.c',
   'ppc_mac_gpu_vp.c',
-), pixman])
+), pixman] + r300_shader_deps)
+
+# Vulkan backend for the R300 (renderer=vulkan): the Rust/ash crate in
+# ppc_mac_gpu_vulkan/, which implements the interface declared in
+# ppc_mac_gpu_renderer.h (ppc_mac_gpu_renderer_vulkan and the VRAM
+# allocator).  ppc_mac_gpu_vulkan.c is the C backend this crate was ported
+# from, kept as a reference and not built.  It is built by running Cargo
+# (a custom_target re-checked by Cargo's own incremental cache) and linked
+# in as a static library; without Cargo or the Vulkan loader the device
+# refuses renderer=vulkan.
+if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
+  ppc_vulkan_probe = dependency('vulkan', required: false, method: 'pkg-config')
+  ppc_vulkan_cargo = find_program('cargo', required: false)
+  if ppc_vulkan_probe.found() and ppc_vulkan_cargo.found()
+    ppc_vulkan_dir = meson.current_source_dir() / 'ppc_mac_gpu_vulkan'
+    ppc_vulkan_target_dir = meson.current_build_dir() / 'ppc_mac_gpu_vulkan_target'
+    ppc_vulkan_lib = custom_target('ppc_mac_gpu_vulkan_rs',
+      output: 'libppc_mac_gpu_vulkan.a',
+      command: [find_program('sh'),
+        files('ppc_mac_gpu_vulkan/build.sh'),
+        ppc_vulkan_dir, ppc_vulkan_target_dir, '@OUTPUT@'],
+      build_by_default: true,
+      build_always_stale: true,
+      console: true,
+    )
+    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [
+      declare_dependency(
+        sources: [ppc_vulkan_lib],
+        link_args: [ppc_vulkan_target_dir / 'release' / 'libppc_mac_gpu_vulkan.a'],
+        compile_args: ['-DCONFIG_PPC_MAC_GPU_VULKAN'])])
+  endif
+endif
 
 system_ss.add(when: 'CONFIG_POWEREMU_GPU', if_true: [files('poweremu-gpu.c'), pixman])
 

@@ -7,7 +7,9 @@
  *
  * Backends:
  *   - Software (ppc_mac_gpu_renderer_sw.c): always available, pure C
- *   - Metal (ppc_mac_gpu_metal.m): macOS only, primary accelerated path
+ *   - Metal (ppc_mac_gpu_metal.m): macOS only, the default there
+ *   - Vulkan (ppc_mac_gpu_vulkan.c): R300 only; MoltenVK on macOS, the
+ *     Vulkan loader elsewhere
  *
  * This interface is designed to compile cleanly on both Intel and Apple
  * Silicon macOS hosts. No platform-specific types leak into this header.
@@ -20,6 +22,17 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+
+struct R300DrawPacket;     /* hw/display/r300/r300_draw.h */
+
+/*
+ * Which VRAM pages the CPU side (the guest CPU through the BARs, or the
+ * device) has written since the last call: sets bit p of bitmap (npages
+ * bits, pages of PPC_MAC_GPU_DIRTY_PAGE bytes) for each, and forgets them.
+ */
+#define PPC_MAC_GPU_DIRTY_PAGE 4096
+typedef void (*PPCMacGPUDirtyFn)(void *arg, unsigned long *bitmap,
+                                 uint64_t npages);
 
 /*
  * Blit operation descriptor.
@@ -232,7 +245,10 @@ typedef struct R200DrawPacket {
 } R200DrawPacket;
 
 typedef struct PPCMacGPURenderer {
-    const char *name;           /* e.g. "software", "metal" */
+    const char *name;           /* e.g. "software", "metal", "vulkan" */
+
+    /* r300_us_to_glsl() flags for the GLSL this backend compiles. */
+    uint32_t r300_glsl_flags;
 
     /*
      * Initialize the renderer backend.
@@ -313,6 +329,21 @@ typedef struct PPCMacGPURenderer {
                      const R200DrawPacket *pkt);
 
     /*
+     * Render one assembled R300 draw (see hw/display/r300/r300_draw.h);
+     * rt_gpu_addr and tex[].gpu_addr are already VRAM offsets.  Batched
+     * with draw_r200 work: flush_r200() finishes both.
+     */
+    int (*draw_r300)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
+                     const struct R300DrawPacket *pkt);
+
+    /*
+     * The R300 Z-pass (occlusion) counter that draws with
+     * uniforms.zpass_count set add to.  Finishes batched work first, then
+     * returns the count; with reset, sets it to value (ZB_ZPASS_DATA).
+     */
+    uint32_t (*zpass_r300)(void *opaque, bool reset, uint32_t value);
+
+    /*
      * Finish all batched draw_r200 work.  The device calls this before any
      * CPU-side access to VRAM that 3D rendering may have written.
      */
@@ -343,6 +374,13 @@ typedef struct PPCMacGPURenderer {
     void (*fill_notify_r200)(void *opaque, uint32_t offset, uint32_t pitch,
                              uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                              uint32_t bpp, uint32_t value);
+
+    /*
+     * Backends that keep copies of VRAM (Vulkan: images on the GPU) learn
+     * about CPU-side writes here; the device keeps VRAM dirty logging on
+     * and marks its own writes dirty.  Optional — may be NULL.
+     */
+    void (*set_dirty_source)(void *opaque, PPCMacGPUDirtyFn fn, void *arg);
 
     /*
      * Notify the backend that a display mode change occurred.
@@ -435,6 +473,20 @@ PPCMacGPURenderer *ppc_mac_gpu_renderer_metal(void);
  */
 void *ppc_mac_gpu_metal_alloc_vram(uint64_t vram_size, void **opaque_out);
 void ppc_mac_gpu_metal_free_vram(void *opaque);
+#endif
+
+#ifdef CONFIG_PPC_MAC_GPU_VULKAN
+/*
+ * The Vulkan renderer (R300 draws only).  VRAM must come from
+ * ppc_mac_gpu_vulkan_alloc_vram(): host-visible Vulkan memory the GPU
+ * copies to and from its own images (it never renders into it, so a
+ * discrete GPU works the same way).  Both return NULL on failure, with
+ * the reason in ppc_mac_gpu_vulkan_error().
+ */
+PPCMacGPURenderer *ppc_mac_gpu_renderer_vulkan(void);
+void *ppc_mac_gpu_vulkan_alloc_vram(uint64_t vram_size, void **opaque_out);
+void ppc_mac_gpu_vulkan_free_vram(void *opaque);
+const char *ppc_mac_gpu_vulkan_error(void);
 #endif
 
 #endif /* HW_DISPLAY_PPC_MAC_GPU_RENDERER_H */

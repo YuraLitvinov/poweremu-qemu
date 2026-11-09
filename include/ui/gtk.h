@@ -39,6 +39,9 @@ typedef struct VirtualGfxConsole {
     DisplayChangeListener dcl;
     QKbdState *kbd;
     DisplaySurface *ds;
+    /* the cursor the guest last defined (a hardware cursor), kept so that a
+     * pointer-mode change can put it back instead of hiding the pointer */
+    GdkCursor *guest_cursor;
     pixman_image_t *convert;
     cairo_surface_t *surface;
     double scale_x;
