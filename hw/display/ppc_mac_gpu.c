@@ -4292,7 +4292,11 @@ static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
         mc_vram_write32(s, vram, addr, s->swap ? be32_to_cpu(color) : color);
     } else if (addr + bpp <= s->vram_size) {
         if (bpp == 2) {
-            stw_be_p(vram + addr, color);
+            if (s->swap) {
+                stw_be_p(vram + addr, color);
+            } else {
+                stw_le_p(vram + addr, color);
+            }
         } else {
             vram[addr] = color;
         }
@@ -4373,6 +4377,118 @@ static uint32_t gpu_po_offset(PPCMacGPUState *s, uint32_t po)
         }
     }
     return off;
+}
+
+/* Pixel size of a GMC destination datatype (bits 11:8). */
+static uint32_t gpu_gmc_bpp(uint32_t gmc)
+{
+    switch ((gmc >> 8) & 0xF) {
+    case 2:
+        return 1;
+    case 3:
+    case 4:
+        return 2;
+    default:
+        return 4;
+    }
+}
+
+/*
+ * PM4 HOSTDATA_BLT (0x94) as the Linux DDX sends it for mono glyphs:
+ *   d[0] DP_GUI_MASTER_CNTL  d[1] dst PITCH_OFFSET  d[2] clip top-left (y<<16|x)
+ *   d[3] clip bottom-right  d[4] foreground  d[5] background
+ *   d[6] dst (y<<16|x)      d[7] size (h<<16|w)     d[8] (not used)
+ *   d[9..] 1-bit rows, 32-bit padded
+ * Returns false for anything but mono expansion.
+ */
+static bool ppc_mac_gpu_hostdata_mono(PPCMacGPUState *s, const uint32_t *d,
+                                      uint32_t n)
+{
+    uint32_t gmc = d[0], po = d[1];
+    uint32_t src_dt = (gmc >> 12) & 3;      /* 0 mono fg/bg, 1 mono fg/leave */
+    uint32_t off = gpu_po_offset(s, po);
+    uint32_t pitch = (po & 0x3FC00000) >> 16;
+    uint32_t bpp = gpu_gmc_bpp(gmc);
+    uint32_t w = d[7] & 0xFFFF, h = d[7] >> 16;
+    uint32_t dx = d[6] & 0xFFFF, dy = d[6] >> 16;
+    uint32_t wps = (w + 31) / 32;
+    bool lsb = gmc & (1u << 14), clip = gmc & (1u << 3);
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    if (src_dt > 1 || n < 9 || !w || !h || !pitch) {
+        return false;
+    }
+    if ((uint64_t)n - 9 < (uint64_t)wps * h) {
+        h = (n - 9) / wps;
+    }
+    r200_vram_access(s, R200_ROWS(off, pitch, dy, h), true, 1);
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t px = dx + x, py = dy + y;
+            uint32_t word = d[9 + y * wps + x / 32];
+            bool bit = lsb ? (word >> (x & 31)) & 1 : (word >> (31 - (x & 31))) & 1;
+
+            if (clip && (px < (d[2] & 0xFFFF) || py < (d[2] >> 16) ||
+                         px >= (d[3] & 0xFFFF) || py >= (d[3] >> 16))) {
+                continue;
+            }
+            if (bit || src_dt == 0) {
+                fill_vram_px(s, vram,
+                             (uint64_t)off + (uint64_t)py * pitch + (uint64_t)px * bpp,
+                             bit ? d[4] : d[5], bpp);
+            }
+        }
+    }
+    memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)dy * pitch,
+                            (uint64_t)h * pitch);
+    return true;
+}
+
+/* DST_LINE_END write: draw the line DST_LINE_START..end in the brush colour. */
+static void ppc_mac_gpu_2d_line(PPCMacGPUState *s, uint32_t end)
+{
+    uint32_t gmc = s->regs.dp_gui_master_cntl;
+    uint32_t po = (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) ? s->regs.dst_pitch_offset
+                                                         : s->regs.default_pitch_offset;
+    uint32_t off = gpu_po_offset(s, po), pitch = (po & 0x3FC00000) >> 16;
+    uint32_t bpp = gpu_gmc_bpp(gmc), color = s->regs.dp_brush_frgd_clr;
+    int x0 = s->regs.dst_line_start & 0xFFFF, y0 = s->regs.dst_line_start >> 16;
+    int x1 = end & 0xFFFF, y1 = end >> 16;
+    int dx = abs(x1 - x0), dy = -abs(y1 - y0), sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    bool clip = gmc & (1u << 3);
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    int ymin = MIN(y0, y1), ymax = MAX(y0, y1);
+
+    if (!pitch) {
+        return;
+    }
+    r200_vram_access(s, R200_ROWS(off, pitch, ymin, ymax - ymin + 1), true, 1);
+    for (;;) {
+        bool in = !clip ||
+            (x0 >= (int)(s->regs.sc_top_left & 0xFFFF) && y0 >= (int)(s->regs.sc_top_left >> 16) &&
+             x0 <= (int)(s->regs.sc_bottom_right & 0xFFFF) &&
+             y0 <= (int)(s->regs.sc_bottom_right >> 16));
+
+        if (in) {
+            fill_vram_px(s, vram, (uint64_t)off + (uint64_t)y0 * pitch +
+                         (uint64_t)x0 * bpp, color, bpp);
+        }
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+    memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)ymin * pitch,
+                            (uint64_t)(ymax - ymin + 1) * pitch);
 }
 
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
@@ -8479,6 +8595,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                          blit_w, blit_h, bpp, color);
                     }
                 }
+            } else if (opcode == 0x94 && !s->swap && body_dw >= 9 &&
+                       ppc_mac_gpu_hostdata_mono(s, d, body_dw)) {
+                /* mono HOSTDATA_BLT from a little-endian guest: drawn */
             } else if (opcode == 0x9c && body_dw >= 4) {
                 /*
                  * CNTL_HOSTDATA_BLT — CPU-to-VRAM blit via PM4
@@ -10697,6 +10816,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_DST_Y_X:
         s->regs.dst_y_x = val;
         break;
+    case 0x1600:                    /* DST_LINE_START */
+        s->regs.dst_line_start = val;
+        break;
+    case 0x1604:                    /* DST_LINE_END: draws the line */
+        ppc_mac_gpu_2d_line(s, val);
+        break;
+
     case R200_DST_X_Y: {
         /* DST_X_Y: bits[31:16]=X, bits[15:0]=Y → convert to Y_X */
         uint32_t x = (val >> 16) & 0xFFFF;
