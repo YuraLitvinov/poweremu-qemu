@@ -4356,6 +4356,25 @@ static inline uint32_t mc_vram_read32(PPCMacGPUState *s, uint8_t *vram,
     return 0;
 }
 
+/*
+ * Byte offset into VRAM that a PITCH_OFFSET register value names.  A Linux
+ * driver adds the card's MC_FB_LOCATION base to every surface offset (VRAM
+ * sits at 0xe0000000 in its address space); the PowerMac drivers use plain
+ * VRAM offsets, so the base is only removed for little-endian guests.
+ */
+static uint32_t gpu_po_offset(PPCMacGPUState *s, uint32_t po)
+{
+    uint32_t off = (po & 0x3FFFFF) << 10;
+
+    if (!s->swap) {
+        uint32_t fb = (s->regs.mc_fb_location & 0xFFFF) << 16;
+        if (off >= fb) {
+            off -= fb;
+        }
+    }
+    return off;
+}
+
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
 {
     /*
@@ -4379,9 +4398,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
      *   bit  31      = micro tile
      * Decode: offset = (val & 0x3FFFFF) << 10
      *         pitch  = (val & 0x3FC00000) >> 16   (= bits[29:22] << 6) */
-    uint32_t src_offset = (src_po & 0x3FFFFF) << 10;
+    uint32_t src_offset = gpu_po_offset(s, src_po);
     uint32_t src_pitch  = (src_po & 0x3FC00000) >> 16;
-    uint32_t dst_offset = (dst_po & 0x3FFFFF) << 10;
+    uint32_t dst_offset = gpu_po_offset(s, dst_po);
     uint32_t dst_pitch  = (dst_po & 0x3FC00000) >> 16;
     /*
      * Tiling policy — MC-style surface registry.
@@ -4964,7 +4983,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
      * tiling transparently for all writes to that surface's VRAM range.
      */
     uint32_t parent_po    = s->regs.dst_pitch_offset;
-    uint32_t parent_base  = (parent_po & 0x3FFFFF) << 10;
+    uint32_t parent_base  = gpu_po_offset(s, parent_po);
     uint32_t parent_pitch = (parent_po & 0x3FC00000) >> 16;
     bool     parent_macro = (parent_po >> 30) & 1;
     if (parent_macro && parent_base > 0 && parent_pitch > 0) {
@@ -7781,9 +7800,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                     continue;
                 }
 
-                uint32_t dst_offset = (dst_po & 0x3FFFFF) << 10;
+                uint32_t dst_offset = gpu_po_offset(s, dst_po);
                 uint32_t dst_pitch  = (dst_po & 0x3FC00000) >> 16;
-                uint32_t src_offset = (src_po & 0x3FFFFF) << 10;
+                uint32_t src_offset = gpu_po_offset(s, src_po);
                 uint32_t src_pitch  = (src_po & 0x3FC00000) >> 16;
                 /* MC-style tiling: register surfaces from PO if macro_tile=1 */
                 if ((dst_po >> 30) & 1) {
@@ -8298,7 +8317,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 uint32_t offset, pitch;
                 if (has_po) {
                     uint32_t po = d[idx++];
-                    offset = (po & 0x3FFFFF) << 10;
+                    offset = gpu_po_offset(s, po);
                     pitch  = (po & 0x3FC00000) >> 16;
                     /* MC-style: register tiled surface if macro_tile=1 */
                     if ((po >> 30) & 1) {
@@ -8308,7 +8327,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                     /* GMC_DST_PITCH_OFFSET_CNTL clear: DEFAULT_PITCH_OFFSET,
                      * not the separate DST_OFFSET/DST_PITCH registers. */
                     uint32_t po = s->regs.default_pitch_offset;
-                    offset = (po & 0x3FFFFF) << 10;
+                    offset = gpu_po_offset(s, po);
                     pitch  = (po & 0x3FC00000) >> 16;
                 }
 
@@ -8471,7 +8490,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                  */
                 uint32_t gmc = d[0];
                 uint32_t po = d[1];
-                uint32_t dst_offset = (po & 0x3FFFFF) << 10;
+                uint32_t dst_offset = gpu_po_offset(s, po);
                 uint32_t dst_pitch  = (po & 0x3FC00000) >> 16;
                 /* MC-style: register tiled surface if macro_tile=1 */
                 if ((po >> 30) & 1) {
@@ -10622,7 +10641,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.src_pitch_offset = val;
         /* Register/unregister tiled surface from SRC_PITCH_OFFSET */
         {
-            uint32_t spo_base  = (val & 0x3FFFFF) << 10;
+            uint32_t spo_base  = gpu_po_offset(s, val);
             uint32_t spo_pitch = (val & 0x3FC00000) >> 16;
             bool spo_macro     = (val >> 30) & 1;
             if (spo_macro && spo_base > 0 && spo_pitch > 0) {
@@ -10634,7 +10653,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.dst_pitch_offset = val;
         /* Register/unregister tiled surface from DST_PITCH_OFFSET */
         {
-            uint32_t dpo_base  = (val & 0x3FFFFF) << 10;
+            uint32_t dpo_base  = gpu_po_offset(s, val);
             uint32_t dpo_pitch = (val & 0x3FC00000) >> 16;
             bool dpo_macro     = (val >> 30) & 1;
             if (dpo_macro && dpo_base > 0 && dpo_pitch > 0) {
