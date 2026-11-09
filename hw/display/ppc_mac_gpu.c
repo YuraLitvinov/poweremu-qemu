@@ -2983,6 +2983,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
+    s->r3->le_screen_h = s->swap ? 0 : s->disp.height;
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
                                 s, &pkt, &err) :

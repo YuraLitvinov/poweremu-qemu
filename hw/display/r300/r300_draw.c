@@ -89,6 +89,8 @@
 #define GA_FOG_OFFSET               0x4298
 
 #define SC_COORD_BIAS               1440    /* scissor/cliprect origin */
+#define CLIP_MIN(a, b)              ((a) < (b) ? (a) : (b))
+#define CLIP_MAX(a, b)              ((a) > (b) ? (a) : (b))
 
 static float bits_to_float(uint32_t v)
 {
@@ -1323,8 +1325,46 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                       (br & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
     pkt->scissor[3] = (((br >> 13) & 0x1FFF) >= SC_COORD_BIAS) ?
                       ((br >> 13) & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
+    if (st->le_screen_h) {
+        /* The DRM clips with up to four cliprects (SC_CLIPRECT_TL/BR_0..3) chosen by
+         * SC_CLIP_RULE: bit (in0 | in1<<1 | in2<<2 | in3<<3) says whether a pixel inside
+         * exactly those rectangles is drawn.  Use the bounding box of the rectangles that
+         * take part in a passing combination; a rule that passes pixels outside every
+         * rectangle (index 0) clips nothing. */
+        uint32_t rule = r300_reg(st, 0x43D0) & 0xFFFF;
+        bool outside_ok = rule & 1;
+        uint32_t bx0 = ~0u, by0 = ~0u, bx1 = 0, by1 = 0;
+        for (int k = 0; k < 4 && !outside_ok; k++) {
+            bool used = false;
+            for (int idx = 0; idx < 16; idx++) {
+                if ((idx >> k) & 1 && (rule >> idx) & 1) {
+                    used = true;
+                }
+            }
+            if (!used) {
+                continue;
+            }
+            uint32_t ctl = r300_reg(st, 0x43B0 + 8 * k), cbr = r300_reg(st, 0x43B4 + 8 * k);
+            uint32_t x0 = (ctl & 0x1FFF) > SC_COORD_BIAS ? (ctl & 0x1FFF) - SC_COORD_BIAS : 0;
+            uint32_t y0 = ((ctl >> 13) & 0x1FFF) > SC_COORD_BIAS ? ((ctl >> 13) & 0x1FFF) - SC_COORD_BIAS : 0;
+            uint32_t x1 = (cbr & 0x1FFF) >= SC_COORD_BIAS ? (cbr & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
+            uint32_t y1 = ((cbr >> 13) & 0x1FFF) >= SC_COORD_BIAS ? ((cbr >> 13) & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
+            bx0 = CLIP_MIN(bx0, x0); by0 = CLIP_MIN(by0, y0);
+            bx1 = CLIP_MAX(bx1, x1); by1 = CLIP_MAX(by1, y1);
+        }
+        if (!outside_ok && bx0 != ~0u) {
+            pkt->scissor[0] = CLIP_MAX(pkt->scissor[0], bx0);
+            pkt->scissor[1] = CLIP_MAX(pkt->scissor[1], by0);
+            pkt->scissor[2] = CLIP_MIN(pkt->scissor[2], bx1);
+            pkt->scissor[3] = CLIP_MIN(pkt->scissor[3], by1);
+        } else if (!outside_ok) {
+            pkt->scissor[2] = pkt->scissor[3] = 0;      /* nothing passes */
+        }
+    }
     pkt->rt_width = pkt->rt_pitch;
-    pkt->rt_height = pkt->scissor[3];
+    /* an open scissor (Linux) says nothing about the buffer: it is as tall as the screen */
+    pkt->rt_height = st->le_screen_h && (((br >> 13) & 0x1FFF) >= 0x1F00)
+                         ? st->le_screen_h : pkt->scissor[3];
     if (!pkt->rt_width || !pkt->rt_height) {
         *err = "empty colour buffer";
         free(order);

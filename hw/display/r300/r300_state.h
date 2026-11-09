@@ -34,6 +34,9 @@ typedef struct R300State {
     uint32_t pvs_upload_dw;                    /* next dword to write */
     uint64_t pvs_gen;       /* bumps when PVS code/constants change */
     uint64_t draws;
+    uint32_t le_screen_h;   /* little-endian (Linux) guest: the screen height, else 0.  Linux clips with
+                             * the SC_CLIPRECT registers and leaves the scissor open, and the colour buffer
+                             * is screen-sized */
     uint32_t glsl_flags;    /* r300_us_to_glsl() flags the renderer wants (not a
                                register; the device sets it before each draw) */
 } R300State;
