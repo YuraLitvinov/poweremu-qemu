@@ -1508,6 +1508,11 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
 static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src,
                                      int width)
 {
+    if (!target_words_bigendian()) {
+        /* A little-endian (x86) guest writes XRGB as [B, G, R, X] already. */
+        memcpy(dst, src, (size_t)width * 4);
+        return;
+    }
     for (int i = 0; i < width; i++) {
         dst[i] = bswap32(src[i]);
     }
