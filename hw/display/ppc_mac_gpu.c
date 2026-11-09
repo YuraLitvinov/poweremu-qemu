@@ -37,6 +37,7 @@
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
+#include "exec/tswap.h"
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_renderer.h"
@@ -50,6 +51,16 @@
 /* UniNorth AGP bridge GART base — defined in hw/pci-host/uninorth.c */
 hwaddr uninorth_get_agp_gart_base(void);
 uint32_t uninorth_get_agp_gart_gen(void);
+
+/*
+ * A dword the guest CPU wrote to memory the card reads (the CP ring, indirect
+ * buffers): in the guest's byte order, big-endian for a PowerPC guest,
+ * little-endian for an x86 one.
+ */
+static inline uint32_t gpu_guest_dw(uint32_t raw)
+{
+    return target_words_bigendian() ? be32_to_cpu(raw) : le32_to_cpu(raw);
+}
 
 #ifndef CONFIG_DARWIN
 /*
@@ -3630,10 +3641,9 @@ static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
             return NULL;
         }
 
-        /* Data in guest memory is big-endian (PPC native).
-         * PM4 commands are written in CPU byte order.
-         * Convert to host byte order for parsing. */
-        buf[i] = be32_to_cpu(raw);
+        /* PM4 commands are written in the guest CPU's byte order (big-endian
+         * for PowerPC, little-endian for x86); convert for parsing. */
+        buf[i] = gpu_guest_dw(raw);
     }
     return buf;
 }
@@ -8968,8 +8978,8 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
             return;
         }
 
-        /* Ring buffer data is written by PPC CPU in big-endian */
-        rb_data[i] = be32_to_cpu(raw);
+        /* Ring buffer data is written in the guest CPU's byte order */
+        rb_data[i] = gpu_guest_dw(raw);
     }
 
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
