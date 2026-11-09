@@ -9465,6 +9465,15 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     case R200_MC_STATUS:
         /* Report memory controller idle */
         val = R200_MC_IDLE;
+        if (s->r300 && !target_words_bigendian()) {
+            /*
+             * R300's idle bit is bit 4, not the older chips' bit 2.  Linux's
+             * radeon (r300_mc_wait_for_idle) and the X radeon DDX (the wait in
+             * RADEONRestoreMemMapRegisters, up to a million usleep(10)s) poll
+             * for it; the Apple driver does not.  PowerMac path unchanged.
+             */
+            val |= 1u << 4;
+        }
         break;
 
     /* Bus */
