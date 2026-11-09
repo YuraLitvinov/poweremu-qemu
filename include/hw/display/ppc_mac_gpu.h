@@ -497,6 +497,8 @@ typedef struct PPCMacGPURegs {
     uint32_t default_pitch_offset;
     uint32_t dst_width_height;     /* 0x1598: blit trigger */
     uint32_t dst_line_start;       /* 0x1600: line start, y<<16|x */
+    uint32_t brush_y_x;            /* 0x1474 */
+    uint32_t brush_data[16];       /* 0x1480..0x14bc */
     uint32_t dp_gui_master_cntl;
     uint32_t dp_brush_frgd_clr;
     uint32_t dp_brush_bkgd_clr;

@@ -4393,6 +4393,29 @@ static uint32_t gpu_gmc_bpp(uint32_t gmc)
     }
 }
 
+static inline uint32_t gpu_px_get(PPCMacGPUState *s, const uint8_t *vram,
+                                  uint64_t a, uint32_t bpp)
+{
+    if (a + bpp > s->vram_size) {
+        return 0;
+    }
+    return bpp == 4 ? ldl_le_p(vram + a) : bpp == 2 ? lduw_le_p(vram + a) : vram[a];
+}
+
+static inline void gpu_px_put(PPCMacGPUState *s, uint8_t *vram, uint64_t a,
+                              uint32_t v, uint32_t bpp)
+{
+    if (a + bpp <= s->vram_size) {
+        if (bpp == 4) {
+            stl_le_p(vram + a, v);
+        } else if (bpp == 2) {
+            stw_le_p(vram + a, v);
+        } else {
+            vram[a] = v;
+        }
+    }
+}
+
 /*
  * PM4 HOSTDATA_BLT (0x94) as the Linux DDX sends it for mono glyphs:
  *   d[0] DP_GUI_MASTER_CNTL  d[1] dst PITCH_OFFSET  d[2] clip top-left (y<<16|x)
@@ -4415,7 +4438,10 @@ static bool ppc_mac_gpu_hostdata_mono(PPCMacGPUState *s, const uint32_t *d,
     bool lsb = gmc & (1u << 14), clip = gmc & (1u << 3);
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
-    if (src_dt > 1 || n < 9 || !w || !h || !pitch) {
+    if (src_dt == 3) {                      /* colour pixels in the destination format */
+        wps = (w * bpp + 3) / 4;
+    }
+    if (src_dt == 2 || n < 9 || !w || !h || !pitch) {
         return false;
     }
     if ((uint64_t)n - 9 < (uint64_t)wps * h) {
@@ -4425,6 +4451,18 @@ static bool ppc_mac_gpu_hostdata_mono(PPCMacGPUState *s, const uint32_t *d,
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
             uint32_t px = dx + x, py = dy + y;
+            if (src_dt == 3) {
+                uint32_t v = bpp == 4 ? d[9 + y * wps + x]
+                           : bpp == 2 ? (d[9 + y * wps + x / 2] >> ((x & 1) * 16)) & 0xFFFF
+                           : (d[9 + y * wps + x / 4] >> ((x & 3) * 8)) & 0xFF;
+
+                if (!clip || !(px < (d[2] & 0xFFFF) || py < (d[2] >> 16) ||
+                               px >= (d[3] & 0xFFFF) || py >= (d[3] >> 16))) {
+                    gpu_px_put(s, vram, (uint64_t)off + (uint64_t)py * pitch +
+                               (uint64_t)px * bpp, v, bpp);
+                }
+                continue;
+            }
             uint32_t word = d[9 + y * wps + x / 32];
             bool bit = lsb ? (word >> (x & 31)) & 1 : (word >> (31 - (x & 31))) & 1;
 
@@ -4442,6 +4480,128 @@ static bool ppc_mac_gpu_hostdata_mono(PPCMacGPUState *s, const uint32_t *d,
     memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)dy * pitch,
                             (uint64_t)h * pitch);
     return true;
+}
+
+/* ROP3 on 32-bit words: bit (P<<2 | S<<1 | D) of the code gives the result. */
+static uint32_t gpu_rop3(uint32_t rop, uint32_t pat, uint32_t src, uint32_t dst)
+{
+    uint32_t r = 0;
+
+    for (int k = 0; k < 8; k++) {
+        if (rop & (1u << k)) {
+            r |= ((k & 4) ? pat : ~pat) & ((k & 2) ? src : ~src) &
+                 ((k & 1) ? dst : ~dst);
+        }
+    }
+    return r;
+}
+
+/*
+ * The 2D engine for a little-endian guest: one rectangle operation, started by
+ * a write to DST_WIDTH_HEIGHT (0x1598) or DST_HEIGHT_WIDTH (0x143c).  It takes
+ * the ROP3, the source (screen memory) and the brush (solid or 8x8 mono) from
+ * DP_GUI_MASTER_CNTL, honours the copy direction in DP_CNTL and the scissor,
+ * and is independent of the PowerMac code paths.
+ */
+static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
+{
+    uint32_t gmc = s->regs.dp_gui_master_cntl;
+    uint32_t dpo = (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) ? s->regs.dst_pitch_offset
+                                                          : s->regs.default_pitch_offset;
+    uint32_t spo = (gmc & R200_GMC_SRC_PITCH_OFFSET_CNTL) ? s->regs.src_pitch_offset
+                                                          : s->regs.default_pitch_offset;
+    uint32_t doff = gpu_po_offset(s, dpo), dpitch = (dpo & 0x3FC00000) >> 16;
+    uint32_t soff = gpu_po_offset(s, spo), spitch = (spo & 0x3FC00000) >> 16;
+    uint32_t bpp = gpu_gmc_bpp(gmc), rop = (gmc >> 16) & 0xFF;
+    uint32_t src_src = (gmc >> 24) & 7, brush = (gmc >> 4) & 0xF;
+    bool xl2r = s->regs.dp_cntl & 1, yt2b = s->regs.dp_cntl & 2;
+    bool clip = gmc & R200_GMC_DST_CLIPPING, lsb = gmc & (1u << 14);
+    int dx = s->regs.dst_y_x & 0xFFFF, dy = s->regs.dst_y_x >> 16;
+    int sx = s->regs.src_y_x & 0xFFFF, sy = s->regs.src_y_x >> 16;
+    int cx0 = (int16_t)(s->regs.sc_top_left & 0xFFFF), cy0 = (int16_t)(s->regs.sc_top_left >> 16);
+    int cx1 = (int16_t)(s->regs.sc_bottom_right & 0xFFFF);
+    int cy1 = (int16_t)(s->regs.sc_bottom_right >> 16);
+    bool need_src = rop & 0xAA ? (rop & 0xAA) != ((rop & 0x55) << 1) : false;
+    uint32_t mask = bpp == 4 ? 0xFFFFFFFFu : bpp == 2 ? 0xFFFF : 0xFF;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    if (!w || !h || !dpitch || (src_src == 3 && need_src)) {
+        return;     /* host-data sources arrive in HOSTDATA_BLT packets */
+    }
+    if (need_src && src_src != 2) {
+        need_src = false;
+    }
+    if (brush != 13 && brush != 15 && brush > 1) {
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "ppc-mac-gpu: 2D brush type %u not supported\n", brush);
+        }
+        return;
+    }
+    r200_vram_access(s, R200_ROWS(doff, dpitch, dy < 0 ? 0 : MIN(dy, dy + (int)h - 1), h), true, 1);
+    for (uint32_t j = 0; j < h; j++) {
+        int y = yt2b ? dy + (int)j : dy - (int)j;
+        int ys = yt2b ? sy + (int)j : sy - (int)j;
+
+        if (y < 0 || (uint64_t)doff + (uint64_t)y * dpitch >= s->vram_size) {
+            continue;
+        }
+        /* fast paths: solid pattern copy and screen copy of whole rows */
+        if (rop == 0xF0 && brush == 13 && !clip) {
+            uint32_t col = s->regs.dp_brush_frgd_clr & mask;
+            int x0 = xl2r ? dx : dx - (int)w + 1;
+            for (uint32_t i = 0; i < w; i++) {
+                gpu_px_put(s, vram, (uint64_t)doff + (uint64_t)y * dpitch +
+                           (uint64_t)(x0 + i) * bpp, col, bpp);
+            }
+            continue;
+        }
+        if (rop == 0xCC && src_src == 2 && !clip && ys >= 0) {
+            int x0 = xl2r ? dx : dx - (int)w + 1, xs0 = xl2r ? sx : sx - (int)w + 1;
+            uint64_t da = (uint64_t)doff + (uint64_t)y * dpitch + (uint64_t)x0 * bpp;
+            uint64_t sa = (uint64_t)soff + (uint64_t)ys * spitch + (uint64_t)xs0 * bpp;
+            if (da + (uint64_t)w * bpp <= s->vram_size && sa + (uint64_t)w * bpp <= s->vram_size) {
+                memmove(vram + da, vram + sa, (size_t)w * bpp);
+            }
+            continue;
+        }
+        for (uint32_t i = 0; i < w; i++) {
+            int x = xl2r ? dx + (int)i : dx - (int)i;
+            int xs = xl2r ? sx + (int)i : sx - (int)i;
+            uint32_t pat = 0, src = 0, bit = 1;
+
+            if (x < 0 || (clip && (x < cx0 || x > cx1 || y < cy0 || y > cy1))) {
+                continue;
+            }
+            if (brush == 13) {
+                pat = s->regs.dp_brush_frgd_clr;
+            } else if (brush <= 1) {
+                int bx = (x + (s->regs.brush_y_x & 0xFFFF)) & 7;
+                int by = (y + (s->regs.brush_y_x >> 16)) & 7;
+                uint32_t row = (s->regs.brush_data[by >> 2] >> ((by & 3) * 8)) & 0xFF;
+                bit = lsb ? (row >> bx) & 1 : (row >> (7 - bx)) & 1;
+                if (!bit && brush == 1) {
+                    continue;           /* mono pattern, background left alone */
+                }
+                pat = bit ? s->regs.dp_brush_frgd_clr : s->regs.dp_brush_bkgd_clr;
+            }
+            if (need_src) {
+                src = gpu_px_get(s, vram, (uint64_t)soff + (uint64_t)ys * spitch +
+                                 (uint64_t)xs * bpp, bpp);
+            }
+            uint64_t da = (uint64_t)doff + (uint64_t)y * dpitch + (uint64_t)x * bpp;
+            gpu_px_put(s, vram, da, gpu_rop3(rop, pat, src, gpu_px_get(s, vram, da, bpp)) & mask, bpp);
+        }
+    }
+    {
+        int ylo = yt2b ? dy : dy - (int)h + 1;
+        if (ylo < 0) {
+            ylo = 0;
+        }
+        memory_region_set_dirty(&s->vram, (uint64_t)doff + (uint64_t)ylo * dpitch,
+                                (uint64_t)h * dpitch);
+    }
 }
 
 /* DST_LINE_END write: draw the line DST_LINE_START..end in the brush colour. */
@@ -10795,6 +10955,10 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_DST_HEIGHT_WIDTH: {
         /* Alternate blit trigger with h|w format */
+        if (!s->swap) {
+            ppc_mac_gpu_2d_le(s, val & 0x3FFF, (val >> 16) & 0x3FFF);
+            break;
+        }
         uint32_t h = (val >> 16) & 0x3FFF;
         uint32_t w = val & 0x3FFF;
         s->regs.dst_width_height = (w << 16) | h;
@@ -10806,6 +10970,10 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_DST_WIDTH_HEIGHT: {
         /* Blit trigger with w|h format (0x1598) */
         s->regs.dst_width_height = val;
+        if (!s->swap) {
+            ppc_mac_gpu_2d_le(s, (val >> 16) & 0x3FFF, val & 0x3FFF);
+            break;
+        }
         uint32_t w2 = (val >> 16) & 0x3FFF;
         uint32_t h2 = val & 0x3FFF;
         if (w2 > 0 && h2 > 0) {
@@ -10815,6 +10983,12 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     case R200_DST_Y_X:
         s->regs.dst_y_x = val;
+        break;
+    case 0x1474:                    /* BRUSH_Y_X */
+        s->regs.brush_y_x = val;
+        break;
+    case 0x1480 ... 0x14bc:         /* BRUSH_DATA0..15 */
+        s->regs.brush_data[(addr - 0x1480) / 4] = val;
         break;
     case 0x1600:                    /* DST_LINE_START */
         s->regs.dst_line_start = val;
