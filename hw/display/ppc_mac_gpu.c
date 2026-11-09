@@ -9468,6 +9468,53 @@ static bool is_r300_register(uint32_t addr)
 #define PPC_MAC_GPU_HWC_END   0xFF20
 #define PPC_MAC_GPU_HWC_MAGIC 0x48574331
 
+/*
+ * The CRTC1 hardware cursor as a Linux driver programs it: a 64x64 ARGB image
+ * in VRAM at CUR_OFFSET, enabled by CRTC_GEN_CNTL bit 16, positioned by
+ * CUR_HORZ_VERT_POSN (x<<16 | y, bit 31 = lock) minus the hot-spot shift in
+ * CUR_HORZ_VERT_OFF.  Handed to the display as a QEMU cursor.
+ */
+static void ppc_mac_gpu_cursor_sync(PPCMacGPUState *s)
+{
+    uint32_t fb = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t off = s->regs.cur_offset & 0x0FFFFFFF;
+    bool on = s->regs.crtc_gen_cntl & (1u << 16);
+    int x = (int)((s->regs.cur_horz_vert_posn >> 16) & 0x7FFF) -
+            (int)((s->regs.cur_horz_vert_off >> 16) & 0x3F);
+    int y = (int)(s->regs.cur_horz_vert_posn & 0x7FFF) -
+            (int)(s->regs.cur_horz_vert_off & 0x3F);
+
+    if (!s->con) {
+        return;
+    }
+    if (off >= fb) {
+        off -= fb;
+    }
+    if (on && (uint64_t)off + 64 * 64 * 4 <= s->vram_size) {
+        const uint8_t *src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + off;
+        uint32_t px[64 * 64];
+
+        for (int i = 0; i < 64 * 64; i++) {
+            px[i] = ldl_le_p(src + 4 * i);
+        }
+        if (!s->hwc_w || memcmp(px, s->hwc_pix, sizeof(px))) {
+            QEMUCursor *c = cursor_alloc(64, 64);
+
+            c->hot_x = 0;
+            c->hot_y = 0;
+            memcpy(c->data, px, sizeof(px));
+            memcpy(s->hwc_pix, px, sizeof(px));
+            s->hwc_w = s->hwc_h = 64;
+            dpy_cursor_define(s->con, c);
+            cursor_unref(c);
+        }
+    }
+    s->hwc_x = x;
+    s->hwc_y = y;
+    s->hwc_visible = on && s->hwc_w;
+    dpy_mouse_set(s->con, x, y, s->hwc_visible);
+}
+
 static void ppc_mac_gpu_hwc_write(PPCMacGPUState *s, uint32_t reg, uint32_t val)
 {
     switch (reg) {
@@ -10795,6 +10842,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_CRTC_GEN_CNTL:
         s->regs.crtc_gen_cntl = val;
         s->display_invalid = true;
+        if (!s->swap) {
+            ppc_mac_gpu_cursor_sync(s);
+        }
         break;
     case R200_CRTC_EXT_CNTL:
         s->regs.crtc_ext_cntl = val;
@@ -10865,12 +10915,21 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* Cursor */
     case R200_CUR_OFFSET:
         s->regs.cur_offset = val;
+        if (!s->swap) {
+            ppc_mac_gpu_cursor_sync(s);
+        }
         break;
     case R200_CUR_HORZ_VERT_POSN:
         s->regs.cur_horz_vert_posn = val;
+        if (!s->swap) {
+            ppc_mac_gpu_cursor_sync(s);
+        }
         break;
     case R200_CUR_HORZ_VERT_OFF:
         s->regs.cur_horz_vert_off = val;
+        if (!s->swap) {
+            ppc_mac_gpu_cursor_sync(s);
+        }
         break;
     case R200_CUR_CLR0:
         s->regs.cur_clr0 = val;
