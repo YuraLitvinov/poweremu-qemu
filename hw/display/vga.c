@@ -1794,7 +1794,10 @@ static void vga_update_display(void *opaque)
         /* nothing to do */
     } else {
         full_update = 0;
-        if (!(s->ar_index & 0x20)) {
+        /* palette address source off, or the sequencer's "screen off" bit that
+         * X sets while it reprograms the card: the screen is blank */
+        if (!(s->ar_index & 0x20) ||
+            (sr(s, VGA_SEQ_CLOCK_MODE) & VGA_SR01_SCREEN_OFF)) {
             graphic_mode = GMODE_BLANK;
         } else {
             graphic_mode = s->gr[VGA_GFX_MISC] & VGA_GR06_GRAPHICS_MODE;
