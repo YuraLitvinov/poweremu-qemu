@@ -1743,7 +1743,13 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         pkt->scissor[2] <= pkt->depth.pitch) {
         pkt->rt_width = pkt->depth.pitch;
     }
-    if (pkt->depth.attach && pkt->depth.pitch > pkt->rt_pitch && pkt->scissor[2] <= pkt->depth.pitch &&
+    /*
+     * Also when the masked colour target is the depth buffer's own memory (Mesa blits packed depth/stencil as
+     * ARGB8888 words, then draws stencil ops with that same buffer bound as colour): the colour store would write
+     * the old word back over the stencil and depth the same invocation just updated.
+     */
+    if (pkt->depth.attach && (pkt->depth.pitch > pkt->rt_pitch || pkt->rt_gpu_addr == pkt->depth.gpu_addr) &&
+        pkt->depth.pitch >= pkt->rt_pitch && pkt->scissor[2] <= pkt->depth.pitch &&
         pkt->num_cb == 1 && pkt->aa_samples == 1 && (r300_reg(st, RB3D_COLOR_CHANNEL_MASK) & 0xF) == 0) {
         pkt->rt_dummy = true;
         pkt->rt_pitch = pkt->rt_width = pkt->depth.pitch;
