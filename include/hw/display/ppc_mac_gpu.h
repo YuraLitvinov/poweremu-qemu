@@ -552,6 +552,7 @@ typedef struct PPCMacGPURegs {
     /* Clock (stub) */
     uint32_t clock_cntl_index;
     uint32_t clock_cntl_data;
+    uint32_t pll[64];              /* PLL register file, indexed by CLOCK_CNTL_INDEX[5:0] (little-endian guests) */
 
     /* GPIO / DDC */
     uint32_t gpio_vga_ddc;

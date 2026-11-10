@@ -10050,7 +10050,8 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = s->regs.clock_cntl_index;
         break;
     case R200_CLOCK_CNTL_DATA:
-        val = s->regs.clock_cntl_data;
+        val = s->swap ? s->regs.clock_cntl_data
+                      : s->regs.pll[s->regs.clock_cntl_index & 0x3F];
         break;
 
     /* 2D engine - read back state */
@@ -10999,6 +11000,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_CLOCK_CNTL_DATA:
         s->regs.clock_cntl_data = val;
+        if (!s->swap && (s->regs.clock_cntl_index & 0x80)) {   /* PLL_WR_EN */
+            s->regs.pll[s->regs.clock_cntl_index & 0x3F] = val;
+        }
         break;
 
     /* 2D engine registers - store state */
@@ -12101,6 +12105,16 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
             (uint16_t)(s->vram_size >> 16);
     }
 
+    if (!s->swap) {
+        /*
+         * PLL defaults.  The Linux radeon driver, finding no ATI BIOS clock table, reads the
+         * engine and memory clock back from these (radeon_legacy_get_engine_clock/memory_clock:
+         * 27 MHz reference * 2 * fb_div / ref_div) and divides by them in r100_bandwidth_update,
+         * so zero oopses it.  A 9700 PRO runs its core at 325 MHz and memory at 310 MHz.
+         */
+        s->regs.pll[0x0A] = 12 | (69 << 8) | (72 << 16);    /* M_SPLL_REF_FB_DIV */
+        s->regs.pll[0x03] = 12;                              /* PPLL_REF_DIV */
+    }
     if (s->legacy_vga) {
         s->regs.crtc_gen_cntl = 0;      /* VGA mode until a driver sets one */
         s->vga_shown = false;
