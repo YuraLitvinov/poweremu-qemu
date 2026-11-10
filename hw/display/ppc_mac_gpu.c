@@ -4416,26 +4416,76 @@ static uint32_t gpu_gmc_bpp(uint32_t gmc)
     }
 }
 
+/* Host pointer for a pixel at MC-relative address a: VRAM below vram_size, else a GART address. */
+static inline uint8_t *gpu_px_ptr(PPCMacGPUState *s, uint8_t *vram, uint64_t a,
+                                  uint32_t bpp)
+{
+    if (a < s->vram_size) {
+        return a + bpp <= s->vram_size ? vram + a : NULL;
+    }
+    if (a > 0xFFFFFFFFull) {
+        return NULL;
+    }
+    uint8_t *pg = r200_agp_page(s, (uint32_t)a);
+    return pg ? pg + (a & 0xFFF) : NULL;
+}
+
 static inline uint32_t gpu_px_get(PPCMacGPUState *s, const uint8_t *vram,
                                   uint64_t a, uint32_t bpp)
 {
-    if (a + bpp > s->vram_size) {
+    const uint8_t *p = gpu_px_ptr(s, (uint8_t *)vram, a, bpp);
+
+    if (!p) {
         return 0;
     }
-    return bpp == 4 ? ldl_le_p(vram + a) : bpp == 2 ? lduw_le_p(vram + a) : vram[a];
+    return bpp == 4 ? ldl_le_p(p) : bpp == 2 ? lduw_le_p(p) : *p;
 }
 
 static inline void gpu_px_put(PPCMacGPUState *s, uint8_t *vram, uint64_t a,
                               uint32_t v, uint32_t bpp)
 {
-    if (a + bpp <= s->vram_size) {
+    uint8_t *p = gpu_px_ptr(s, vram, a, bpp);
+
+    if (p) {
         if (bpp == 4) {
-            stl_le_p(vram + a, v);
+            stl_le_p(p, v);
         } else if (bpp == 2) {
-            stw_le_p(vram + a, v);
+            stw_le_p(p, v);
         } else {
-            vram[a] = v;
+            *p = v;
         }
+    }
+}
+
+/* Copy bytes between two MC-relative addresses (VRAM or GART), page by page. */
+static void gpu_mc_copy(PPCMacGPUState *s, uint8_t *vram, uint64_t da, uint64_t sa,
+                        uint32_t n)
+{
+    while (n) {
+        uint32_t chunk = n;
+        uint8_t *d, *r;
+
+        if (da >= s->vram_size) {
+            chunk = MIN(chunk, 0x1000 - (uint32_t)(da & 0xFFF));
+        }
+        if (sa >= s->vram_size) {
+            chunk = MIN(chunk, 0x1000 - (uint32_t)(sa & 0xFFF));
+        }
+        d = gpu_px_ptr(s, vram, da, 1);
+        r = gpu_px_ptr(s, vram, sa, 1);
+        if (!d || !r) {
+            return;
+        }
+        if (da < s->vram_size) {
+            chunk = MIN(chunk, (uint32_t)(s->vram_size - da));
+        }
+        if (sa < s->vram_size) {
+            chunk = MIN(chunk, (uint32_t)(s->vram_size - sa));
+        }
+        memmove(d, r, chunk);
+        da += chunk;
+        sa += chunk;
+        n -= chunk;
     }
 }
 
@@ -4548,6 +4598,15 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
     uint32_t mask = bpp == 4 ? 0xFFFFFFFFu : bpp == 2 ? 0xFFFF : 0xFF;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
+    if (getenv("PPCGPU_LE2D_LOG")) {
+        static int n;
+        if (n++ < 4000) {
+            fprintf(stderr, "LE2D rop=%02x brush=%u srcsrc=%u dst=%08x/%u (%d,%d) src=%08x/%u (%d,%d) %ux%u bpp=%u%s%s\n",
+                    rop, brush, src_src, doff, dpitch, dx, dy, soff, spitch, sx, sy, w, h, bpp,
+                    (uint64_t)doff + (uint64_t)dpitch * (dy > 0 ? dy : 0) >= s->vram_size ? " DST-OUTSIDE-VRAM" : "",
+                    need_src && (uint64_t)soff + (uint64_t)spitch * (sy > 0 ? sy : 0) >= s->vram_size ? " SRC-OUTSIDE-VRAM" : "");
+        }
+    }
     if (!w || !h || !dpitch || (src_src == 3 && need_src)) {
         return;     /* host-data sources arrive in HOSTDATA_BLT packets */
     }
@@ -4562,22 +4621,36 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
         }
         return;
     }
-    r200_vram_access(s, R200_ROWS(doff, dpitch, dy < 0 ? 0 : MIN(dy, dy + (int)h - 1), h), true, 1);
+    bool dgtt = doff >= s->vram_size, sgtt = need_src && soff >= s->vram_size;
+    if (!dgtt) {
+        r200_vram_access(s, R200_ROWS(doff, dpitch, dy < 0 ? 0 : MIN(dy, dy + (int)h - 1), h), true, 1);
+    }
+    if (need_src && !sgtt) {
+        /* a download reads what the renderer wrote: make it visible first */
+        r200_vram_access(s, R200_ROWS(soff, spitch, sy < 0 ? 0 : MIN(sy, sy + (int)h - 1), h), false, 1);
+    }
     for (uint32_t j = 0; j < h; j++) {
         int y = yt2b ? dy + (int)j : dy - (int)j;
         int ys = yt2b ? sy + (int)j : sy - (int)j;
 
-        if (y < 0 || (uint64_t)doff + (uint64_t)y * dpitch >= s->vram_size) {
+        if (y < 0 || (!dgtt && (uint64_t)doff + (uint64_t)y * dpitch >= s->vram_size)) {
             continue;
         }
         /* fast paths: solid pattern copy and screen copy of whole rows */
-        if (rop == 0xF0 && brush == 13 && !clip) {
+        if (rop == 0xF0 && brush == 13 && !clip && !dgtt) {
             uint32_t col = s->regs.dp_brush_frgd_clr & mask;
             int x0 = xl2r ? dx : dx - (int)w + 1;
             for (uint32_t i = 0; i < w; i++) {
                 gpu_px_put(s, vram, (uint64_t)doff + (uint64_t)y * dpitch +
                            (uint64_t)(x0 + i) * bpp, col, bpp);
             }
+            continue;
+        }
+        if (rop == 0xCC && src_src == 2 && !clip && ys >= 0 && (dgtt || sgtt)) {
+            /* a download to system memory or an upload from it: whole rows, page by page */
+            int x0 = xl2r ? dx : dx - (int)w + 1, xs0 = xl2r ? sx : sx - (int)w + 1;
+            gpu_mc_copy(s, vram, (uint64_t)doff + (uint64_t)y * dpitch + (uint64_t)x0 * bpp,
+                        (uint64_t)soff + (uint64_t)ys * spitch + (uint64_t)xs0 * bpp, w * bpp);
             continue;
         }
         if (rop == 0xCC && src_src == 2 && !clip && ys >= 0) {
@@ -4617,7 +4690,7 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
             gpu_px_put(s, vram, da, gpu_rop3(rop, pat, src, gpu_px_get(s, vram, da, bpp)) & mask, bpp);
         }
     }
-    {
+    if (!dgtt) {
         int ylo = yt2b ? dy : dy - (int)h + 1;
         if (ylo < 0) {
             ylo = 0;
