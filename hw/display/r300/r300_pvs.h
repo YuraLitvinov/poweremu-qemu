@@ -25,6 +25,32 @@
 #define R300_PVS_NUM_TEMPS      128
 #define R300_PVS_NUM_ALT_TEMPS  20
 
+/* Opcodes and operand kinds (shared with the GLSL translator, r300_pvs_glsl.c). */
+/* Vector engine opcodes */
+enum {
+    VE_NOP = 0, VE_DOT_PRODUCT, VE_MULTIPLY, VE_ADD, VE_MULTIPLY_ADD,
+    VE_DISTANCE_VECTOR, VE_FRACTION, VE_MAXIMUM, VE_MINIMUM,
+    VE_SET_GREATER_THAN_EQUAL, VE_SET_LESS_THAN, VE_MULTIPLYX2_ADD,
+    VE_MULTIPLY_CLAMP, VE_FLT2FIX_DX, VE_FLT2FIX_DX_RND,
+    /* R5xx, harmless to implement */
+    VE_COND_MUX_EQ = 23, VE_COND_MUX_GT, VE_COND_MUX_GTE,
+    VE_SET_GREATER_THAN, VE_SET_EQUAL, VE_SET_NOT_EQUAL,
+};
+
+/* Math engine opcodes */
+enum {
+    ME_NOP = 0, ME_EXP_BASE2_DX, ME_LOG_BASE2_DX, ME_EXP_BASEE_FF,
+    ME_LIGHT_COEFF_DX, ME_POWER_FUNC_FF, ME_RECIP_DX, ME_RECIP_FF,
+    ME_RECIP_SQRT_DX, ME_RECIP_SQRT_FF, ME_MULTIPLY, ME_EXP_BASE2_FULL_DX,
+    ME_LOG_BASE2_FULL_DX, ME_POWER_FUNC_FF_CLAMP_B,
+    ME_POWER_FUNC_FF_CLAMP_B1, ME_POWER_FUNC_FF_CLAMP_01, ME_SIN, ME_COS,
+    ME_LOG_BASE2_IEEE, ME_RECIP_IEEE, ME_RECIP_SQRT_IEEE,
+};
+
+enum { SRC_TEMP = 0, SRC_INPUT, SRC_CONST, SRC_ALT };
+enum { DST_TEMP = 0, DST_A0, DST_OUT, DST_OUT_REPL_X, DST_ALT, DST_INPUT };
+
+
 /* A source operand decoded once per draw (r300_pvs_prepare) instead of once per vertex. */
 typedef struct R300PVSSrc {
     uint8_t type;           /* SRC_TEMP, SRC_INPUT, SRC_CONST, SRC_ALT */

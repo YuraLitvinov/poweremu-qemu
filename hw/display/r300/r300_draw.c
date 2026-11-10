@@ -1267,7 +1267,40 @@ static bool pvsrec_wanted(uint32_t n)
                     pvsrec.path, pvsrec.n, pvsrec.max);
         }
     }
-    return pvsrec.path && n == pvsrec.n && pvsrec.done < pvsrec.max;
+    /* PPCGPU_PVSREC_N=0: every distinct program once, its first 64 vertices (see pvsrec_write) */
+    return pvsrec.path && n && (pvsrec.n ? n == pvsrec.n : true) && pvsrec.done < pvsrec.max;
+}
+
+/* Has this program (code, flow control, constants) been recorded already?  Only used when PVSREC_N is 0. */
+static bool pvsrec_seen(const R300PVSProgram *prog, const float (*consts)[4])
+{
+    static uint64_t seen[1024];
+    static unsigned nseen;
+    uint64_t h = 1469598103934665603ull;
+
+    for (unsigned pc = prog->first_inst; pc <= prog->last_inst && pc < R300_PVS_MAX_INSTS; pc++) {
+        for (int k = 0; k < 4; k++) {
+            h = (h ^ prog->code[pc * 4 + k]) * 1099511628211ull;
+        }
+    }
+    h = (h ^ prog->fc_opc) * 1099511628211ull;
+    for (int i = 0; i <= prog->max_const && i < 256; i++) {
+        for (int k = 0; k < 4; k++) {
+            uint32_t w;
+
+            memcpy(&w, &consts[i][k], sizeof(w));
+            h = (h ^ w) * 1099511628211ull;
+        }
+    }
+    for (unsigned i = 0; i < nseen; i++) {
+        if (seen[i] == h) {
+            return true;
+        }
+    }
+    if (nseen < 1024) {
+        seen[nseen++] = h;
+    }
+    return false;
 }
 
 static void pvsrec_write(const R300PVSProgram *prog, const float (*consts)[4],
@@ -1543,7 +1576,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     free(oidx);
     free(corner);
     if (cin) {
-        pvsrec_write(&prog, (const float (*)[4])consts, n, cin, outs);
+        if (pvsrec.n || !pvsrec_seen(&prog, (const float (*)[4])consts)) {
+            pvsrec_write(&prog, (const float (*)[4])consts, !pvsrec.n && n > 64 ? 64 : n, cin, outs);
+        }
         free(cin);
     }
     for (uint32_t j = 0; j < nsrc; j++) {
