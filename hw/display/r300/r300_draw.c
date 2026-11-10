@@ -486,10 +486,19 @@ static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
             u->consts[i][c] = r300_float24(r300_reg(st, PFS_PARAM_0_X + 16 * i + 4 * c));
         }
     }
-    u->blend_color[0] = ((bc >> 16) & 0xFF) / 255.0f;
-    u->blend_color[1] = ((bc >> 8) & 0xFF) / 255.0f;
-    u->blend_color[2] = (bc & 0xFF) / 255.0f;
-    u->blend_color[3] = (bc >> 24) / 255.0f;
+    /*
+     * RB3D_BLEND_COLOR byte n belongs to stored component n of the colour buffer, i.e. to the channel US_OUT_FMT's
+     * select n names (0 A, 1 R, 2 G, 3 B); Mesa pre-swaps the colour for buffers that are not BGRA.  Fixed-size work.
+     */
+    {
+        uint32_t ofr = r300_reg(st, US_OUT_FMT_0);
+
+        for (int n = 0; n < 4; n++) {
+            unsigned sel = (ofr >> (8 + 2 * n)) & 3;
+
+            u->blend_color[sel == 0 ? 3 : sel - 1] = ((bc >> (8 * n)) & 0xFF) / 255.0f;
+        }
+    }
     u->cblend = r300_reg(st, RB3D_CBLEND);
     u->ablend = r300_reg(st, RB3D_ABLEND);
     u->chanmask = r300_reg(st, RB3D_COLOR_CHANNEL_MASK) & 0xF;
