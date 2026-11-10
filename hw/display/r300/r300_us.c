@@ -915,6 +915,17 @@ static const char us_prelude2[] =
 "    return r300_tswz(hw, unit);\n"
 "}\n"
 "\n"
+"/* RB3D_COLOR_CHANNEL_MASK bit n covers stored component n of the colour buffer, i.e. the colour channel\n"
+"   sel[n] (0 A, 1 R, 2 G, 3 B) selects into it; returns the mask in logical order: bit 0 R, 1 G, 2 B, 3 A */\n"
+"uint r300_lmask(uint cm, uvec4 sel)\n"
+"{\n"
+"    uint m = 0u;\n"
+"    for (uint n = 0u; n < 4u; n++)\n"
+"        if (((cm >> n) & 1u) != 0u)\n"
+"            m |= 1u << (sel[n] == 0u ? 3u : sel[n] - 1u);\n"
+"    return m;\n"
+"}\n"
+"\n"
 "float r300_bfactor(uint f, vec4 src, vec4 dst, vec4 k, uint c)\n"
 "{\n"
 "    switch (f) {\n"
@@ -968,6 +979,19 @@ static const char us_prelude2[] =
 "{\n"
 "    vec4 c = vec4(0.0);\n"
 "    for (uint n = 0u; n < 4u; n++) {\n"
+"        uint s = sel[n];\n"
+"        if (s == 0u) c.a = hw[n]; else if (s == 1u) c.r = hw[n];\n"
+"        else if (s == 2u) c.g = hw[n]; else c.b = hw[n];\n"
+"    }\n"
+"    return c;\n"
+"}\n"
+"/* Like r300_from_hw, for a buffer that stores only the components in bit mask m: the others must not override\n"
+"   the channel they would select (A8 stores C2 only; its other selects still read A). */\n"
+"vec4 r300_from_hw_m(vec4 hw, uvec4 sel, uint m)\n"
+"{\n"
+"    vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n"
+"    for (uint n = 0u; n < 4u; n++) {\n"
+"        if (((m >> n) & 1u) == 0u) continue;\n"
 "        uint s = sel[n];\n"
 "        if (s == 0u) c.a = hw[n]; else if (s == 1u) c.r = hw[n];\n"
 "        else if (s == 2u) c.g = hw[n]; else c.b = hw[n];\n"
@@ -1176,10 +1200,11 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
         r300_sb_printf(sb,
             "#define r300_cb%u_t vec4\n#define r300_cb%u_o vec4\n#define R300_CB%u_OUT(x) (x)\n"
             "#define R300_CB%u_CLAMP true\n#define R300_CB%u_BLEND true\n"
+            "#define R300_CB%u_SEL %s\n"
             "%s"
             "vec4 r300_cb%u_unpack(vec4 fb) { return r300_unpack(fb, %s, %s); }\n"
             "vec4 r300_cb%u_pack(vec4 c) { return r300_pack(c, %s, %s); }\n\n",
-            k, k, k, k, k, fbdecl, k, sel, swap, k, sel, swap);
+            k, k, k, k, k, k, sel, fbdecl, k, sel, swap, k, sel, swap);
         return;
     }
     type = view == R300_RTV_RG32U ? "uvec2" : view == R300_RTV_RGBA32U ? "uvec4" : "uint";
@@ -1205,9 +1230,10 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
     r300_sb_printf(sb, "// colour buffer %u: format %u, US_OUT_FMT %08x, endian %u, %u bytes\n"
                    "#define r300_cb%u_t %s\n#define r300_cb%u_o uvec4\n#define R300_CB%u_OUT(x) %s\n"
                    "#define R300_CB%u_CLAMP %s\n#define R300_CB%u_BLEND %s\n"
+                   "#define R300_CB%u_SEL %s\n"
                    "%s",
                    k, cf, ofr, e, bpp, k, type, k, k, pad, k, fp ? "false" : "true",
-                   k, blend ? "true" : "false", fbdecl);
+                   k, blend ? "true" : "false", k, sel, fbdecl);
 
     /* The card's word(s): swaps are their own inverse. */
     char swb[200];
@@ -1226,9 +1252,11 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
     }
 
     char ub[640], pb[640];
+    unsigned stored = 0xF;      /* components of C0..C3 the buffer holds */
 #define S(n) (sg[n] ? "true" : "false")
     switch (cf) {
     case 9:     /* I8 stores C2 (Mesa r300_translate_out_fmt) */
+        stored = 0x4;
         snprintf(ub, sizeof(ub), "h.z = r300_upk(w, 0u, 8u, %s);", S(2));
         snprintf(pb, sizeof(pb), "uint w = r300_pk(h.z, 0u, 8u, %s);", S(2));
         break;
@@ -1246,12 +1274,15 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
         break;
     case 13:    /* UV88: C2 low byte, C0 high (Mesa); C_16 / C_16_FP: C0 */
         if (of == 3) {
+            stored = 0x1;
             snprintf(ub, sizeof(ub), "h.x = r300_upk(w, 0u, 16u, %s);", S(0));
             snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0u, 16u, %s);", S(0));
         } else if (of == 16) {
+            stored = 0x1;
             snprintf(ub, sizeof(ub), "h.x = r300_h16(w);");
             snprintf(pb, sizeof(pb), "uint w = r300_ph16(h.x);");
         } else {
+            stored = 0x5;
             snprintf(ub, sizeof(ub), "h.z = r300_upk(w, 0u, 8u, %s); h.x = r300_upk(w, 8u, 8u, %s);", S(2), S(0));
             snprintf(pb, sizeof(pb), "uint w = r300_pk(h.z, 0u, 8u, %s) | r300_pk(h.x, 8u, 8u, %s);", S(2), S(0));
         }
@@ -1259,22 +1290,27 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
     case 6:     /* 32-bit pixels other than C4_8 */
         switch (of) {
         case 3:
+            stored = 0x1;
             snprintf(ub, sizeof(ub), "h.x = r300_upk(w, 0u, 16u, %s);", S(0));
             snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0u, 16u, %s);", S(0));
             break;
         case 16:
+            stored = 0x1;
             snprintf(ub, sizeof(ub), "h.x = r300_h16(w);");
             snprintf(pb, sizeof(pb), "uint w = r300_ph16(h.x);");
             break;
         case 17:
+            stored = 0x3;
             snprintf(ub, sizeof(ub), "h.x = r300_h16(w); h.y = r300_h16(w >> 16);");
             snprintf(pb, sizeof(pb), "uint w = r300_ph16(h.x) | (r300_ph16(h.y) << 16);");
             break;
         case 19:
+            stored = 0x1;
             snprintf(ub, sizeof(ub), "h.x = uintBitsToFloat(w);");
             snprintf(pb, sizeof(pb), "uint w = floatBitsToUint(h.x);");
             break;
         default:    /* C2_16 */
+            stored = 0x3;
             snprintf(ub, sizeof(ub), "h.x = r300_upk(w, 0u, 16u, %s); h.y = r300_upk(w, 16u, 16u, %s);", S(0), S(1));
             snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0u, 16u, %s) | r300_pk(h.y, 16u, 16u, %s);", S(0), S(1));
             break;
@@ -1285,6 +1321,7 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
             snprintf(ub, sizeof(ub), "h = vec4(r300_h16(w.x), r300_h16(w.x >> 16), r300_h16(w.y), r300_h16(w.y >> 16));");
             snprintf(pb, sizeof(pb), "uvec2 w = uvec2(r300_ph16(h.x) | (r300_ph16(h.y) << 16), r300_ph16(h.z) | (r300_ph16(h.w) << 16));");
         } else if (of == 20) {
+            stored = 0x3;
             snprintf(ub, sizeof(ub), "h.x = uintBitsToFloat(w.x); h.y = uintBitsToFloat(w.y);");
             snprintf(pb, sizeof(pb), "uvec2 w = uvec2(floatBitsToUint(h.x), floatBitsToUint(h.y));");
         } else {    /* C4_16 */
@@ -1296,6 +1333,7 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
         break;
     default:    /* 7: 128-bit pixels, C4_32_FP (C2_32_FP fills two) */
         if (of == 20) {
+            stored = 0x3;
             snprintf(ub, sizeof(ub), "h.x = uintBitsToFloat(w.x); h.y = uintBitsToFloat(w.y);");
             snprintf(pb, sizeof(pb), "uvec4 w = uvec4(floatBitsToUint(h.x), floatBitsToUint(h.y), 0u, 0u);");
         } else {
@@ -1324,10 +1362,10 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
     r300_sb_printf(sb,
         "vec4 r300_cb%u_unpack(r300_cb%u_t fb)\n"
         "{\n    %s\n    vec4 h = vec4(0.0, 0.0, 0.0, 1.0);\n    %s\n"
-        "    return r300_from_hw(h, %s);\n}\n"
+        "    return r300_from_hw_m(h, %s, %uu);\n}\n"
         "r300_cb%u_t r300_cb%u_pack(vec4 c)\n"
         "{\n    vec4 h = r300_to_hw(c, %s);\n    %s\n    %s\n}\n\n",
-        k, k, swb, ub, sel, k, k, sel, pb, back);
+        k, k, swb, ub, sel, stored, k, k, sel, pb, back);
 }
 
 /* Blend, ROP and write mask for colour buffer k from shader output src. */
@@ -1356,13 +1394,13 @@ static void us_emit_target(R300Sb *sb, unsigned k, int src)
         "        if ((u.rop & 4u) != 0u)\n"
         "            res = r300_cb%u_unpack(r300_rop(r300_cb%u_pack(R300_CB%u_CLAMP ? clamp(s, 0.0, 1.0) : s),\n"
         "                                            fb%u, (u.rop >> 8) & 15u));\n"
-        "        /* RB3D_COLOR_CHANNEL_MASK: B G R A in bits 0..3 */\n"
-        "        uint cm = u.chanmask;\n"
-        "        res = vec4((cm & 4u) != 0u ? res.r : d.r, (cm & 2u) != 0u ? res.g : d.g,\n"
-        "                   (cm & 1u) != 0u ? res.b : d.b, (cm & 8u) != 0u ? res.a : d.a);\n"
+        "        /* RB3D_COLOR_CHANNEL_MASK: one bit per stored component, through the buffer's channel selects */\n"
+        "        uint cm = r300_lmask(u.chanmask, R300_CB%u_SEL);\n"
+        "        res = vec4((cm & 1u) != 0u ? res.r : d.r, (cm & 2u) != 0u ? res.g : d.g,\n"
+        "                   (cm & 4u) != 0u ? res.b : d.b, (cm & 8u) != 0u ? res.a : d.a);\n"
         "        o.c%u = r300_cb%u_pack(res);\n"
         "    }\n",
-        k, src, k, k, k, k, k, k, k, k, k, k);
+        k, src, k, k, k, k, k, k, k, k, k, k, k);
 }
 
 char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
