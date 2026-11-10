@@ -569,7 +569,11 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
             pitch = (((w + 3) / 4) * bpp + 31) & ~31u;
             rows = (h + 3) / 4;
         } else {
-            pitch = (w * bpp + 31) & ~31u;
+            /* Linear textures: rows padded to 32 bytes (Mesa's rule).  Micro-tiled ones (TX_OFFSET bit 3) as
+             * a little-endian guest's card lays them out, measured: 2x2, 3x2, 4x4 -> 16 bytes; 8x8 -> 32; 16x16
+             * -> 64, so rows are aligned to 16 bytes. */
+            pitch = (td->le && (td->tile & 0x8)) ? (w * bpp + 15) & ~15u
+                                                 : (w * bpp + 31) & ~31u;
             rows = h;
         }
         if (l == 0 && pitch_en) {

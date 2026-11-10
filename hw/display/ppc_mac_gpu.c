@@ -3060,6 +3060,8 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
         uint32_t ga = td->gpu_addr;
         if (r300_to_vram(s, &td->gpu_addr, tlen)) {
+            /* the card's own copies (texture uploads) write this memory: let them land before it is read */
+            r200_vram_access(s, td->gpu_addr, (uint64_t)td->gpu_addr + tlen, false, 1);
             continue;
         }
         /* AGP/GART texture: copy the texels out of guest memory (freed
