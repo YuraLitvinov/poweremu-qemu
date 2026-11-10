@@ -13,8 +13,11 @@
 
 #include <float.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Vector engine opcodes */
 enum {
@@ -95,20 +98,42 @@ static float pvs_select(const float *v, unsigned sel)
     return sel < 4 ? v[sel] : sel == 5 ? 1.0f : 0.0f;
 }
 
-/* A regular source operand, swizzled, with abs and negate applied. */
-static void pvs_src(PVSCtx *c, uint32_t s, float o[4])
+/*
+ * A source operand as decoded once per draw (r300_pvs_prepare): swizzled, abs and negate applied.  A plain
+ * operand is the register itself (no copy); otherwise the result goes to o.
+ */
+static inline const float *pvs_src(PVSCtx *c, const R300PVSSrc *s, float o[4])
 {
-    const float *v = pvs_mem(c, s & 3, pvs_addr(c, s, (s >> 5) & 0xFF));
+    const float *v = pvs_mem(c, s->type, s->mode ? pvs_rel(c, s->mode, s->sel, s->offset) : s->offset);
+    float t[8];
 
+    if (s->plain) {
+        return v;
+    }
+    t[0] = v[0]; t[1] = v[1]; t[2] = v[2]; t[3] = v[3];
+    t[4] = 0.0f; t[5] = 1.0f; t[6] = 0.0f; t[7] = 0.0f;
     for (int i = 0; i < 4; i++) {
-        float x = pvs_select(v, (s >> (13 + 3 * i)) & 7);
-        if (s & (1u << 3)) {
-            x = fabsf(x);
-        }
-        if (s & (1u << (25 + i))) {
-            x = -x;
-        }
-        o[i] = x;
+        uint32_t b;
+
+        memcpy(&b, &t[s->swz[i]], sizeof(b));
+        b = (b & s->absmask) ^ s->neg[i];
+        memcpy(&o[i], &b, sizeof(b));
+    }
+    return o;
+}
+
+static void pvs_decode_src(R300PVSSrc *d, uint32_t s)
+{
+    d->type = s & 3;
+    d->mode = ((s >> 4) & 1) | ((s >> 31) << 1);
+    d->sel = (s >> 29) & 7;
+    d->offset = (s >> 5) & 0xFF;
+    d->absmask = (s & (1u << 3)) ? 0x7fffffffu : 0xffffffffu;
+    d->plain = d->absmask == 0xffffffffu;
+    for (int i = 0; i < 4; i++) {
+        d->swz[i] = (s >> (13 + 3 * i)) & 7;
+        d->neg[i] = (s & (1u << (25 + i))) ? 0x80000000u : 0;
+        d->plain = d->plain && d->swz[i] == i && !d->neg[i];
     }
 }
 
@@ -221,34 +246,33 @@ static void pvs_vector(PVSCtx *c, unsigned op, const float *a, const float *b,
         return;
     }
     }
-    for (int i = 0; i < 4; i++) {
-        float x;
-        switch (op) {
-        case VE_NOP:                    x = 0.0f; break;
-        case VE_MULTIPLY:               x = a[i] * b[i]; break;
-        case VE_ADD:                    x = a[i] + b[i]; break;
-        case VE_MULTIPLY_ADD:           x = a[i] * b[i] + cc[i]; break;
-        case VE_FRACTION:               x = a[i] - floorf(a[i]); break;
-        case VE_MAXIMUM:                x = fmaxf(a[i], b[i]); break;
-        case VE_MINIMUM:                x = fminf(a[i], b[i]); break;
-        case VE_SET_GREATER_THAN_EQUAL: x = a[i] >= b[i]; break;
-        case VE_SET_LESS_THAN:          x = a[i] < b[i]; break;
-        case VE_MULTIPLYX2_ADD:         x = 2.0f * (a[i] * b[i]) + cc[i]; break;
-        case VE_FLT2FIX_DX:             x = floorf(a[i]); break;
-        case VE_FLT2FIX_DX_RND:         x = floorf(a[i] + 0.5f); break;
-        case VE_COND_MUX_EQ:            x = a[i] == 0.0f ? b[i] : cc[i]; break;
-        case VE_COND_MUX_GT:            x = a[i] > 0.0f ? b[i] : cc[i]; break;
-        case VE_COND_MUX_GTE:           x = a[i] >= 0.0f ? b[i] : cc[i]; break;
-        case VE_SET_GREATER_THAN:       x = a[i] > b[i]; break;
-        case VE_SET_EQUAL:              x = a[i] == b[i]; break;
-        case VE_SET_NOT_EQUAL:          x = a[i] != b[i]; break;
-        default:
-            c->unsup |= R300_PVS_UNSUP_OPCODE;
-            x = 0.0f;
-            break;
-        }
-        r[i] = x;
+    /* one loop per opcode, so the compiler can vectorise the common ones */
+#define VLOOP(expr) for (int i = 0; i < 4; i++) { r[i] = (expr); } return
+    switch (op) {
+    case VE_NOP:                    VLOOP(0.0f);
+    case VE_MULTIPLY:               VLOOP(a[i] * b[i]);
+    case VE_ADD:                    VLOOP(a[i] + b[i]);
+    case VE_MULTIPLY_ADD:           VLOOP(a[i] * b[i] + cc[i]);
+    case VE_FRACTION:               VLOOP(a[i] - floorf(a[i]));
+    case VE_MAXIMUM:                VLOOP(fmaxf(a[i], b[i]));
+    case VE_MINIMUM:                VLOOP(fminf(a[i], b[i]));
+    case VE_SET_GREATER_THAN_EQUAL: VLOOP(a[i] >= b[i]);
+    case VE_SET_LESS_THAN:          VLOOP(a[i] < b[i]);
+    case VE_MULTIPLYX2_ADD:         VLOOP(2.0f * (a[i] * b[i]) + cc[i]);
+    case VE_FLT2FIX_DX:             VLOOP(floorf(a[i]));
+    case VE_FLT2FIX_DX_RND:         VLOOP(floorf(a[i] + 0.5f));
+    case VE_COND_MUX_EQ:            VLOOP(a[i] == 0.0f ? b[i] : cc[i]);
+    case VE_COND_MUX_GT:            VLOOP(a[i] > 0.0f ? b[i] : cc[i]);
+    case VE_COND_MUX_GTE:           VLOOP(a[i] >= 0.0f ? b[i] : cc[i]);
+    case VE_SET_GREATER_THAN:       VLOOP(a[i] > b[i]);
+    case VE_SET_EQUAL:              VLOOP(a[i] == b[i]);
+    case VE_SET_NOT_EQUAL:          VLOOP(a[i] != b[i]);
+    default:
+        c->unsup |= R300_PVS_UNSUP_OPCODE;
+        r[0] = r[1] = r[2] = r[3] = 0.0f;
+        return;
     }
+#undef VLOOP
 }
 
 static void pvs_sat(float r[4])
@@ -370,23 +394,24 @@ static unsigned pvs_flow(const R300PVSProgram *prog, PVSCtx *c, unsigned pc,
 }
 
 /* One instruction. */
-static void pvs_exec(PVSCtx *c, const uint32_t *d)
+static void pvs_exec(PVSCtx *c, const R300PVSInst *ins)
 {
+    const uint32_t *d = ins->d;
     uint32_t d0 = d[0];
     unsigned op = d0 & 0x3F;
     bool math = (d0 >> 6) & 1;
     bool macro = (d0 >> 7) & 1;
     bool dual = !math && !macro && ((d0 >> 28) & 1);
-    float a[4], b[4], cc[4] = { 0 }, r[4];     /* dual: no third operand */
+    float sa[4], sb[4], sc[4], r[4];
+    static const float zero[4];
+    const float *a, *b, *cc;     /* dual: no third operand */
 
     if ((d0 >> 26) & 1) {
         c->unsup |= R300_PVS_UNSUP_PRED;
     }
-    pvs_src(c, d[1], a);
-    pvs_src(c, d[2], b);
-    if (!dual) {
-        pvs_src(c, d[3], cc);
-    }
+    a = pvs_src(c, &ins->src[0], sa);
+    b = pvs_src(c, &ins->src[1], sb);
+    cc = dual ? zero : pvs_src(c, &ins->src[2], sc);
 
     if (math) {
         pvs_math(c, op, a[3], b[3], cc[3], r);
@@ -441,13 +466,64 @@ static void pvs_exec(PVSCtx *c, const uint32_t *d)
     pvs_write(c, d0, r);
 }
 
+void r300_pvs_prepare(R300PVSProgram *prog)
+{
+    unsigned nt = 0;
+    bool all = false, alt = false;
+
+    for (unsigned pc = prog->first_inst; pc <= prog->last_inst && pc < R300_PVS_MAX_INSTS; pc++) {
+        R300PVSInst *ins = &prog->dec[pc];
+        uint32_t d0;
+
+        memcpy(ins->d, &prog->code[pc * 4], sizeof(ins->d));
+        d0 = ins->d[0];
+        for (int k = 0; k < 3; k++) {
+            pvs_decode_src(&ins->src[k], ins->d[k + 1]);
+        }
+        /* which temporaries can the program touch?  A relative address could reach any of them. */
+        for (int k = 0; k < 3; k++) {
+            const R300PVSSrc *sr = &ins->src[k];
+
+            if (sr->type == SRC_ALT) {
+                alt = true;
+            }
+            if (sr->type == SRC_TEMP) {
+                if (sr->mode) {
+                    all = true;
+                } else if (sr->offset + 1u > nt) {
+                    nt = sr->offset + 1u;
+                }
+            }
+        }
+        if (((d0 >> 8) & 0xF) == DST_ALT || (!((d0 >> 6) & 1) && !((d0 >> 7) & 1) && ((d0 >> 28) & 1))) {
+            alt = true;                 /* an ATRM destination, or a dual-issue math half that writes one */
+        }
+        if (((d0 >> 8) & 0xF) == DST_TEMP) {
+            unsigned mode = ((d0 >> 31) & 1) | (((d0 >> 12) & 1) << 1);
+
+            if (mode) {
+                all = true;
+            } else if (((d0 >> 13) & 0x7F) + 1u > nt) {
+                nt = ((d0 >> 13) & 0x7F) + 1u;
+            }
+        }
+    }
+    prog->ntemps = all || nt > R300_PVS_NUM_TEMPS ? R300_PVS_NUM_TEMPS : nt;
+    prog->uses_alt = alt;
+}
+
 uint32_t r300_pvs_run(const R300PVSProgram *prog,
                       const float in[R300_PVS_NUM_INPUTS][4],
                       float out[R300_PVS_NUM_OUTPUTS][4])
 {
     PVSCtx c;
 
-    memset(&c.r, 0, sizeof(c.r));
+    /* only the registers the program can read need to start at zero (see r300_pvs_prepare) */
+    memset(c.r.temp, 0, prog->ntemps * sizeof(c.r.temp[0]));
+    if (prog->uses_alt) {
+        memset(c.r.alt, 0, sizeof(c.r.alt));
+    }
+    memset(c.r.a0, 0, sizeof(c.r.a0));
     c.prog = prog;
     c.in = in;
     c.out = out;
@@ -466,11 +542,133 @@ uint32_t r300_pvs_run(const R300PVSProgram *prog,
             c.unsup |= R300_PVS_UNSUP_FLOW;     /* runaway loop */
             break;
         }
-        pvs_exec(&c, &prog->code[pc * 4]);
+        pvs_exec(&c, &prog->dec[pc]);
         next = prog->fc_opc ? pvs_flow(prog, &c, pc, loop, &nloop, jsr, &njsr)
                             : pc + 1;
     }
     return c.unsup;
+}
+
+/* ---- batches over a small worker pool ---------------------------------- */
+
+#define PVS_MAX_WORKERS     7           /* plus the calling thread */
+#define PVS_MIN_BATCH       256         /* smaller batches cost more to hand out than to run */
+#define PVS_CHUNK           64
+
+typedef struct PVSJob {
+    const R300PVSProgram *prog;
+    unsigned n;
+    const float (*in)[R300_PVS_NUM_INPUTS][4];
+    float (*out)[R300_PVS_NUM_OUTPUTS][4];
+    const uint32_t *oidx;
+    unsigned next;                      /* next unclaimed vertex (atomic) */
+    uint32_t unsup;                     /* OR of the flags (atomic) */
+} PVSJob;
+
+static struct {
+    pthread_mutex_t call;               /* one batch at a time */
+    pthread_mutex_t m;
+    pthread_cond_t wake, done;
+    unsigned gen;                       /* bumps per batch */
+    unsigned pending;                   /* workers that have not finished the current batch */
+    int nworkers;
+    PVSJob job;
+} pool = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+           PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, -1 };
+
+static void pvs_job_work(PVSJob *j)
+{
+    uint32_t u = 0;
+
+    for (;;) {
+        unsigned i0 = __atomic_fetch_add(&j->next, PVS_CHUNK, __ATOMIC_RELAXED);
+        unsigned i1;
+
+        if (i0 >= j->n) {
+            break;
+        }
+        i1 = i0 + PVS_CHUNK < j->n ? i0 + PVS_CHUNK : j->n;
+        for (unsigned i = i0; i < i1; i++) {
+            u |= r300_pvs_run(j->prog, j->in[i], j->out[j->oidx[i]]);
+        }
+    }
+    if (u) {
+        __atomic_fetch_or(&j->unsup, u, __ATOMIC_RELAXED);
+    }
+}
+
+static void *pvs_worker(void *arg)
+{
+    unsigned seen = 0;
+
+    (void)arg;
+    pthread_mutex_lock(&pool.m);
+    for (;;) {
+        while (pool.gen == seen) {
+            pthread_cond_wait(&pool.wake, &pool.m);
+        }
+        seen = pool.gen;
+        pthread_mutex_unlock(&pool.m);
+        pvs_job_work(&pool.job);
+        pthread_mutex_lock(&pool.m);
+        if (--pool.pending == 0) {
+            pthread_cond_signal(&pool.done);
+        }
+    }
+    return NULL;
+}
+
+static int pvs_pool_init(void)
+{
+    if (pool.nworkers < 0) {
+        const char *e = getenv("R300_PVS_THREADS");   /* total threads, 1 = serial */
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        int want = e ? atoi(e) : (int)(cpus < 8 ? cpus : 8);
+        int made = 0;
+
+        want = want < 1 ? 1 : want > PVS_MAX_WORKERS + 1 ? PVS_MAX_WORKERS + 1 : want;
+        for (int i = 0; i < want - 1; i++) {
+            pthread_t t;
+
+            if (pthread_create(&t, NULL, pvs_worker, NULL)) {
+                break;
+            }
+            pthread_detach(t);
+            made++;
+        }
+        pool.nworkers = made;
+    }
+    return pool.nworkers;
+}
+
+uint32_t r300_pvs_run_batch(const R300PVSProgram *prog, unsigned n,
+                            const float (*in)[R300_PVS_NUM_INPUTS][4],
+                            float (*out)[R300_PVS_NUM_OUTPUTS][4],
+                            const uint32_t *oidx)
+{
+    PVSJob serial = { prog, n, in, out, oidx, 0, 0 };
+
+    if (n < PVS_MIN_BATCH || pvs_pool_init() == 0 || pthread_mutex_trylock(&pool.call)) {
+        pvs_job_work(&serial);
+        return serial.unsup;
+    }
+    pthread_mutex_lock(&pool.m);
+    pool.job = serial;
+    pool.pending = pool.nworkers;
+    pool.gen++;
+    pthread_cond_broadcast(&pool.wake);
+    pthread_mutex_unlock(&pool.m);
+
+    pvs_job_work(&pool.job);
+
+    pthread_mutex_lock(&pool.m);
+    while (pool.pending) {
+        pthread_cond_wait(&pool.done, &pool.m);
+    }
+    serial.unsup = pool.job.unsup;
+    pthread_mutex_unlock(&pool.m);
+    pthread_mutex_unlock(&pool.call);
+    return serial.unsup;
 }
 
 void r300_pvs_disasm_inst(const uint32_t d[4], char *buf, unsigned len)

@@ -25,6 +25,23 @@
 #define R300_PVS_NUM_TEMPS      128
 #define R300_PVS_NUM_ALT_TEMPS  20
 
+/* A source operand decoded once per draw (r300_pvs_prepare) instead of once per vertex. */
+typedef struct R300PVSSrc {
+    uint8_t type;           /* SRC_TEMP, SRC_INPUT, SRC_CONST, SRC_ALT */
+    uint8_t mode;           /* ADDR_MODE: 0 absolute, 1 A0 relative, 2 loop index */
+    uint8_t sel;            /* A0 component (s >> 29) */
+    uint8_t swz[4];         /* component select: 0-3 channel, 5 one, else zero */
+    uint16_t offset;
+    bool plain;             /* identity swizzle, no abs, no negate: use the register in place */
+    uint32_t absmask;       /* 0x7fffffff with abs, else 0xffffffff */
+    uint32_t neg[4];        /* 0x80000000 where negated */
+} R300PVSSrc;
+
+typedef struct R300PVSInst {
+    uint32_t d[4];          /* the raw instruction */
+    R300PVSSrc src[3];
+} R300PVSInst;
+
 typedef struct R300PVSProgram {
     const uint32_t *code;   /* PVS code memory, 4 dwords per inst */
     unsigned first_inst;    /* VAP_PVS_CODE_CNTL_0.PVS_FIRST_INST */
@@ -37,7 +54,14 @@ typedef struct R300PVSProgram {
     uint32_t fc_opc;
     uint32_t fc_addrs[16];
     uint32_t fc_loop[16];
+    /* Filled by r300_pvs_prepare: */
+    unsigned ntemps;        /* temporaries a vertex can read before writing: zeroed per vertex */
+    bool uses_alt;          /* the program reads or writes the ATRM registers */
+    R300PVSInst dec[R300_PVS_MAX_INSTS];
 } R300PVSProgram;
+
+/* Decode the program once (code, first_inst, last_inst, flow control must be set); call before r300_pvs_run. */
+void r300_pvs_prepare(R300PVSProgram *prog);
 
 /*
  * Run the program for one vertex.  in[] is the input vertex memory (IVM),
@@ -53,6 +77,16 @@ typedef struct R300PVSProgram {
 uint32_t r300_pvs_run(const R300PVSProgram *prog,
                       const float in[R300_PVS_NUM_INPUTS][4],
                       float out[R300_PVS_NUM_OUTPUTS][4]);
+
+/*
+ * Run the program for n vertices: vertex i reads in[i] and writes out[oidx[i]].  Large batches are split across
+ * a small pool of worker threads; the results are exactly those of n calls to r300_pvs_run.  Returns the OR of
+ * their flags.
+ */
+uint32_t r300_pvs_run_batch(const R300PVSProgram *prog, unsigned n,
+                            const float (*in)[R300_PVS_NUM_INPUTS][4],
+                            float (*out)[R300_PVS_NUM_OUTPUTS][4],
+                            const uint32_t *oidx);
 
 /* One line of disassembly per instruction into buf; for traces. */
 void r300_pvs_disasm_inst(const uint32_t d[4], char *buf, unsigned len);

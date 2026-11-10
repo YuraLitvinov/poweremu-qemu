@@ -1458,6 +1458,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
     }
 
+    r300_pvs_prepare(&prog);
     output_layout(st, &lay);
     rs_route(st, &route, &desc, &pkt->warn);
 
@@ -1471,12 +1472,37 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
     bool rec = !rects && !bypass && pvsrec_wanted(n);
     float (*cin)[R300_PVS_NUM_INPUTS][4] = rec ? calloc(n, sizeof(*cin)) : NULL;
+    /*
+     * Fetch every vertex first, then run the vertex program over all of them at once (r300_pvs_run_batch splits a
+     * big batch across worker threads).  oidx[k] is the output slot of the k-th vertex; a rectangle's fourth
+     * corner is derived from the other three once their outputs exist.
+     */
+    float (*ins)[R300_PVS_NUM_INPUTS][4] = bypass || !n ? NULL : malloc(n * sizeof(*ins));
+    uint32_t *oidx = bypass || !n ? NULL : malloc(n * sizeof(*oidx));
+    uint32_t *corner = rects ? malloc((n / 3 + 1) * sizeof(*corner)) : NULL;
+    uint32_t nrun = 0, ncorner = 0;
+
+    if (!bypass && n && (!ins || !oidx)) {
+        *err = "out of memory";
+        free(ins);
+        free(oidx);
+        free(corner);
+        free(cin);
+        free(outs);
+        free(xv);
+        free(order);
+        return false;
+    }
     for (uint32_t i = 0, j = 0; i < n && j < nsrc; i++, j++) {
-        float in[R300_PVS_NUM_INPUTS][4];
-        float (*out)[4] = outs[j];
+        float in_local[R300_PVS_NUM_INPUTS][4];
+        float (*in)[4] = ins ? ins[nrun] : in_local;
 
         if (!fetch_vertex(&f, order[i], in)) {
             *err = f.why ? f.why : "vertex data out of range";
+            free(ins);
+            free(oidx);
+            free(corner);
+            free(cin);
             free(outs);
             free(xv);
             free(order);
@@ -1486,25 +1512,36 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             memcpy(cin[i], in, sizeof(cin[i]));
         }
         if (bypass) {
-            memcpy(out, in, sizeof(outs[j]));
+            memcpy(outs[j], in, sizeof(outs[j]));
         } else {
-            uint32_t u = r300_pvs_run(&prog, (const float (*)[4])in, out);
-            if (u & R300_PVS_UNSUP_FLOW) {
-                pkt->warn |= R300_WARN_FLOW;
-            }
-            if (u & ~R300_PVS_UNSUP_FLOW) {
-                pkt->warn |= R300_WARN_PVS;
-            }
+            oidx[nrun++] = j;
         }
         if (rects && i % 3 == 2) {
-            j++;
-            for (int o = 0; o < R300_PVS_NUM_OUTPUTS; o++) {
-                for (int c = 0; c < 4; c++) {
-                    outs[j][o][c] = outs[j - 3][o][c] + outs[j - 1][o][c] - outs[j - 2][o][c];
-                }
+            corner[ncorner++] = ++j;
+        }
+    }
+    if (nrun) {
+        uint32_t u = r300_pvs_run_batch(&prog, nrun, (const float (*)[R300_PVS_NUM_INPUTS][4])ins, outs, oidx);
+
+        if (u & R300_PVS_UNSUP_FLOW) {
+            pkt->warn |= R300_WARN_FLOW;
+        }
+        if (u & ~R300_PVS_UNSUP_FLOW) {
+            pkt->warn |= R300_WARN_PVS;
+        }
+    }
+    for (uint32_t k = 0; k < ncorner; k++) {
+        uint32_t j = corner[k];
+
+        for (int o = 0; o < R300_PVS_NUM_OUTPUTS; o++) {
+            for (int c = 0; c < 4; c++) {
+                outs[j][o][c] = outs[j - 3][o][c] + outs[j - 1][o][c] - outs[j - 2][o][c];
             }
         }
     }
+    free(ins);
+    free(oidx);
+    free(corner);
     if (cin) {
         pvsrec_write(&prog, (const float (*)[4])consts, n, cin, outs);
         free(cin);
