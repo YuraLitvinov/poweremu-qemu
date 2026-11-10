@@ -11287,8 +11287,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
              addr + size > R200_GPIO_DVI_DDC + 2) ||
             (addr == R200_GPIO_DVI_DDC &&
              (s->regs.gpio_dvi_ddc & 0x30000))) {
-            s->regs.gpio_dvi_ddc = ppc_mac_gpu_i2c(&s->bbi2c,
+            if (!s->swap) {
+                /* one monitor, on the VGA connector: nothing answers on this port, so
+                 * both lines float high and the driver sees it as unconnected */
+                s->regs.gpio_dvi_ddc |= 0x300;
+            } else {
+                s->regs.gpio_dvi_ddc = ppc_mac_gpu_i2c(&s->bbi2c,
                                                      s->regs.gpio_dvi_ddc, 0);
+            }
         }
         break;
     case R200_GPIO_MONID ... R200_GPIO_MONID + 3:
@@ -11298,8 +11304,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
              addr + size > R200_GPIO_MONID + 2) ||
             (addr == R200_GPIO_MONID &&
              (s->regs.gpio_monid & 0x30000))) {
-            s->regs.gpio_monid = ppc_mac_gpu_i2c(&s->bbi2c,
-                                                   s->regs.gpio_monid, 0);
+            if (!s->swap) {
+                /* one monitor, on the VGA connector: nothing answers on this port, so
+                 * both lines float high and the driver sees it as unconnected */
+                s->regs.gpio_monid |= 0x300;
+            } else {
+                s->regs.gpio_monid = ppc_mac_gpu_i2c(&s->bbi2c,
+                                                     s->regs.gpio_monid, 0);
+            }
         }
         break;
 
