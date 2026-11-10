@@ -3129,6 +3129,13 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             pkt.uniforms.tex_info[t][0] = 0;
             continue;
         }
+        if (getenv("PPCGPU_GART_LOG")) {
+            const uint8_t *hb = td->host_data;
+            fprintf(stderr, "GARTTEX %08x fmt %02x %ux%u size %llu bytes: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | at +%u: %02x%02x%02x%02x\n",
+                    ga, td->format, td->width, td->height, (unsigned long long)tlen,
+                    hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7], hb[8], hb[9], hb[10], hb[11], hb[12], hb[13], hb[14], hb[15],
+                    (unsigned)(tlen > 64 ? 64 : 0), hb[tlen > 68 ? 64 : 0], hb[tlen > 68 ? 65 : 1], hb[tlen > 68 ? 66 : 2], hb[tlen > 68 ? 67 : 3]);
+        }
         static bool said;
         if (!said) {
             said = true;
