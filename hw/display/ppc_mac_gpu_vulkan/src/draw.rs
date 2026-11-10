@@ -207,9 +207,12 @@ impl Vk {
                     unsafe {
                         let dw = auxp.add(u.tex_addr[t][0] as usize) as *mut u32;
                         std::ptr::copy_nonoverlapping(td.host_data, dw as *mut u8, td.size_bytes as usize);
-                        // GART dwords reversed to VRAM's side (r300_tex_raw_bpp)
-                        for i in 0..(td.size_bytes as usize).div_ceil(4) {
-                            *dw.add(i) = (*dw.add(i)).swap_bytes();
+                        // GART dwords reversed to VRAM's side (r300_tex_raw_bpp); a little-endian guest's GART
+                        // already holds the words the card reads, as its VRAM does
+                        if !td.le {
+                            for i in 0..(td.size_bytes as usize).div_ceil(4) {
+                                *dw.add(i) = (*dw.add(i)).swap_bytes();
+                            }
                         }
                     }
                 }

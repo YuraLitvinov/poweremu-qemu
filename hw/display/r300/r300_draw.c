@@ -795,7 +795,8 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_dim[k][0] = t->dim;
         u->tex_dim[k][1] = t->depth;
         u->tex_dim[k][2] = t->pitch_bytes;
-        for (uint32_t l = 0; l < t->levels && l < R300_TEX_MAX_LEVELS; l++) {
+        /* only the shader-decoded (raw) path reads the level table: keep the common draw cheap */
+        for (uint32_t l = 0; t->kind == R300_TEXK_RAW && l < t->levels && l < R300_TEX_MAX_LEVELS; l++) {
             u->tex_lvl[k][l / 4][l % 4] = t->lvl_off[l];
             u->tex_lvl[k][3 + l / 4][l % 4] = t->lvl_pitch[l];
             u->tex_lvl[k][6 + l / 4][l % 4] = t->lvl_pitch[l] * t->lvl_rows[l];

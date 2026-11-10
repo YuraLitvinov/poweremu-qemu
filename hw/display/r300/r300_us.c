@@ -266,7 +266,7 @@ static void us_texu_args(char *buf, size_t len, const R300State *st,
      * (see work fix_piglit_texture_upload_copy_formats), so real 32F textures stay wrong for now.
      */
     snprintf(buf, len, "0x%xu, %uu, %uu, 0x%xu, %s", fmt, r300_tex_raw_bpp(fmt),
-             st->le_guest && (fmt < 0x1B || fmt > 0x1D) ? 2u : r300_reg(st, TX_OFFSET_0 + 4 * unit) & 3, filt,
+             st->le_guest ? 2u : r300_reg(st, TX_OFFSET_0 + 4 * unit) & 3, filt,
              (f1 >> 22) & 1 ? "true" : "false");
 }
 

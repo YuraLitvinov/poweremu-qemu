@@ -2441,9 +2441,24 @@ static uint32_t r300_swap_mode(uint32_t v, unsigned mode)
  * renderer counts every sample on one counter, which is reported as
  * pipe 0's (the driver sums the pipes).
  */
+/* PPCGPU_ZPASS_LOG, looked up once: the draw path must not call getenv */
+static bool r300_zpass_log(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PPCGPU_ZPASS_LOG") != NULL;
+    }
+    return on;
+}
+
 static void r300_zpass_write(PPCMacGPUState *s, uint32_t addr, uint32_t val)
 {
     PPCMacGPURenderer *r = s->renderer;
+
+    if (r300_zpass_log()) {
+        fprintf(stderr, "ZPASS %s %08x active %d\n", addr == 0x4F58 ? "DATA" : "ADDR", val, s->r3_zpass_active);
+    }
 
     if (addr == 0x4F58) {
         if (r && r->zpass_r300) {
@@ -3245,6 +3260,18 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     pkt.uniforms.zpass_count = s->r3_zpass_active;
+    if (s->r3_zpass_active && r300_zpass_log()) {
+        uint32_t h = 2166136261u;
+
+        for (const char *c = pkt.glsl ? pkt.glsl : ""; *c; c++) {
+            h = (h ^ (uint8_t)*c) * 16777619u;
+        }
+        fprintf(stderr, "ZPASS draw counted: rt %ux%u scissor %u,%u-%u,%u cull %u nv %u prim %u zinfo %x/%x/%x "
+                "cblend %x chanmask %x depth.attach %d fs %08x\n", pkt.rt_width, pkt.rt_height,
+                pkt.scissor[0], pkt.scissor[1], pkt.scissor[2], pkt.scissor[3], pkt.cull, pkt.num_verts,
+                pkt.prim_class, pkt.uniforms.zinfo[0], pkt.uniforms.zinfo[1], pkt.uniforms.zinfo[2],
+                pkt.uniforms.cblend, pkt.uniforms.chanmask, pkt.depth.attach, h);
+    }
     if (r300_reg(s->r3, 0x4E88) & 1) {         /* RB3D_AARESOLVE_CTL */
         r300_aa_resolve(s, &pkt);
         if (gart_backup) {
