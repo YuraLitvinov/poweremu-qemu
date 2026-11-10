@@ -68,6 +68,15 @@ impl Vk {
             bpr[k] = ns * (if k > 0 { pkt.cb[k].pitch } else { pkt.rt_pitch }) * bpp[k];
             fmt[k] = rt_format(view);
         }
+        if pkt.rt_dummy {
+            // Nothing is written to this colour target (all channels masked): give it room at the end of VRAM.
+            let bytes = bpr[0] as u64 * pkt.rt_height as u64;
+            if bytes == 0 || bytes > self.vram_size / 4 {
+                self.warn(7, "colour-less draw too large");
+                return -1;
+            }
+            addr[0] = ((self.vram_size - bytes) & !0xFFF) as u32;
+        }
         let zd = &pkt.depth;
         let mut want_z = zd.attach;
         if want_z && (zd.pitch < pkt.rt_width || zd.gpu_addr % 4 != 0) {

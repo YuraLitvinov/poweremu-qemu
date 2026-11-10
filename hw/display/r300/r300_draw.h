@@ -142,6 +142,12 @@ typedef struct R300DrawPacket {
     uint32_t rt_width, rt_height;
     uint32_t rt_format;         /* RB3D_COLORPITCH0 format field */
     uint32_t rt_bpp;            /* bytes per pixel */
+    /*
+     * Colour writes are all masked and the guest's colour buffer is a dummy narrower than the depth buffer (Mesa binds
+     * a tiny one when a draw has only depth or stencil): rt_pitch/rt_width are the depth buffer's and the renderer
+     * puts the (never changed) colour target in scratch VRAM instead of at rt_gpu_addr.
+     */
+    bool rt_dummy;
     uint32_t rt_view;           /* R300_RTV_* */
     uint32_t scissor[4];        /* x0, y0, x1, y1 (exclusive) */
     /* Colour buffers 1..num_cb-1 (render targets B-D the program writes,
