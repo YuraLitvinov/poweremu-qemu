@@ -572,9 +572,24 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
             /* Linear textures: rows padded to 32 bytes (Mesa's rule).  Micro-tiled ones (TX_OFFSET bit 3) as
              * a little-endian guest's card lays them out, measured: 2x2, 3x2, 4x4 -> 16 bytes; 8x8 -> 32; 16x16
              * -> 64, so rows are aligned to 16 bytes. */
-            pitch = (td->le && (td->tile & 0x8)) ? (w * bpp + 15) & ~15u
+            /* The micro tile is 8 pixels wide for 8bpp (8 bytes) and 16 bytes wide for 16..64bpp. */
+            uint32_t mt = bpp == 1 ? 7u : 15u;
+            bool square = td->le && (td->tile & 0x10);     /* TX_OFFSET micro tile 2: 4x4 pixels (16bpp) */
+            pitch = (td->le && (td->tile & 0x8)) ? (w * bpp + mt) & ~mt
                                                  : (w * bpp + 31) & ~31u;
+            if (square) {
+                pitch = (w * bpp + 4 * bpp - 1) & ~(4 * bpp - 1);
+            }
             rows = h;
+            if (square) {
+                rows = (rows + 3) & ~3u;
+            } else if (td->le && (td->tile & 0x8)) {
+                /* The driver also rounds the height up to the micro tile's height (r300_get_pixel_alignment:
+                 * 4 rows for 8bpp, 2 for 16..64bpp), so a 1-row level takes 2 rows and every level after it
+                 * sits that much further on. */
+                uint32_t th = bpp == 1 ? 4 : bpp <= 8 ? 2 : 1;
+                rows = (rows + th - 1) & ~(th - 1);
+            }
         }
         if (l == 0 && pitch_en) {
             pitch = td->pitch_bytes;
@@ -669,7 +684,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         unsigned bpp, decode = 0;
         bool dxt = false;
-        bool le = st->le_screen_h != 0;
+        bool le = st->le_guest;
         switch (fmt) {
         case 0x0:                       /* X8 */
             t->kind = R300_TEXK_R8; bpp = 1;
@@ -1352,7 +1367,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                       (br & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
     pkt->scissor[3] = (((br >> 13) & 0x1FFF) >= SC_COORD_BIAS) ?
                       ((br >> 13) & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
-    if (st->le_screen_h) {
+    if (st->le_guest) {
         /* The DRM clips with up to four cliprects (SC_CLIPRECT_TL/BR_0..3) chosen by
          * SC_CLIP_RULE: bit (in0 | in1<<1 | in2<<2 | in3<<3) says whether a pixel inside
          * exactly those rectangles is drawn.  Use the bounding box of the rectangles that

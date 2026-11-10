@@ -2983,6 +2983,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
+    s->r3->le_guest = !s->swap;
     s->r3->le_screen_h = s->swap ? 0 : s->disp.height;
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
@@ -3036,11 +3037,64 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.warn & R300_WARN_FLOW)     r300_warn_once("vertex program flow control ran away", NULL);
 
     uint32_t ns = pkt.aa_samples;
-    if (!r300_to_vram(s, &pkt.rt_gpu_addr,
-                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
-        r300_warn_once("colour buffer outside VRAM", NULL);
-        r300_draw_free(&pkt);
-        return;
+    /*
+     * A colour buffer in system memory (the GART): a little-endian guest's Mesa blits into a staging buffer
+     * there for glReadPixels and glGetTexImage.  The renderer only draws into VRAM, so draw into the end of
+     * VRAM instead, then copy the rows the draw touched back to the guest's pages and put back what the
+     * scratch area held.
+     */
+    uint32_t gart_addr = pkt.rt_gpu_addr, gart_scratch = 0, gart_y0 = 0, gart_y1 = 0;
+    uint64_t gart_len = 0;
+    uint8_t *gart_backup = NULL;
+    {
+        uint64_t rt_len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns;
+
+        if (!r300_to_vram(s, &pkt.rt_gpu_addr, rt_len)) {
+            uint8_t *vram_p = memory_region_get_ram_ptr(&s->vram);
+            uint32_t pitch_b = pkt.rt_pitch * pkt.rt_bpp;
+            float miny = 1e30f, maxy = -1e30f;
+
+            pkt.rt_gpu_addr = gart_addr;
+            for (uint32_t v = 0; v < pkt.num_verts + pkt.num_line_verts; v++) {
+                float y = pkt.verts[v].pos[1];
+                miny = MIN(miny, y);
+                maxy = MAX(maxy, y);
+            }
+            /* the packet's positions are NDC over the colour buffer: window y = (1 - y) * height / 2 */
+            {
+                float wy0 = (1.0f - maxy) * pkt.rt_height / 2.0f, wy1 = (1.0f - miny) * pkt.rt_height / 2.0f;
+                gart_y0 = wy0 > 0 ? (uint32_t)wy0 : 0;
+                gart_y1 = wy1 > 0 ? (uint32_t)ceilf(wy1) : 0;
+            }
+            gart_y0 = MAX(gart_y0, pkt.scissor[1]);
+            gart_y1 = MIN(MIN(gart_y1, pkt.scissor[3]), pkt.rt_height);
+            gart_len = rt_len;
+            if (getenv("PPCGPU_GART_LOG")) {
+                fprintf(stderr, "GARTRT %08x pitch %u bpp %u rt_h %u scissor %u,%u-%u,%u bbox y %.2f..%.2f -> rows %u..%u (%u verts)\n",
+                        gart_addr, pkt.rt_pitch, pkt.rt_bpp, pkt.rt_height, pkt.scissor[0], pkt.scissor[1],
+                        pkt.scissor[2], pkt.scissor[3], miny, maxy, gart_y0, gart_y1, pkt.num_verts);
+            }
+            if (ns != 1 || !pitch_b || gart_y1 <= gart_y0 || rt_len > s->vram_size / 4 ||
+                !(gart_backup = g_try_malloc(rt_len))) {
+                r300_warn_once("colour buffer outside VRAM", NULL);
+                g_free(gart_backup);
+                r300_draw_free(&pkt);
+                return;
+            }
+            gart_scratch = (s->vram_size - rt_len) & ~0xFFFu;
+            r200_vram_access(s, gart_scratch, gart_scratch + rt_len, true, 1);
+            if (s->renderer && s->renderer->flush_r200) {
+                s->renderer->flush_r200(s->renderer_opaque);
+            }
+            memcpy(gart_backup, vram_p + gart_scratch, rt_len);
+            /* what the buffer holds now, for blends and rows the draw leaves alone */
+            if (!r300_read_raw(s, gart_addr, vram_p + gart_scratch, rt_len)) {
+                memset(vram_p + gart_scratch, 0, rt_len);
+            }
+            memory_region_set_dirty(&s->vram, gart_scratch, rt_len);
+            pkt.rt_gpu_addr = gart_scratch;
+            gart_len = rt_len;
+        }
     }
     /* Render targets B-D (multiple render targets / multiwrites) */
     for (uint32_t k = 1; k < pkt.num_cb; k++) {
@@ -3173,6 +3227,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     pkt.uniforms.zpass_count = s->r3_zpass_active;
     if (r300_reg(s->r3, 0x4E88) & 1) {         /* RB3D_AARESOLVE_CTL */
         r300_aa_resolve(s, &pkt);
+        if (gart_backup) {
+            memcpy(memory_region_get_ram_ptr(&s->vram) + gart_scratch, gart_backup, gart_len);
+            memory_region_set_dirty(&s->vram, gart_scratch, gart_len);
+            g_free(gart_backup);
+        }
         r300_draw_free(&pkt);
         s->regs.stall_draws++;
         return;
@@ -3204,6 +3263,31 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
+        }
+        if (gart_backup) {
+            /* GART colour buffer: finish the draw, copy the rows it touched to the guest, restore the scratch */
+            uint8_t *vram_p = memory_region_get_ram_ptr(&s->vram);
+            uint32_t pitch_b = pkt.rt_pitch * pkt.rt_bpp;
+
+            if (rr >= 0 && s->renderer->flush_r200) {
+                s->renderer->flush_r200(s->renderer_opaque);
+                uint64_t off = (uint64_t)gart_y0 * pitch_b, end = (uint64_t)gart_y1 * pitch_b;
+                while (off < end) {
+                    uint32_t ga = gart_addr + off;
+                    uint8_t *page = r200_agp_page(s, ga);
+                    uint32_t n = MIN(end - off, 0x1000 - (ga & 0xFFF));
+                    if (!page) {
+                        r300_warn_once("GART colour buffer page not mapped", NULL);
+                        break;
+                    }
+                    memcpy(page + (ga & 0xFFF), vram_p + gart_scratch + off, n);
+                    off += n;
+                }
+            }
+            memcpy(vram_p + gart_scratch, gart_backup, gart_len);
+            memory_region_set_dirty(&s->vram, gart_scratch, gart_len);
+            g_free(gart_backup);
+            gart_backup = NULL;
         }
         if (rr < 0) {
             r300_warn_once("renderer rejected a draw", NULL);
@@ -3325,6 +3409,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             bql_unlock();
         }
     }
+    if (gart_backup) {                          /* no renderer drew: nothing to copy, scratch untouched */
+        memcpy(memory_region_get_ram_ptr(&s->vram) + gart_scratch, gart_backup, gart_len);
+        memory_region_set_dirty(&s->vram, gart_scratch, gart_len);
+        g_free(gart_backup);
+    }
     r300_draw_free(&pkt);
     s->regs.stall_draws++;
 }
@@ -3350,8 +3439,9 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump, "T3 %02x n=%u %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0);
     }
-    if (!draw && r300_drawlog()) {
-        fprintf(r300_drawlog(), "P op%02x n=%u %08x %08x %08x %08x\n", opcode,
+    FILE *dlog = draw ? NULL : r300_drawlog();      /* once: each call counts a line and may close the log */
+    if (dlog) {
+        fprintf(dlog, "P op%02x n=%u %08x %08x %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0,
                 body_dw > 2 ? d[2] : 0, body_dw > 3 ? d[3] : 0);
     }
