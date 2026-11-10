@@ -3205,6 +3205,16 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             g_free(fn);
         }
     }
+    /*
+     * CBZB fast clear (Mesa r300_blit.c): ZB_BW_CNTL.ZB_CB_CLEAR (bit 5).  The blitter draws only the upper half
+     * of the colour buffer; the Z unit writes ZB_DEPTHCLEARVALUE (the packed colour) over the pixels the draw
+     * covers, at ZB_DEPTHOFFSET (the buffer's midpoint) with ZB_DEPTHPITCH.  That is colour memory, not a depth
+     * buffer: no depth attachment, and the rectangle is filled after the draw.
+     */
+    bool cbzb_clear = (r300_reg(s->r3, 0x4F1C) & 0x20) != 0;
+    if (cbzb_clear) {
+        pkt.depth.attach = false;
+    }
     if (s->r3_zconv && (pkt.depth.attach || (r300_reg(s->r3, 0x4F00) & 7))) {
         r300_zconv(s, false);           /* drawing again: back to linear */
         s->r3_zconv = false;
@@ -3263,6 +3273,27 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
+        }
+        if (cbzb_clear && rr >= 0 && s->renderer->flush_r200) {
+            uint32_t zpitch_reg = r300_reg(s->r3, 0x4F24);
+            uint32_t zo = r300_reg(s->r3, 0x4F20) & ~0xFu;
+            uint32_t pitch_b = (zpitch_reg & 0x3FFC) * 4;
+            uint32_t x0 = pkt.scissor[0], y0 = pkt.scissor[1], x1 = pkt.scissor[2], y1 = pkt.scissor[3];
+            uint32_t v = r300_swap_mode(r300_reg(s->r3, 0x4F28), (zpitch_reg >> 19) & 3);
+
+            if (pitch_b && x1 > x0 && y1 > y0 && r300_to_vram(s, &zo, (uint64_t)pitch_b * y1)) {
+                uint8_t *vram_p = memory_region_get_ram_ptr(&s->vram);
+
+                /* the colour half is drawn and written back first, then the Z unit's half lands beside it */
+                s->renderer->flush_r200(s->renderer_opaque);
+                for (uint32_t y = y0; y < y1; y++) {
+                    uint32_t *row = (uint32_t *)(vram_p + zo + (uint64_t)y * pitch_b) + x0;
+                    for (uint32_t x = x0; x < x1; x++) {
+                        *row++ = v;
+                    }
+                }
+                memory_region_set_dirty(&s->vram, zo + (uint64_t)y0 * pitch_b, (uint64_t)(y1 - y0) * pitch_b);
+            }
         }
         if (gart_backup) {
             /* GART colour buffer: finish the draw, copy the rows it touched to the guest, restore the scratch */
