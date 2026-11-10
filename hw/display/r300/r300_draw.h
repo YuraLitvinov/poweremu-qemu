@@ -60,6 +60,7 @@ typedef struct R300TexDesc {
     uint32_t gpu_addr;          /* TX_OFFSET, low bits cleared */
     uint32_t width, height;
     uint32_t endian;            /* TX_OFFSET[1:0]: the card's dword swap */
+    bool le;                    /* little-endian (Linux) guest: texels are the card's own LE words */
     uint32_t tile;              /* TX_OFFSET[4:2]: macro (bit 2) and micro (bits 3-4) tiling; not implemented */
     uint32_t pitch_bytes;       /* level 0: bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */

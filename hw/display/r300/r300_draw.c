@@ -665,19 +665,20 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         unsigned bpp, decode = 0;
         bool dxt = false;
+        bool le = st->le_screen_h != 0;
         switch (fmt) {
         case 0x0:                       /* X8 */
             t->kind = R300_TEXK_R8; bpp = 1;
             break;
         case 0x3:                       /* Y8X8: big-endian halfwords */
-            t->kind = R300_TEXK_RG8; bpp = 2; decode = 2;
+            t->kind = R300_TEXK_RG8; bpp = 2; decode = le ? 0 : 2;
             break;
         case 0x1: case 0x6: case 0x7: case 0xA: case 0xB:
             t->kind = R300_TEXK_CONVERT16; bpp = 2;
             break;
         case 0xC:                       /* W8Z8Y8X8 */
             /* VRAM holds the guest CPU's big-endian words (see r300_tex). */
-            t->kind = R300_TEXK_RGBA8; bpp = 4; decode = (off & 3) == 0;
+            t->kind = R300_TEXK_RGBA8; bpp = 4; decode = le ? 0 : (off & 3) == 0;
             break;
         /* The card hands the shader DXT1 texels as B,G,R,A and DXT3/5 as
          * A,B,G,R (Tiger's swizzles R=Z,G=Y,B=X and R=W,G=Z,B=Y,A=X);
@@ -697,7 +698,9 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         t->bound = true;
         t->gpu_addr = off & ~0x1Fu;
-        t->endian = off & 3;
+        t->le = le;
+        /* a little-endian guest's words are already the card's: endian 2 undoes the big-endian view */
+        t->endian = le ? 2 : off & 3;
         t->tile = off & 0x1C;
         t->width = (f0 & 0x7FF) + 1;
         t->height = ((f0 >> 11) & 0x7FF) + 1;
@@ -1814,7 +1817,8 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
         for (uint32_t y = 0; y < h; y++) {
             const uint8_t *row = src + (uint64_t)y * pitch;
             for (uint32_t x = 0; x < w; x++) {
-                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
+                uint16_t v = td->le ? (uint16_t)(row[2 * x] | row[2 * x + 1] << 8)
+                                    : (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
                 r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
             }
         }
@@ -1840,7 +1844,7 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
         for (size_t i = 0; i < (size_t)bw * bh * bs; i += 4) {
             uint32_t l, v;
             memcpy(&l, out + i, 4);
-            if (td->host_data) {
+            if (td->host_data && !td->le) {
                 l = __builtin_bswap32(l);
             }
             v = __builtin_bswap32(l);                       /* the BE value */
