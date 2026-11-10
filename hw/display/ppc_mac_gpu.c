@@ -3211,7 +3211,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
      * covers, at ZB_DEPTHOFFSET (the buffer's midpoint) with ZB_DEPTHPITCH.  That is colour memory, not a depth
      * buffer: no depth attachment, and the rectangle is filled after the draw.
      */
-    bool cbzb_clear = (r300_reg(s->r3, 0x4F1C) & 0x20) != 0;
+    bool cbzb_clear = (r300_reg(s->r3, 0x4F1C) & 0x20) != 0 && !getenv("PPCGPU_NO_CBZB");
     if (cbzb_clear) {
         pkt.depth.attach = false;
     }
@@ -3281,6 +3281,12 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             uint32_t x0 = pkt.scissor[0], y0 = pkt.scissor[1], x1 = pkt.scissor[2], y1 = pkt.scissor[3];
             uint32_t v = r300_swap_mode(r300_reg(s->r3, 0x4F28), (zpitch_reg >> 19) & 3);
 
+            x1 = MIN(x1, pitch_b / 4);      /* the scissor is rounded up to 32 pixels; a row ends at the pitch */
+
+            if (getenv("PPCGPU_CBZB_LOG")) {
+                fprintf(stderr, "CBZB fill zo %08x pitch %u rows %u..%u cols %u..%u value %08x rt %08x rt_pitch %u rt_h %u\n",
+                        zo, pitch_b, y0, y1, x0, x1, v, pkt.rt_gpu_addr, pkt.rt_pitch, pkt.rt_height);
+            }
             if (pitch_b && x1 > x0 && y1 > y0 && r300_to_vram(s, &zo, (uint64_t)pitch_b * y1)) {
                 uint8_t *vram_p = memory_region_get_ram_ptr(&s->vram);
 
