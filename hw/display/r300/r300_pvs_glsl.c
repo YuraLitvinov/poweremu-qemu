@@ -59,7 +59,7 @@ static void reg_expr(char *out, size_t len, const R300PVSProgram *prog, const R3
             return;
         case SRC_CONST:
             if ((int)i <= prog->max_const) {
-                snprintf(out, len, "pvs_consts[%u]", i);
+                snprintf(out, len, "pvs_const(%u)", i);
             } else {
                 snprintf(out, len, "%s", zero);
             }
@@ -83,7 +83,7 @@ static void reg_expr(char *out, size_t len, const R300PVSProgram *prog, const R3
         snprintf(out, len, "(%s >= 0 && %s < %d ? IN[%s] : vec4(0.0))", ri, ri, R300_PVS_NUM_INPUTS, ri);
         break;
     case SRC_CONST:
-        snprintf(out, len, "(%s >= 0 && %s <= %d ? pvs_consts[%s] : vec4(0.0))", ri, ri, prog->max_const, ri);
+        snprintf(out, len, "(%s >= 0 && %s <= %d ? pvs_const(%s) : vec4(0.0))", ri, ri, prog->max_const, ri);
         break;
     default:
         snprintf(out, len, "(%s >= 0 && %s < %d ? A[%s] : vec4(0.0))", ri, ri, R300_PVS_NUM_ALT_TEMPS, ri);

@@ -5,8 +5,11 @@
  */
 
 #include "r300_draw.h"
+#include "r300_pvs_glsl.h"
 
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1333,6 +1336,192 @@ static void pvsrec_write(const R300PVSProgram *prog, const float (*consts)[4],
  * Everything after vertex ordering.  order[] (n entries, malloc'd) is
  * taken over; immd is the DRAW_IMMD_2 vertex data or NULL.
  */
+
+/* ---- vertex program on the GPU ---------------------------------------- */
+
+typedef struct Gb {
+    char *p;
+    size_t n, cap;
+} Gb;
+
+static void gb_printf(Gb *g, const char *fmt, ...)
+{
+    va_list ap;
+    int k;
+
+    for (;;) {
+        va_start(ap, fmt);
+        k = vsnprintf(g->p ? g->p + g->n : NULL, g->cap - g->n, fmt, ap);
+        va_end(ap);
+        if (k >= 0 && g->n + (size_t)k + 1 <= g->cap) {
+            g->n += k;
+            return;
+        }
+        g->cap = g->cap ? g->cap * 2 : 8192;
+        g->p = realloc(g->p, g->cap);
+    }
+}
+
+/*
+ * Word layout of the vertex shader's buffer (R300DrawPacket.gpu_data):
+ *   0..1023     the 256 constants (vec4), zero past max_const
+ *   1024 W  1025 H  1026 VTE bit 8 (uint)  1027 first word of the input vertices (uint)
+ *   1028..1033  viewport xscale, xoffset, yscale, yoffset, zscale, zoffset
+ *   1034 fog scale  1035 fog offset  1036 user clip enables (uint)
+ *   1038..1061  the six user clip planes (vec4)
+ *   1064..      one source vertex index per vertex drawn, then the input vertices (nin vec4 each)
+ */
+#define GPU_IDX_BASE        1064u
+
+/*
+ * Does this draw take the GPU vertex path?  Triangles only, with the colours as they come out of the vertex
+ * program and no polygon mode: the CPU path then does nothing to a vertex but copy it, so the shader can do all of
+ * it.  R300_PVS_GPU=0 forces the CPU path, 1 the GPU path; the default is the CPU path until the GPU one is
+ * proven (see work move_r300_vertex_stage_to_gpu).
+ */
+__attribute__((unused)) static bool gpu_vs_wanted(const R300State *st, unsigned prim, bool rects, bool bypass)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("R300_PVS_GPU");
+
+        mode = e ? atoi(e) : 0;
+    }
+    if (!mode || rects || bypass || !((1u << prim) & 0xE0F0u)) {
+        return false;
+    }
+    if ((r300_reg(st, GA_POLY_MODE) & 3) == 1) {
+        return false;
+    }
+    uint32_t colctl = r300_reg(st, GA_COLOR_CONTROL);
+    for (int c = 0; c < 4; c++) {
+        if (((colctl >> (4 * c)) & 3) != 2 || ((colctl >> (4 * c + 2)) & 3) != 2) {
+            return false;                       /* flat or solid shading */
+        }
+    }
+    return (r300_reg(st, VAP_OUTPUT_VTX_FMT_0) & (3u << 3)) == 0;   /* two-sided colours */
+}
+
+/* The vertex stage as GLSL: the vertex program, then what vtx_colors, viewport_xform and rs_values do. */
+__attribute__((unused)) static char *gpu_vs_text(const R300State *st, const Layout *lay, const Route *route, const char *pvs_glsl,
+                         uint32_t nin, const uint8_t *slots, bool fog, uint32_t fogsel, uint32_t clip)
+{
+    Gb g = { 0 };
+    static const int8_t tbl[16][4] = {
+        [0] = { 0, 1, 2, 3 },  [1] = { 0, 1, 2, -1 }, [2] = { 0, 1, 2, -2 },
+        [4] = { -1, -1, -1, 3 }, [5] = { -1, -1, -1, -1 }, [6] = { -1, -1, -1, -2 },
+        [8] = { -2, -2, -2, 3 }, [9] = { -2, -2, -2, -1 }, [10] = { -2, -2, -2, -2 },
+    };
+
+    gb_printf(&g,
+        "layout(std430, set = 0, binding = 2) readonly buffer R300PVS { uint pvs_data[]; };\n"
+        "/* ms.xy: the multisample being drawn, as a clip-space shift */\n"
+        "layout(std140, set = 0, binding = 3) uniform R300MS { vec4 ms; };\n"
+        "layout(location = 0) out vec4 v0; layout(location = 1) out vec4 v1;\n"
+        "layout(location = 2) out vec4 v2; layout(location = 3) out vec4 v3;\n"
+        "layout(location = 4) out vec4 v4; layout(location = 5) out vec4 v5;\n"
+        "layout(location = 6) out vec4 v6; layout(location = 7) out vec4 v7;\n"
+        "layout(location = 8) out vec4 v8; layout(location = 9) out vec4 v9;\n"
+        "layout(location = 10) out vec4 aux;\n");
+    if (clip & 0x3F) {
+        gb_printf(&g, "out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[6]; };\n");
+    }
+    gb_printf(&g,
+        "float pvs_f(uint w) { return uintBitsToFloat(pvs_data[w]); }\n"
+        "vec4 pvs_v4(uint w) { return vec4(pvs_f(w), pvs_f(w + 1u), pvs_f(w + 2u), pvs_f(w + 3u)); }\n"
+        "vec4 pvs_const(int i) { return pvs_v4(uint(i) * 4u); }\n"
+        "%s"
+        "void main()\n{\n"
+        "    uint sv = pvs_data[%uu + uint(gl_VertexIndex)];\n"
+        "    uint vb = pvs_data[1027u] + sv * %uu;\n"
+        "    vec4 IN[32]; vec4 OUT[32];\n"
+        "    for (int i = 0; i < 32; i++) { IN[i] = vec4(0.0); OUT[i] = vec4(0.0); }\n",
+        pvs_glsl, GPU_IDX_BASE, nin * 4);
+    for (uint32_t j = 0; j < nin; j++) {
+        gb_printf(&g, "    IN[%u] = pvs_v4(vb + %uu);\n", slots[j], j * 4);
+    }
+    gb_printf(&g,
+        "    r300_pvs(IN, OUT);\n"
+        "    vec4 c = OUT[%d];\n"
+        "    float W = pvs_f(1024u), H = pvs_f(1025u);\n"
+        "    float xs = pvs_f(1028u), xo = pvs_f(1029u), ys = pvs_f(1030u), yo = pvs_f(1031u), zs = pvs_f(1032u), zo = pvs_f(1033u);\n"
+        "    vec4 p;\n"
+        "    if (pvs_data[1026u] == 0u) {\n"
+        "        /* no perspective divide by the VTE: stay linear in clip space */\n"
+        "        p = vec4((2.0 * xs / W) * c.x + (2.0 * xo / W - 1.0) * c.w,\n"
+        "                 -(2.0 * ys / H) * c.y + (1.0 - 2.0 * yo / H) * c.w,\n"
+        "                 zs * c.z + zo * c.w, c.w);\n"
+        "    } else {\n"
+        "        float wx = xs * c.x + xo, wy = ys * c.y + yo;\n"
+        "        p = vec4(2.0 * wx / W - 1.0, 1.0 - 2.0 * wy / H, zs * c.z + zo, 1.0);\n"
+        "    }\n",
+        lay->pos);
+    for (int cp = 0; cp < 4; cp++) {
+        if (lay->color[cp] >= 0) {
+            gb_printf(&g, "    vec4 col%d = OUT[%d];\n", cp, lay->color[cp]);
+        } else {
+            gb_printf(&g, "    vec4 col%d = vec4(0.0);\n", cp);
+        }
+    }
+    for (unsigned k = 0; k < R300_NUM_VARYINGS; k++) {
+        if (k >= route->nvary) {
+            gb_printf(&g, "    v%u = vec4(0.0);\n", k);
+            continue;
+        }
+        uint32_t ip = r300_reg(st, RS_IP_0 + 4 * route->vary[k].ip);
+        gb_printf(&g, "    v%u = vec4(", k);
+        for (unsigned i = 0; i < 4; i++) {
+            char e[48];
+
+            if (route->vary[k].is_tex) {
+                unsigned ptr = ip & 0x3F, sel = (ip >> (13 + 3 * i)) & 7;
+
+                if (sel < 4 && ptr + sel < lay->nscal) {
+                    snprintf(e, sizeof(e), "OUT[%u].%c", lay->scal_slot[ptr + sel], "xyzw"[lay->scal_comp[ptr + sel]]);
+                } else {
+                    snprintf(e, sizeof(e), "%s", sel == 5 ? "1.0" : "0.0");
+                }
+            } else {
+                unsigned cp = (ip >> 6) & 7;
+                int sl = tbl[((ip >> 9) & 0xF) & 15][i];
+
+                if (sl >= 0 && cp < 4) {
+                    snprintf(e, sizeof(e), "col%u.%c", cp, "xyzw"[sl]);
+                } else {
+                    snprintf(e, sizeof(e), "%s", sl == -2 ? "1.0" : "0.0");
+                }
+            }
+            gb_printf(&g, "%s%s", i ? ", " : "", e);
+        }
+        gb_printf(&g, ");\n");
+    }
+    if (fog) {
+        if (fogsel < 4) {
+            gb_printf(&g, "    float fsrc = %s;\n", lay->color[fogsel] >= 0 ? "" : "0.0");
+            if (lay->color[fogsel] >= 0) {
+                g.n -= 0;
+                gb_printf(&g, "    fsrc = OUT[%d].w;\n", lay->color[fogsel]);
+            }
+        } else if (fogsel == 4) {
+            gb_printf(&g, "    float fsrc = c.w;\n");
+        } else {
+            gb_printf(&g, "    float fsrc = p.z / (p.w != 0.0 ? p.w : 1.0);\n");
+        }
+        gb_printf(&g, "    aux = vec4(fsrc * pvs_f(1034u) + pvs_f(1035u), 0.0, 0.0, 0.0);\n");
+    } else {
+        gb_printf(&g, "    aux = vec4(0.0);\n");
+    }
+    if (clip & 0x3F) {
+        for (int k = 0; k < 6; k++) {
+            gb_printf(&g, "    gl_ClipDistance[%d] = ((pvs_data[1036u] >> %du) & 1u) != 0u ? dot(c, pvs_v4(%uu)) : 1.0;\n",
+                      k, k, 1038 + 4 * k);
+        }
+    }
+    gb_printf(&g, "    gl_Position = vec4(p.xy + ms.xy * p.w, p.zw);\n}\n");
+    return g.p;
+}
+
 static bool draw_core(const R300State *st, const R300Arrays *arr,
                       uint32_t vf, uint32_t *order, uint32_t n,
                       const uint32_t *immd, uint32_t immd_dw,
@@ -1491,6 +1680,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
     }
 
+    desc.vs_gpu = NULL;
     r300_pvs_prepare(&prog);
     output_layout(st, &lay);
     rs_route(st, &route, &desc, &pkt->warn);
@@ -1837,8 +2027,10 @@ void r300_draw_free(R300DrawPacket *pkt)
 {
     free(pkt->glsl);
     free(pkt->verts);
+    free(pkt->gpu_data);
     pkt->glsl = NULL;
     pkt->verts = NULL;
+    pkt->gpu_data = NULL;
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         free(pkt->tex[t].host_data);
         pkt->tex[t].host_data = NULL;

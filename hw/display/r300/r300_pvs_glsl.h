@@ -5,9 +5,9 @@
  *
  *     void r300_pvs(vec4 IN[32], inout vec4 OUT[32])
  *
- * that does what r300_pvs_run() does for one vertex.  The program's constants are read from a global
- * `pvs_consts[]` array of vec4 that the consumer declares (a buffer or a uniform block); entries past
- * the program's max_const are never read, as in the interpreter.  OUT must be zero-filled by the caller
+ * that does what r300_pvs_run() does for one vertex.  The program's constants are read through a function
+ * `vec4 pvs_const(int i)` that the consumer defines (from a buffer or a uniform block); indices past
+ * the program's max_const are never requested, as in the interpreter.  OUT must be zero-filled by the caller
  * (outputs the program does not write keep their previous contents).
  *
  * Only straight-line programs are handled; anything the translator does not do is reported through

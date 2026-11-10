@@ -1407,6 +1407,10 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
     /* Vertex stage: post-transform vertices as they are (shifted by the
      * sample offset when multisampling), plus the user clip plane
      * distances when VAP_CLIP_CNTL enables any. */
+    if (desc->vs_gpu) {
+        /* the vertex program runs here: the C side generated the whole stage */
+        r300_sb_printf(&sb, "#ifdef R300_VS\n%s\n#else\n\n", desc->vs_gpu);
+    } else {
     r300_sb_printf(&sb,
         "#ifdef R300_VS\n%s"
         "%s"
@@ -1423,6 +1427,7 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         us_prelude_vs,
         ucp ? "out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[6]; };\n" : "",
         ucp ? "    for (int i = 0; i < 6; i++) gl_ClipDistance[i] = x.ucp[i];\n" : "");
+    }
 
     /* Discards only mark the invocation dead; main() discards once the
      * attachment interlock (if any) has been left. */

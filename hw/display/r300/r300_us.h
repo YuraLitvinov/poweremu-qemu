@@ -85,6 +85,7 @@ typedef struct R300FSUniforms {
 /* What the translator needs besides the US registers themselves. */
 typedef struct R300FSDesc {
     int8_t route[R300_US_NUM_TEMPS];    /* temp <- varying index, or -1 */
+    const char *vs_gpu;                 /* the whole vertex stage as GLSL (vertex program on the GPU), or NULL */
 } R300FSDesc;
 
 /*

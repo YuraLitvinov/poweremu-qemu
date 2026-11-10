@@ -172,7 +172,16 @@ typedef struct R300DrawPacket {
      * or line list (prim_class), then num_line_verts more of a line list
      * (polygon-mode edges drawn with filled polygons).  Points and wide
      * lines arrive as triangles. */
-    R300Vertex *verts;          /* owned by the packet */
+    R300Vertex *verts;          /* owned by the packet; NULL when the GPU runs the vertex stage (gpu_vs) */
+    /*
+     * gpu_vs: the vertex program and the vertex-stage math run in the vertex shader (r300_pvs_glsl.c) instead of
+     * on the CPU.  gpu_data (gpu_words 32-bit words) is the shader's buffer: 256 vec4 constants, viewport, fog
+     * and clip state, the source vertex index of every one of the num_verts vertices, then the compact input
+     * vertices.  See gpu_vs_text in r300_draw.c for the layout.
+     */
+    bool gpu_vs;
+    uint32_t *gpu_data;
+    uint32_t gpu_words;
     uint32_t num_verts;
     uint32_t num_line_verts;
     uint32_t prim_class;        /* 0 triangles, 1 lines (of num_verts) */

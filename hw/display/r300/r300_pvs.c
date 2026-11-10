@@ -445,7 +445,8 @@ static void pvs_exec(PVSCtx *c, const R300PVSInst *ins)
 void r300_pvs_prepare(R300PVSProgram *prog)
 {
     unsigned nt = 0;
-    bool all = false, alt = false;
+    bool all = false, alt = false, inrel = false;
+    uint32_t imask = 0;
 
     for (unsigned pc = prog->first_inst; pc <= prog->last_inst && pc < R300_PVS_MAX_INSTS; pc++) {
         R300PVSInst *ins = &prog->dec[pc];
@@ -462,6 +463,13 @@ void r300_pvs_prepare(R300PVSProgram *prog)
 
             if (sr->type == SRC_ALT) {
                 alt = true;
+            }
+            if (sr->type == SRC_INPUT) {
+                if (sr->mode) {
+                    inrel = true;
+                } else if (sr->offset < R300_PVS_NUM_INPUTS) {
+                    imask |= 1u << sr->offset;
+                }
             }
             if (sr->type == SRC_TEMP) {
                 if (sr->mode) {
@@ -486,6 +494,7 @@ void r300_pvs_prepare(R300PVSProgram *prog)
     }
     prog->ntemps = all || nt > R300_PVS_NUM_TEMPS ? R300_PVS_NUM_TEMPS : nt;
     prog->uses_alt = alt;
+    prog->in_mask = inrel ? 0xffffffffu : imask;
 }
 
 uint32_t r300_pvs_run(const R300PVSProgram *prog,

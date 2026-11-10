@@ -83,6 +83,7 @@ typedef struct R300PVSProgram {
     /* Filled by r300_pvs_prepare: */
     unsigned ntemps;        /* temporaries a vertex can read before writing: zeroed per vertex */
     bool uses_alt;          /* the program reads or writes the ATRM registers */
+    uint32_t in_mask;       /* input vertex slots the program reads (all of them when addressed relatively) */
     R300PVSInst dec[R300_PVS_MAX_INSTS];
 } R300PVSProgram;
 
