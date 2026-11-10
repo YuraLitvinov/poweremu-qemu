@@ -297,7 +297,9 @@ impl Vk {
         let nv = (pkt.num_verts + pkt.num_line_verts) as usize;
         let vsize = std::mem::size_of::<R300Vertex>() as u64;
         let usize_ = std::mem::size_of::<R300FSUniforms>() as u64;
-        let Some((vb, vo, vp)) = self.arena(nv as u64 * vsize) else {
+        // Binding 2 is the CPU-built vertices, or the vertex shader's buffer when the GPU runs the vertex stage.
+        let vbytes = if pkt.gpu_vs { pkt.gpu_words as u64 * 4 } else { nv as u64 * vsize };
+        let Some((vb, vo, vp)) = self.arena(vbytes.max(16)) else {
             return -1;
         };
         let ustride = round_up(usize_, self.align);
@@ -306,7 +308,11 @@ impl Vk {
             return -1;
         };
         unsafe {
-            std::ptr::copy_nonoverlapping(pkt.verts, vp as *mut R300Vertex, nv);
+            if pkt.gpu_vs {
+                std::ptr::copy_nonoverlapping(pkt.gpu_data as *const u8, vp as *mut u8, vbytes as usize);
+            } else {
+                std::ptr::copy_nonoverlapping(pkt.verts, vp as *mut R300Vertex, nv);
+            }
             for k in 0..ns as u64 {
                 let uk = up.add((k * ustride) as usize) as *mut R300FSUniforms;
                 let ms = up.add((ns as u64 * ustride + k * mstride) as usize) as *mut f32;
@@ -357,7 +363,7 @@ impl Vk {
         let bufi = [
             vk::DescriptorBufferInfo { buffer: ub, offset: uo, range: usize_ },
             vk::DescriptorBufferInfo { buffer: self.zpass_buf, offset: 0, range: 16 },
-            vk::DescriptorBufferInfo { buffer: vb, offset: vo, range: nv as u64 * vsize },
+            vk::DescriptorBufferInfo { buffer: vb, offset: vo, range: vbytes.max(16) },
             vk::DescriptorBufferInfo { buffer: ub, offset: uo + ns as u64 * ustride, range: 16 },
             vk::DescriptorBufferInfo { buffer: self.vram_buf, offset: 0, range: vk::WHOLE_SIZE },
             vk::DescriptorBufferInfo { buffer: auxb, offset: auxo, range: aux_bytes.max(16) as u64 },
@@ -514,7 +520,7 @@ impl Vk {
         use std::io::Write;
         self.dump_draws += 1;
         let n = self.dump_draws;
-        if self.dump.is_none() {
+        if self.dump.is_none() || pkt.gpu_vs {
             return;
         }
         let glsl = unsafe { CStr::from_ptr(pkt.glsl) }.to_string_lossy();

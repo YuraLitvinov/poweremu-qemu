@@ -1379,7 +1379,7 @@ static void gb_printf(Gb *g, const char *fmt, ...)
  * it.  R300_PVS_GPU=0 forces the CPU path, 1 the GPU path; the default is the CPU path until the GPU one is
  * proven (see work move_r300_vertex_stage_to_gpu).
  */
-__attribute__((unused)) static bool gpu_vs_wanted(const R300State *st, unsigned prim, bool rects, bool bypass)
+static bool gpu_vs_wanted(const R300State *st, unsigned prim, bool rects, bool bypass)
 {
     static int mode = -1;
 
@@ -1404,7 +1404,7 @@ __attribute__((unused)) static bool gpu_vs_wanted(const R300State *st, unsigned 
 }
 
 /* The vertex stage as GLSL: the vertex program, then what vtx_colors, viewport_xform and rs_values do. */
-__attribute__((unused)) static char *gpu_vs_text(const R300State *st, const Layout *lay, const Route *route, const char *pvs_glsl,
+static char *gpu_vs_text(const R300State *st, const Layout *lay, const Route *route, const char *pvs_glsl,
                          uint32_t nin, const uint8_t *slots, bool fog, uint32_t fogsel, uint32_t clip)
 {
     Gb g = { 0 };
@@ -1520,6 +1520,99 @@ __attribute__((unused)) static char *gpu_vs_text(const R300State *st, const Layo
     }
     gb_printf(&g, "    gl_Position = vec4(p.xy + ms.xy * p.w, p.zw);\n}\n");
     return g.p;
+}
+
+/*
+ * Build a draw whose vertex stage runs on the GPU.  Returns 1 with pkt filled (verts NULL, gpu_data set) and *vs the
+ * vertex stage text, 0 when this draw must take the CPU path (nothing consumed), -1 with *err set on a fetch failure.
+ */
+static int gpu_vs_build(const R300State *st, Fetch *f, R300PVSProgram *prog, const float (*consts)[4],
+                        const Layout *lay, const Route *route, R300DrawPacket *pkt, const uint32_t *order,
+                        uint32_t n, unsigned prim, bool fog, uint32_t fogsel, uint32_t clip,
+                        char **vs, const char **err)
+{
+    uint32_t unsup = 0, nidx, cls, nin = 0, words;
+    uint8_t slots[R300_PVS_NUM_INPUTS];
+    uint32_t *list, *gd;
+    R300Prov *prov;
+    char *glsl;
+    uint32_t vte = r300_reg(st, VAP_VTE_CNTL);
+
+    glsl = r300_pvs_to_glsl(prog, &unsup);
+    if (!glsl) {
+        return 0;
+    }
+    list = malloc(sizeof(uint32_t) * (n * 3 + 6));
+    prov = malloc(sizeof(R300Prov) * (n * 2 + 2));
+    nidx = r300_assemble_prov(prim, n, list, &cls, prov);
+    free(prov);
+    if (!nidx || cls != 0) {
+        free(list);
+        free(glsl);
+        return 0;
+    }
+    for (unsigned i = 0; i < R300_PVS_NUM_INPUTS; i++) {
+        if ((prog->in_mask >> i) & 1) {
+            slots[nin++] = i;
+        }
+    }
+    words = GPU_IDX_BASE + nidx + n * nin * 4;
+    gd = calloc(words, sizeof(uint32_t));
+    for (int i = 0; i < 256 && i <= prog->max_const; i++) {
+        memcpy(&gd[i * 4], consts[i], 16);
+    }
+    {
+        float w[6];
+
+        w[0] = pkt->rt_width;
+        w[1] = pkt->rt_height;
+        memcpy(&gd[1024], w, 8);
+        gd[1026] = (vte >> 8) & 1;
+        gd[1027] = GPU_IDX_BASE + nidx;
+        for (int i = 0; i < 6; i++) {
+            w[i] = ((vte >> i) & 1) ? bits_to_float(r300_reg(st, SE_VPORT_XSCALE + 4 * i)) : (i % 2 ? 0.0f : 1.0f);
+        }
+        memcpy(&gd[1028], w, sizeof(w));
+        w[0] = bits_to_float(r300_reg(st, GA_FOG_SCALE));
+        w[1] = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
+        memcpy(&gd[1034], w, 8);
+        gd[1036] = clip & 0x3F;
+        memcpy(&gd[1038], &st->pvs_mem[R300_PVS_UCP_START * 4], 6 * 16);
+    }
+    for (uint32_t i = 0; i < nidx; i++) {
+        gd[GPU_IDX_BASE + i] = list[i];
+    }
+    free(list);
+    for (uint32_t v = 0; v < n; v++) {
+        float in[R300_PVS_NUM_INPUTS][4];
+
+        if (!fetch_vertex(f, order[v], in)) {
+            *err = f->why ? f->why : "vertex data out of range";
+            free(gd);
+            free(glsl);
+            return -1;
+        }
+        for (uint32_t j = 0; j < nin; j++) {
+            memcpy(&gd[GPU_IDX_BASE + nidx + (v * nin + j) * 4], in[slots[j]], 16);
+        }
+    }
+    *vs = gpu_vs_text(st, lay, route, glsl, nin, slots, fog, fogsel, clip);
+    free(glsl);
+    {
+        static bool said;
+
+        if (!said) {
+            said = true;
+            fprintf(stderr, "ppc-mac-gpu r300: vertex programs run on the GPU (R300_PVS_GPU)\n");
+        }
+    }
+    pkt->gpu_vs = true;
+    pkt->gpu_data = gd;
+    pkt->gpu_words = words;
+    pkt->num_verts = nidx;
+    pkt->prim_class = 0;
+    pkt->cull = r300_reg(st, SU_CULL_MODE) & 7;
+    return 1;
 }
 
 static bool draw_core(const R300State *st, const R300Arrays *arr,
@@ -1684,6 +1777,28 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     r300_pvs_prepare(&prog);
     output_layout(st, &lay);
     rs_route(st, &route, &desc, &pkt->warn);
+
+    if (!((prim == 8)) && !bypass && !pvsrec_wanted(n) && gpu_vs_wanted(st, prim, false, bypass)) {
+        char *vs = NULL;
+        int r = gpu_vs_build(st, &f, &prog, (const float (*)[4])consts, &lay, &route, pkt, order, n, prim,
+                             fog, fogsel, clip, &vs, err);
+
+        if (r) {
+            free(order);
+            if (r < 0) {
+                return false;
+            }
+            pkt->warn |= f.warn;
+            desc.vs_gpu = vs;
+            pkt->glsl = r300_us_to_glsl(st, &desc, st->glsl_flags, err);
+            free(vs);
+            if (!pkt->glsl) {
+                r300_draw_free(pkt);
+                return false;
+            }
+            return true;
+        }
+    }
 
     /* Rectangle lists: three corners a rectangle, the card completes the
      * parallelogram (v0 + v2 - v1) and draws it as a quad. */

@@ -2999,7 +2999,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 r300_reg(s->r3, 0x4480), r300_reg(s->r3, 0x44C0),
                 r300_reg(s->r3, 0x4500), pkt.scissor[0], pkt.scissor[1],
                 pkt.scissor[2], pkt.scissor[3], build_ok ? pkt.num_verts : 0);
-        for (uint32_t v = 0; build_ok && v < pkt.num_verts && v < 48; v++) {
+        for (uint32_t v = 0; build_ok && pkt.verts && v < pkt.num_verts && v < 48; v++) {
             const R300Vertex *x = &pkt.verts[v];
             fprintf(s->r3_dump, "   v%u ndc %.3f %.3f w %.3f  t %.4f %.4f %.4f %.4f"
                     " | %.4f %.4f %.4f %.4f\n", v, x->pos[0] / x->pos[3],
@@ -3052,10 +3052,10 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (!r300_to_vram(s, &pkt.rt_gpu_addr, rt_len)) {
             uint8_t *vram_p = memory_region_get_ram_ptr(&s->vram);
             uint32_t pitch_b = pkt.rt_pitch * pkt.rt_bpp;
-            float miny = 1e30f, maxy = -1e30f;
+            float miny = pkt.gpu_vs ? -1.0f : 1e30f, maxy = pkt.gpu_vs ? 1.0f : -1e30f;   /* GPU vertices: whole target */
 
             pkt.rt_gpu_addr = gart_addr;
-            for (uint32_t v = 0; v < pkt.num_verts + pkt.num_line_verts; v++) {
+            for (uint32_t v = 0; pkt.verts && v < pkt.num_verts + pkt.num_line_verts; v++) {
                 float y = pkt.verts[v].pos[1];
                 miny = MIN(miny, y);
                 maxy = MAX(maxy, y);
@@ -3379,7 +3379,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                             pkt.uniforms.cliprect[0][1], pkt.uniforms.cliprect[0][2],
                             pkt.uniforms.cliprect[0][3], pkt.scissor[0],
                             pkt.scissor[1], pkt.scissor[2], pkt.scissor[3]);
-                    for (uint32_t v = 0; v < pkt.num_verts && v < 6; v++) {
+                    for (uint32_t v = 0; pkt.verts && v < pkt.num_verts && v < 6; v++) {
                         const R300Vertex *x = &pkt.verts[v];
                         fprintf(s->r3_dump, "   v%u pos %.3f %.3f %.3f %.3f  v0 %.4f %.4f %.4f %.4f"
                                 "  v1 %.4f %.4f %.4f %.4f\n", v, x->pos[0], x->pos[1],

@@ -99,7 +99,7 @@ impl Vk {
             return;
         }
 
-        let nv = (pkt.num_verts + pkt.num_line_verts) as usize;
+        let nv = if pkt.gpu_vs { 0 } else { (pkt.num_verts + pkt.num_line_verts) as usize };
         let glsl = unsafe { std::ffi::CStr::from_ptr(pkt.glsl) }.to_bytes();
         let mut out: Vec<u8> = Vec::with_capacity(glsl.len() + nv * std::mem::size_of::<R300Vertex>() + 4096);
         out.extend_from_slice(&TAG.to_le_bytes());

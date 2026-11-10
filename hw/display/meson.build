@@ -88,6 +88,7 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu_x86_stubs.c',
   'r300/r300_state.c',
   'r300/r300_pvs.c',
+  'r300/r300_pvs_glsl.c',
   'r300/r300_us.c',
   'r300/r300_spirv.c',
   'r300/r300_draw.c',
