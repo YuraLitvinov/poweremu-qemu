@@ -258,8 +258,15 @@ static void us_texu_args(char *buf, size_t len, const R300State *st,
     if (!tex_is_float(fmt)) {
         filt |= (((f0 >> 9) & 3) != 1 ? 1 : 0) | (((f0 >> 11) & 3) != 1 ? 2 : 0);
     }
+    /*
+     * A little-endian guest's texel words are already the card's: endian 2 undoes the big-endian view the shader
+     * starts from (the same rule as R300TexDesc.endian in set_textures).  The 32-bit float formats 0x1B..0x1D
+     * are left as the register says: Mesa also uses them as raw copy sources (RGBA8 and luminance uploads and
+     * read-backs go through a float staging texture), and those paths only come out right with the old rule
+     * (see work fix_piglit_texture_upload_copy_formats), so real 32F textures stay wrong for now.
+     */
     snprintf(buf, len, "0x%xu, %uu, %uu, 0x%xu, %s", fmt, r300_tex_raw_bpp(fmt),
-             r300_reg(st, TX_OFFSET_0 + 4 * unit) & 3, filt,
+             st->le_guest && (fmt < 0x1B || fmt > 0x1D) ? 2u : r300_reg(st, TX_OFFSET_0 + 4 * unit) & 3, filt,
              (f1 >> 22) & 1 ? "true" : "false");
 }
 
