@@ -9608,6 +9608,14 @@ static void ppc_mac_gpu_cursor_sync(PPCMacGPUState *s)
     s->hwc_x = x;
     s->hwc_y = y;
     s->hwc_visible = on && s->hwc_w;
+    if (getenv("PPCGPU_CURSOR_LOG")) {
+        static int n;
+        if (n++ < 400) {
+            fprintf(stderr, "CURSOR posn %08x off %08x gen %08x -> (%d,%d) visible %d off %08x\n",
+                    s->regs.cur_horz_vert_posn, s->regs.cur_horz_vert_off, s->regs.crtc_gen_cntl,
+                    x, y, s->hwc_visible, s->regs.cur_offset);
+        }
+    }
     dpy_mouse_set(s->con, x, y, s->hwc_visible);
 }
 
