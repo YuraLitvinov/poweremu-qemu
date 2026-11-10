@@ -72,6 +72,9 @@ typedef struct R300FSUniforms {
     uint32_t tex_addr[R300_NUM_TEX_UNITS][4]; /* x: byte address of a raw unit's texels,
                                                  y: 0 in VRAM, 1 in the aux buffer
                                                  (R300_GLSL_VRAM_SSBO only) */
+    /* The card's layout of each level of a raw unit's texture (r300_tex_layout): group g (0 byte offset, 1 row pitch,
+     * 2 face/slice bytes) of level l is [g * 3 + l / 4][l % 4]. */
+    uint32_t tex_lvl[R300_NUM_TEX_UNITS][9][4];
 } R300FSUniforms;
 
 /* tex_dim[k].w */

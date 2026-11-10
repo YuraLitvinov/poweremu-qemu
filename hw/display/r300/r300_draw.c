@@ -795,6 +795,11 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_dim[k][0] = t->dim;
         u->tex_dim[k][1] = t->depth;
         u->tex_dim[k][2] = t->pitch_bytes;
+        for (uint32_t l = 0; l < t->levels && l < R300_TEX_MAX_LEVELS; l++) {
+            u->tex_lvl[k][l / 4][l % 4] = t->lvl_off[l];
+            u->tex_lvl[k][3 + l / 4][l % 4] = t->lvl_pitch[l];
+            u->tex_lvl[k][6 + l / 4][l % 4] = t->lvl_pitch[l] * t->lvl_rows[l];
+        }
         u->tex_dim[k][3] = ((f1 >> 8) & 1) | ((f1 >> 6) & 2) | ((f1 >> 4) & 4) |
                            ((f1 >> 2) & 8) | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
                            (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0);
