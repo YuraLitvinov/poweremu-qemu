@@ -1419,6 +1419,15 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     set_uniforms(st, pkt);
     set_textures(st, pkt);
     set_depth(st, pkt);
+    /*
+     * Mesa gives a window's colour buffer a wider row pitch than its depth buffer (64 against 32 pixels for a
+     * 32 pixel window).  The depth buffer only has to cover what is drawn, so when the scissor fits inside the
+     * depth pitch the render area is that wide; wider than the pitch the draw cannot use the depth buffer.
+     */
+    if (pkt->depth.attach && pkt->depth.pitch && pkt->depth.pitch < pkt->rt_width &&
+        pkt->scissor[2] <= pkt->depth.pitch) {
+        pkt->rt_width = pkt->depth.pitch;
+    }
 
     /* Vertex order */
     f.st = st;
