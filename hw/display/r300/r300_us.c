@@ -291,12 +291,30 @@ static unsigned unit_border(const R300State *st, unsigned unit)
     if (unit_dim(st, unit) == 2) {
         return 0;                       /* cube maps never reach a border */
     }
+    bool lin = ((f0 >> 9) & 3) != 1 || ((f0 >> 11) & 3) != 1;
+
     for (unsigned a = 0; a < axes; a++) {
         unsigned m = (f0 >> (3 * a)) & 7;
-        bm |= (m == 6 ? 1u : m == 7 ? 2u : 0u) << (2 * a);
+        unsigned v = m == 6 ? 1u : m == 7 ? 2u : 0u;
+        /*
+         * Half-border clamps (GL_CLAMP, GL_MIRROR_CLAMP_EXT): a nearest fetch is the edge texel, but a linear
+         * fetch blends the edge with the border colour, as clamp to border does.  The sampler clamps to the
+         * edge for these, so the border mixes in rather than adds: field value 3, with bits 7..9 marking the
+         * mirror variant (the coordinate is clamped to [0, 1] first, after abs() for the mirror).
+         */
+        if (lin && (m == 4 || m == 5)) {
+            v = 3;
+            if (m == 5) {
+                bm |= 128u << a;        /* mirror first (bits 7..9 per axis) */
+            }
+        }
+        bm |= v << (2 * a);
     }
-    if (bm && (((f0 >> 9) & 3) != 1 || ((f0 >> 11) & 3) != 1)) {
+    if (bm && lin) {
         bm |= 64;
+    }
+    if (getenv("PPCGPU_BORDER_LOG")) {
+        fprintf(stderr, "BORDER unit %u TX_FILTER0 %08x -> bm %x (lin %d)\n", unit, f0, bm, lin);
     }
     return bm;
 }
@@ -585,10 +603,13 @@ static const char us_prelude[] =
 "}\n"
 "/* Share of a bilinear (or nearest) footprint inside [0, n) texels along\n"
 "   one axis; m 2 = mirror once first. */\n"
-"float r300_bcov(float c, float n, uint m, bool lin)\n"
+"float r300_bcov(float c, float n, uint m, bool lin, bool mir)\n"
 "{\n"
 "    if (m == 0u) return 1.0;\n"
 "    if (m == 2u) c = abs(c);\n"
+"    /* half-border clamps (GL_CLAMP, GL_MIRROR_CLAMP_EXT): the coordinate is clamped before filtering, so any\n"
+"       point beyond the edge weighs the border by half */\n"
+"    if (m == 3u) c = clamp(mir ? abs(c) : c, 0.0, 1.0);\n"
 "    if (!lin) { float i = floor(c * n); return i >= 0.0 && i < n ? 1.0 : 0.0; }\n"
 "    float p = c * n - 0.5, i0 = floor(p), f = p - i0;\n"
 "    return (i0 >= 0.0 && i0 < n ? 1.0 - f : 0.0) + (i0 + 1.0 >= 0.0 && i0 + 1.0 < n ? f : 0.0);\n"
@@ -596,8 +617,9 @@ static const char us_prelude[] =
 "vec4 r300_border(vec4 hw, vec3 c, vec3 n, uint bm, uint unit)\n"
 "{\n"
 "    bool lin = (bm & 64u) != 0u;\n"
-"    float cov = r300_bcov(c.x, n.x, bm & 3u, lin) * r300_bcov(c.y, n.y, (bm >> 2) & 3u, lin) *\n"
-"                r300_bcov(c.z, n.z, (bm >> 4) & 3u, lin);\n"
+"    float cov = r300_bcov(c.x, n.x, bm & 3u, lin, (bm & 128u) != 0u) *\n"
+"                r300_bcov(c.y, n.y, (bm >> 2) & 3u, lin, (bm & 256u) != 0u) *\n"
+"                r300_bcov(c.z, n.z, (bm >> 4) & 3u, lin, (bm & 512u) != 0u);\n"
 "    /* clamp to border sampled transparent black outside; mirror once\n"
 "       sampled the edge there */\n"
 "    return (bm & 42u) != 0u ? mix(u.tex_border[unit], hw, cov)\n"
