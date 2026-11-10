@@ -438,6 +438,7 @@ typedef struct PPCMacGPURegs {
     uint32_t crtc_v_sync_strt_wid;
     uint32_t crtc_offset;
     uint32_t crtc_offset_cntl;
+    int64_t crtc_offset_write_ns;   /* CRTC_OFFSET write time: GUI_TRIG_OFFSET (bit 30) reads set until the next 60 Hz frame boundary */
     uint32_t crtc_pitch;
 
     /* DAC */

@@ -1276,10 +1276,13 @@ static void ppc_mac_gpu_vblank(void *opaque)
 {
     PPCMacGPUState *s = opaque;
 
-    /* Schedule next VBlank at 60 Hz */
-    timer_mod(&s->vblank_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / 60);
+    /* Schedule next VBlank at 60 Hz, on the same frame boundaries CRTC_CRNT_FRAME, CRTC_VLINE and the pending
+     * CRTC_OFFSET bit use, so a flip latched at a boundary and its vblank interrupt agree */
+    {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), frame = NANOSECONDS_PER_SECOND / 60;
+
+        timer_mod(&s->vblank_timer, (now / frame + 1) * frame);
+    }
 
     /* Set VBlank interrupt status */
     s->regs.gen_int_status |= R200_CRTC_VBLANK_INT;
@@ -10161,7 +10164,13 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = s->regs.crtc_v_sync_strt_wid;
         break;
     case R200_CRTC_OFFSET:
-        val = s->regs.crtc_offset;
+        /* bit 30, GUI_TRIG_OFFSET: a new offset is waiting for the next vblank (r100_page_flip waits for it to rise) */
+        {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), frame = NANOSECONDS_PER_SECOND / 60;
+            bool pending = s->regs.crtc_offset_write_ns > 0 && now / frame == s->regs.crtc_offset_write_ns / frame;
+
+            val = s->regs.crtc_offset | (pending ? 1u << 30 : 0);
+        }
         break;
     case R200_CRTC_OFFSET_CNTL:
         val = s->regs.crtc_offset_cntl;
@@ -11116,7 +11125,8 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             r200_rate.flips++;             /* page flip: one frame */
             r200_perf_present();
         }
-        s->regs.crtc_offset = val;
+        s->regs.crtc_offset = val & ~(1u << 30);
+        s->regs.crtc_offset_write_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         s->display_invalid = true;
         break;
     case R200_CRTC_OFFSET_CNTL:
@@ -11218,7 +11228,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_CLOCK_CNTL_DATA:
         s->regs.clock_cntl_data = val;
         if (!s->swap && (s->regs.clock_cntl_index & 0x80)) {   /* PLL_WR_EN */
-            s->regs.pll[s->regs.clock_cntl_index & 0x3F] = val;
+            uint32_t pi = s->regs.clock_cntl_index & 0x3F;
+
+            /*
+             * PPLL_REF_DIV bits 15 (ATOMIC_UPDATE_R) and 16 (ATOMIC_UPDATE_W): the driver sets W to apply the new
+             * dividers and polls R until the update is through.  Here it is through at once, so neither bit sticks;
+             * a mode with another pixel clock used to spin radeon_set_pll for ever.
+             */
+            s->regs.pll[pi] = pi == 0x03 ? val & ~((1u << 15) | (1u << 16)) : val;
         }
         break;
 
