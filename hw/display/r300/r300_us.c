@@ -1377,7 +1377,8 @@ static void us_emit_target(R300Sb *sb, unsigned k, int src)
     }
     r300_sb_printf(sb,
         "    {   // target %u\n"
-        "        vec4 s = oc[%d];\n"
+        "        /* fixed-point buffers blend the clamped fragment colour */\n"
+        "        vec4 s = R300_CB%u_CLAMP ? clamp(oc[%d], 0.0, 1.0) : oc[%d];\n"
         "        vec4 d = r300_cb%u_unpack(fb%u);\n"
         "        vec4 res = R300_CB%u_CLAMP ? clamp(s, 0.0, 1.0) : s;\n"
         "        if (R300_CB%u_BLEND && (u.cblend & 1u) != 0u) {\n"
@@ -1400,7 +1401,7 @@ static void us_emit_target(R300Sb *sb, unsigned k, int src)
         "                   (cm & 4u) != 0u ? res.b : d.b, (cm & 8u) != 0u ? res.a : d.a);\n"
         "        o.c%u = r300_cb%u_pack(res);\n"
         "    }\n",
-        k, src, k, k, k, k, k, k, k, k, k, k, k);
+        k, k, src, src, k, k, k, k, k, k, k, k, k, k, k);
 }
 
 char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
