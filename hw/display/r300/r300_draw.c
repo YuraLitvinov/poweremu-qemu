@@ -696,6 +696,26 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
             t->view_bpp = bpp < 4 ? 4 : bpp;
             break;
         }
+        {
+            static uint32_t seen[256];
+            static int nseen = -1;
+            if (nseen < 0) {
+                nseen = getenv("PPCGPU_TEXFMT_LOG") ? 0 : 256;
+            }
+            if (nseen < 256) {
+                uint32_t key = (fmt << 24) ^ (f0 & 0x3FFFFFF) ^ (f1 << 3) ^ (off & 0x1F);
+                bool dup = false;
+                for (int i = 0; i < nseen; i++) {
+                    dup |= seen[i] == key;
+                }
+                if (!dup) {
+                    seen[nseen++] = key;
+                    fprintf(stderr, "TEXFMT unit %u fmt %02x kind %d %ux%u levels %u f0 %08x f1 %08x f2 %08x off %08x\n",
+                            k, fmt, t->kind, (f0 & 0x7FF) + 1, ((f0 >> 11) & 0x7FF) + 1,
+                            ((f0 >> 26) & 0xF) + 1, f0, f1, f2, off);
+                }
+            }
+        }
         t->bound = true;
         t->gpu_addr = off & ~0x1Fu;
         t->le = le;
