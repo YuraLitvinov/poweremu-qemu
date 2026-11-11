@@ -2691,6 +2691,14 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
             r300_reg(r, 0x4318), r300_reg(r, 0x431C), r300_reg(r, 0x2090), r300_reg(r, 0x2094),
             r300_reg(r, 0x421C));
     fprintf(f, "\n");
+    if (getenv("R300_USDISASM")) {
+        char *dis = r300_us_disasm(r);
+
+        if (dis) {
+            fprintf(f, "%s\n", dis);
+            g_free(dis);
+        }
+    }
     fflush(f);
 }
 
