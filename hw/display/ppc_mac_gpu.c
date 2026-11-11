@@ -2686,6 +2686,10 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
                     r300_reg(r, 0x4400 + 4 * t));
         }
     }
+    fprintf(f, " rs=%08x/%08x ip=%08x,%08x,%08x,%08x vo=%08x/%08x ps=%08x",
+            r300_reg(r, 0x4300), r300_reg(r, 0x4304), r300_reg(r, 0x4310), r300_reg(r, 0x4314),
+            r300_reg(r, 0x4318), r300_reg(r, 0x431C), r300_reg(r, 0x2090), r300_reg(r, 0x2094),
+            r300_reg(r, 0x421C));
     fprintf(f, "\n");
     fflush(f);
 }

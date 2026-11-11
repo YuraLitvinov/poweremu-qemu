@@ -17,6 +17,7 @@
 
 /* Registers used here */
 #define SE_VPORT_XSCALE             0x1D98  /* then XOFFSET, YSCALE, ... ZOFFSET */
+#define GB_ENABLE                   0x4008
 #define GB_MSPOS0                   0x4010
 #define GB_MSPOS1                   0x4014
 #define GB_SELECT                   0x401C
@@ -328,11 +329,15 @@ static bool fetch_vertex(Fetch *f, uint32_t vtx, float in[R300_PVS_NUM_INPUTS][4
 
 /* ---- output routing ------------------------------------------------- */
 
+#define LAY_GEN 0xFF
+
 typedef struct Layout {
     int pos, psize, color[4];
     int tex_slot[8];
     unsigned tex_n[8];
-    /* texture interpolants as one scalar list: (slot, component) */
+    /* texture interpolants as one scalar list: (slot, component); a unit whose GB_ENABLE source is ST and that has no
+     * vertex components contributes the rasterizer's own (s, t) (point sprite, line stipple) at its place in the list:
+     * slot LAY_GEN, component 0 or 1 */
     unsigned nscal;
     uint8_t scal_slot[32], scal_comp[32];
 } Layout;
@@ -361,6 +366,11 @@ static void output_layout(const R300State *st, Layout *l)
             l->tex_slot[t] = slot++;
             for (unsigned i = 0; i < n && l->nscal < 32; i++) {
                 l->scal_slot[l->nscal] = l->tex_slot[t];
+                l->scal_comp[l->nscal++] = i;
+            }
+        } else if (((r300_reg(st, GB_ENABLE) >> (16 + 2 * t)) & 3) == 1) {
+            for (unsigned i = 0; i < 2 && l->nscal < 32; i++) {
+                l->scal_slot[l->nscal] = LAY_GEN;
                 l->scal_comp[l->nscal++] = i;
             }
         }
@@ -450,7 +460,9 @@ static void rs_values(const R300State *st, const Layout *l, const Route *r,
                 float x = 0.0f;
                 if (sel < 4) {
                     unsigned s = ptr + sel;
-                    if (s < l->nscal) {
+                    if (s < l->nscal && l->scal_slot[s] == LAY_GEN) {
+                        x = sprite ? sprite[l->scal_comp[s]] : 0.0f;
+                    } else if (s < l->nscal) {
                         x = out[l->scal_slot[s]][l->scal_comp[s]];
                     } else if (sprite) {
                         /* Point sprite: the rasterizer generates (s, t). */
@@ -1496,7 +1508,9 @@ static char *gpu_vs_text(const R300State *st, const Layout *lay, const Route *ro
             if (route->vary[k].is_tex) {
                 unsigned ptr = ip & 0x3F, sel = (ip >> (13 + 3 * i)) & 7;
 
-                if (sel < 4 && ptr + sel < lay->nscal) {
+                if (sel < 4 && ptr + sel < lay->nscal && lay->scal_slot[ptr + sel] == LAY_GEN) {
+                    snprintf(e, sizeof(e), "0.0");      /* rasterizer-generated (s, t): not a point here */
+                } else if (sel < 4 && ptr + sel < lay->nscal) {
                     snprintf(e, sizeof(e), "OUT[%u].%c", lay->scal_slot[ptr + sel], "xyzw"[lay->scal_comp[ptr + sel]]);
                 } else {
                     snprintf(e, sizeof(e), "%s", sel == 5 ? "1.0" : "0.0");
