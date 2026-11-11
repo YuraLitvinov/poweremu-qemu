@@ -1329,9 +1329,10 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
             snprintf(ub, sizeof(ub), "h = vec4(r300_h16(w.x), r300_h16(w.x >> 16), r300_h16(w.y), r300_h16(w.y >> 16));");
             snprintf(pb, sizeof(pb), "uvec2 w = uvec2(r300_ph16(h.x) | (r300_ph16(h.y) << 16), r300_ph16(h.z) | (r300_ph16(h.w) << 16));");
         } else if (of == 20) {
-            stored = 0x3;
-            snprintf(ub, sizeof(ub), "h.x = uintBitsToFloat(w.x); h.y = uintBitsToFloat(w.y);");
-            snprintf(pb, sizeof(pb), "uvec2 w = uvec2(floatBitsToUint(h.x), floatBitsToUint(h.y));");
+            /* RG32F in an ARGB16161616 buffer stores C0 and C2 (Mesa r300_translate_out_fmt: "stores XZ") */
+            stored = 0x5;
+            snprintf(ub, sizeof(ub), "h.x = uintBitsToFloat(w.x); h.z = uintBitsToFloat(w.y);");
+            snprintf(pb, sizeof(pb), "uvec2 w = uvec2(floatBitsToUint(h.x), floatBitsToUint(h.z));");
         } else {    /* C4_16 */
             snprintf(ub, sizeof(ub), "h = vec4(r300_upk(w.x, 0u, 16u, %s), r300_upk(w.x, 16u, 16u, %s), r300_upk(w.y, 0u, 16u, %s), r300_upk(w.y, 16u, 16u, %s));",
                      S(0), S(1), S(2), S(3));
