@@ -3152,7 +3152,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
         /* AGP/GART texture: copy the texels out of guest memory (freed
          * by r300_draw_free with free()). */
-        td->host_data = tlen && tlen <= 64 * 1024 * 1024 ? malloc(tlen) : NULL;
+        /* guest textures can be big (piglit tex3d-maxsize makes one over 64 MB); r300_read_raw bounds the copy to the
+         * GART/VRAM anyway, this only keeps a garbage length from asking the host for gigabytes */
+        td->host_data = tlen && tlen <= 1024u * 1024 * 1024 ? malloc(tlen) : NULL;
         if (!td->host_data || !r300_read_raw(s, ga, td->host_data, tlen)) {
             r300_warn_once("texture outside VRAM and the GART", NULL);
             free(td->host_data);
