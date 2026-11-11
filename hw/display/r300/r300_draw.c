@@ -950,7 +950,8 @@ uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
         *cls = 0;
         for (uint32_t i = 1; i + 1 < n; i++) {
             PUT(0); PUT(i); PUT(i + 1);
-            PROV(0, 1, 2, n - 1, (i == 1 ? 1 : 0) | 2 | (i + 2 == n ? 4 : 0));
+            /* PROVOKING_VERTEX_LAST on a polygon reduces to the first vertex (Mesa r300_provoking_vertex_fixes) */
+            PROV(0, 1, 2, 0, (i == 1 ? 1 : 0) | 2 | (i + 2 == n ? 4 : 0));
         }
         break;
     case 6:                                     /* strip */
