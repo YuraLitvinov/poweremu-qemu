@@ -117,7 +117,9 @@ static float pvs_pow_ff(float base, float e)
 {
     /* Special cases, in the documented order of detection. */
     if (base == 0.0f) {
-        return e < 0.0f ? INFINITY : 0.0f;
+        /* the math engine never produces an infinity: RECIP and LOG return the largest finite value for a zero operand,
+         * and Mesa's lowering (select * result) relies on that: 0 * INF would be NaN */
+        return e < 0.0f ? FLT_MAX : 0.0f;
     }
     if (e == 0.0f) {
         return 1.0f;
