@@ -715,9 +715,9 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         /* The card hands the shader DXT1 texels as B,G,R,A and DXT3/5 as
          * A,B,G,R (Tiger's swizzles R=Z,G=Y,B=X and R=W,G=Z,B=Y,A=X);
          * the host decodes to R,G,B,A, so reorder before the swizzle. */
-        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; decode = 3; break;   /* per block */
-        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; decode = 1; break;
-        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; dxt = true; decode = 1; break;
+        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; decode = le ? 0 : 3; break;   /* per block */
+        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; decode = le ? 0 : 1; break;
+        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; dxt = true; decode = le ? 0 : 1; break;
         default:
             bpp = r300_tex_raw_bpp(fmt);
             if (!bpp) {
