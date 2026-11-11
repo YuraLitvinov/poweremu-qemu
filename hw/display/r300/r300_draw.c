@@ -727,7 +727,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         case 0x3:                       /* Y8X8: big-endian halfwords */
             t->kind = R300_TEXK_RG8; bpp = 2; decode = le ? 0 : 2;
             break;
-        case 0x1: case 0x6: case 0x7: case 0xA: case 0xB:
+        case 0x6: case 0x7: case 0xA: case 0xB:
             t->kind = R300_TEXK_CONVERT16; bpp = 2;
             break;
         case 0xC:                       /* W8Z8Y8X8 */

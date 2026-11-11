@@ -45,6 +45,7 @@ uint32_t r300_tex_raw_bpp(uint32_t txformat)
     switch (txformat & 0x1F) {
     case 0x02: case 0x05:                           /* Y4X4, Z3Y3X2 */
         return 1;
+    case 0x01:                                      /* X16 (16-bit depth): 16 bits of precision, not 8 */
     case 0x12: case 0x14: case 0x15:                /* CxV8U8, VYUY, YVYU */
     case 0x16: case 0x18:                           /* 16 MPEG, 16F */
         return 2;
@@ -711,6 +712,7 @@ static const char us_prelude[] =
 "    vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n"
 "    uint v = w.x;\n"
 "    switch (fmt) {\n"
+"    case 0x01u: c.x = r300_c16(v, 0u, (sg & 1u) != 0u); break;\n"
 "    case 0x02u: c.x = r300_un(v, 0u, 4u); c.y = r300_un(v, 4u, 4u); break;\n"
 "    case 0x04u: c.x = r300_c16(v, 0u, (sg & 1u) != 0u); c.y = r300_c16(v, 16u, (sg & 2u) != 0u); break;\n"
 "    case 0x05u: c.x = r300_un(v, 0u, 2u); c.y = r300_un(v, 2u, 3u); c.z = r300_un(v, 5u, 3u); break;\n"
