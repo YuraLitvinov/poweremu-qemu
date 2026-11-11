@@ -18,6 +18,7 @@
 /* Registers used here */
 #define SE_VPORT_XSCALE             0x1D98  /* then XOFFSET, YSCALE, ... ZOFFSET */
 #define GB_ENABLE                   0x4008
+#define GA_ROUND_MODE              0x428C  /* bit 4 RGB / bit 5 alpha: 1 = FP20 range, 0 = clamp to [0, 1] */
 #define GB_MSPOS0                   0x4010
 #define GB_MSPOS1                   0x4014
 #define GB_SELECT                   0x401C
@@ -478,6 +479,15 @@ static void rs_values(const R300State *st, const Layout *l, const Route *r,
             static const float zero[4];
             unsigned cp = (ip >> 6) & 7;
             const float *c = cp < 4 ? cols[cp] : zero;
+            float cc[4];
+            uint32_t rm = r300_reg(st, GA_ROUND_MODE);
+
+            /* vertex colours are clamped to [0, 1] unless GA_ROUND_MODE selects the FP20 range (GL_CLAMP_VERTEX_COLOR) */
+            for (unsigned i = 0; i < 4; i++) {
+                bool keep = (rm >> (i < 3 ? 4 : 5)) & 1;
+                cc[i] = keep ? c[i] : fminf(fmaxf(c[i], 0.0f), 1.0f);
+            }
+            c = cc;
             for (unsigned i = 0; i < 4; i++) {
                 v[k][i] = rs_col_fmt((ip >> 9) & 0xF, c, i);
             }
@@ -1491,7 +1501,15 @@ static char *gpu_vs_text(const R300State *st, const Layout *lay, const Route *ro
         lay->pos);
     for (int cp = 0; cp < 4; cp++) {
         if (lay->color[cp] >= 0) {
+            uint32_t rm = r300_reg(st, GA_ROUND_MODE);
+
             gb_printf(&g, "    vec4 col%d = OUT[%d];\n", cp, lay->color[cp]);
+            if (!(rm & 0x10)) {
+                gb_printf(&g, "    col%d.xyz = clamp(col%d.xyz, 0.0, 1.0);\n", cp, cp);
+            }
+            if (!(rm & 0x20)) {
+                gb_printf(&g, "    col%d.w = clamp(col%d.w, 0.0, 1.0);\n", cp, cp);
+            }
         } else {
             gb_printf(&g, "    vec4 col%d = vec4(0.0);\n", cp);
         }
