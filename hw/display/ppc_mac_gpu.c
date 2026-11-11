@@ -2690,6 +2690,8 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
             r300_reg(r, 0x4300), r300_reg(r, 0x4304), r300_reg(r, 0x4310), r300_reg(r, 0x4314),
             r300_reg(r, 0x4318), r300_reg(r, 0x431C), r300_reg(r, 0x2090), r300_reg(r, 0x2094),
             r300_reg(r, 0x421C));
+    fprintf(f, " pt=%08x,%08x,%08x,%08x mm=%08x pm=%08x gb=%08x", r300_reg(r, 0x4200), r300_reg(r, 0x4204),
+            r300_reg(r, 0x4208), r300_reg(r, 0x420C), r300_reg(r, 0x4230), r300_reg(r, 0x4288), r300_reg(r, 0x4008));
     fprintf(f, "\n");
     if (getenv("R300_USDISASM")) {
         char *dis = r300_us_disasm(r);
