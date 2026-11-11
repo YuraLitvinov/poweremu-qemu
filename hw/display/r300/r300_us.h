@@ -78,7 +78,7 @@ typedef struct R300FSUniforms {
 } R300FSUniforms;
 
 /* tex_dim[k].w */
-#define R300_TEXF_SIGNED_X      (1u << 0)     /* .. W at bit 3 (TX_FORMAT1.SIGNED_*) */
+#define R300_TEXF_SIGNED_X      (1u << 0)     /* .. W at bit 3: component j (storage order) is TX_FORMAT1 bit 5 + j */
 #define R300_TEXF_GAMMA         (1u << 4)
 #define R300_TEXF_POT_ROWS      (1u << 5)     /* heights round up to a power of two */
 

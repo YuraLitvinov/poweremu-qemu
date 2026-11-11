@@ -811,8 +811,10 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
             u->tex_lvl[k][3 + l / 4][l % 4] = t->lvl_pitch[l];
             u->tex_lvl[k][6 + l / 4][l % 4] = t->lvl_pitch[l] * t->lvl_rows[l];
         }
-        u->tex_dim[k][3] = ((f1 >> 8) & 1) | ((f1 >> 6) & 2) | ((f1 >> 4) & 4) |
-                           ((f1 >> 2) & 8) | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
+        /* Mesa gives channel i of the format (storage order) SIGNED_W, _Z, _Y, _X: a 1- or 2-channel format sets
+         * only the top bits, so component j (X first) is signed when bit 5 + 3 - j is set. */
+        u->tex_dim[k][3] = ((f1 >> 5) & 1) << 0 | ((f1 >> 6) & 1) << 1 | ((f1 >> 7) & 1) << 2 |
+                           ((f1 >> 8) & 1) << 3 | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
                            (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0);
     }
 }
