@@ -25,6 +25,7 @@
 #define VAP_PVS_FLOW_CNTL_ADDRS_0   0x2230
 #define VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 0x2290
 #define VAP_PVS_FLOW_CNTL_OPC       0x22DC
+#define VAP_CNTL                    0x2080
 #define VAP_CNTL_STATUS             0x2140
 #define VAP_OUTPUT_VTX_FMT_0        0x2090
 #define VAP_OUTPUT_VTX_FMT_1        0x2094
@@ -870,7 +871,8 @@ static void viewport_xform(const R300State *st, const R300DrawPacket *pkt,
         float w = c[3];
         p[0] = (2.0f * vp[0] / W) * c[0] + (2.0f * vp[1] / W - 1.0f) * w;
         p[1] = -(2.0f * vp[2] / H) * c[1] + (1.0f - 2.0f * vp[3] / H) * w;
-        p[2] = vp[4] * c[2] + vp[5] * w;
+        /* clip-space z in Vulkan's 0..w clip volume; the viewport depth range (pkt->depth_min/max) does the rest */
+        p[2] = pkt->depth_dx ? c[2] : 0.5f * (c[2] + w);
         p[3] = w;
     } else {
         float wx = vp[0] * c[0] + vp[1], wy = vp[2] * c[1] + vp[3];
@@ -1466,7 +1468,7 @@ static char *gpu_vs_text(const R300State *st, const Layout *lay, const Route *ro
         "        /* no perspective divide by the VTE: stay linear in clip space */\n"
         "        p = vec4((2.0 * xs / W) * c.x + (2.0 * xo / W - 1.0) * c.w,\n"
         "                 -(2.0 * ys / H) * c.y + (1.0 - 2.0 * yo / H) * c.w,\n"
-        "                 zs * c.z + zo * c.w, c.w);\n"
+        "                 pvs_data[1037u] != 0u ? c.z : 0.5 * (c.z + c.w), c.w);\n"
         "    } else {\n"
         "        float wx = xs * c.x + xo, wy = ys * c.y + yo;\n"
         "        p = vec4(2.0 * wx / W - 1.0, 1.0 - 2.0 * wy / H, zs * c.z + zo, 1.0);\n"
@@ -1592,6 +1594,7 @@ static int gpu_vs_build(const R300State *st, Fetch *f, R300PVSProgram *prog, con
         w[1] = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
         memcpy(&gd[1034], w, 8);
         gd[1036] = clip & 0x3F;
+        gd[1037] = pkt->depth_dx;
         memcpy(&gd[1038], &st->pvs_mem[R300_PVS_UCP_START * 4], 6 * 16);
     }
     for (uint32_t i = 0; i < nidx; i++) {
@@ -1745,6 +1748,26 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
 
     pkt->aa_samples = r300_aa_samples(st);
     r300_aa_positions(st, pkt->aa_pos);
+
+    /* Viewport depth range and z clipping, once per draw (see R300DrawPacket.depth_min). */
+    {
+        uint32_t vte = r300_reg(st, VAP_VTE_CNTL);
+        bool zs_en = (vte >> 4) & 1;
+        float zs = zs_en ? bits_to_float(r300_reg(st, SE_VPORT_XSCALE + 4 * 4)) : 1.0f;
+        float zo = (vte >> 5) & 1 ? bits_to_float(r300_reg(st, SE_VPORT_XSCALE + 4 * 5)) : 0.0f;
+
+        pkt->depth_dx = (r300_reg(st, VAP_CNTL) >> 22) & 1;
+        if (zs_en && !((vte >> 8) & 1)) {
+            pkt->depth_min = pkt->depth_dx ? zo : zo - zs;
+            pkt->depth_max = zo + zs;
+        } else {
+            pkt->depth_min = 0.0f;                  /* z is already the depth (or not transformed) */
+            pkt->depth_max = 1.0f;
+        }
+        pkt->depth_min = fminf(fmaxf(pkt->depth_min, 0.0f), 1.0f);
+        pkt->depth_max = fminf(fmaxf(pkt->depth_max, 0.0f), 1.0f);
+        pkt->depth_clip = !((r300_reg(st, VAP_CLIP_CNTL) >> 16) & 1);
+    }
 
     set_uniforms(st, pkt);
     set_textures(st, pkt);

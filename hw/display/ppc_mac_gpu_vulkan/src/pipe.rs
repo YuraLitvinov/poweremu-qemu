@@ -288,7 +288,7 @@ impl Vk {
         let ia = vk::PipelineInputAssemblyStateCreateInfo::builder().topology(vk::PrimitiveTopology::from_raw(pk.topo));
         let vp = vk::PipelineViewportStateCreateInfo::builder().viewport_count(1).scissor_count(1);
         let rs = vk::PipelineRasterizationStateCreateInfo::builder()
-            .depth_clamp_enable(self.depth_clamp && !no_depth_clamp())
+            .depth_clamp_enable(self.depth_clamp && pk.dclamp && !no_depth_clamp())
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::from_raw(pk.cull))
             .front_face(vk::FrontFace::from_raw(pk.front))

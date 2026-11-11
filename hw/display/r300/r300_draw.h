@@ -148,6 +148,15 @@ typedef struct R300DrawPacket {
      * puts the (never changed) colour target in scratch VRAM instead of at rt_gpu_addr.
      */
     bool rt_dummy;
+    /*
+     * Viewport depth range and z clipping.  gl_Position.z is clip-space z mapped to Vulkan's 0..w clip volume
+     * (GL: (z + w) / 2, D3D clip space VAP_CNTL.DX_CLIP_SPACE_DEF: z), and the viewport's depth range applies the
+     * hardware's zscale/zoffset: depth = depth_min + z_ndc * (depth_max - depth_min).  depth_clip: clip against the
+     * near and far planes (VAP_CLIP_CNTL.CLIP_DISABLE turns it off), else depth-clamp.
+     */
+    float depth_min, depth_max;
+    bool depth_clip;
+    bool depth_dx;              /* VAP_CNTL.DX_CLIP_SPACE_DEF: clip-space z is 0..w */
     uint32_t rt_view;           /* R300_RTV_* */
     uint32_t scissor[4];        /* x0, y0, x1, y1 (exclusive) */
     /* Colour buffers 1..num_cb-1 (render targets B-D the program writes,

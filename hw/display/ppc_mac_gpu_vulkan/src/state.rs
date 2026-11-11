@@ -162,6 +162,8 @@ pub struct PipeKey {
     pub front: i32,
     /// the depth buffer is 16 bits (storage-image shaders name the format)
     pub z16: bool,
+    /// depth-clamp instead of clipping against the near and far planes
+    pub dclamp: bool,
 }
 
 /// A program is named by its cached GLSL id when it has one, else by the

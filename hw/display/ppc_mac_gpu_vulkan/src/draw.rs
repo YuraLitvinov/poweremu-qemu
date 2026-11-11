@@ -285,6 +285,7 @@ impl Vk {
                 vk::FrontFace::CLOCKWISE.as_raw()
             },
             z16: pass_z && z16,
+            dclamp: !pkt.depth_clip,
         };
         let glsl: &CStr = unsafe { CStr::from_ptr(pkt.glsl) };
         let key = ProgKey::Text(glsl.to_string_lossy().into_owned());
@@ -485,8 +486,8 @@ impl Vk {
                 y: pkt.rt_height as f32,
                 width: pkt.rt_width as f32,
                 height: -(pkt.rt_height as f32),
-                min_depth: 0.0,
-                max_depth: 1.0,
+                min_depth: pkt.depth_min,
+                max_depth: pkt.depth_max,
             };
             let sc = vk::Rect2D {
                 offset: vk::Offset2D { x: (cx + sx0) as i32, y: sy0 as i32 },
