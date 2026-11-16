@@ -4568,6 +4568,54 @@ static bool ppc_mac_gpu_hostdata_mono(PPCMacGPUState *s, const uint32_t *d,
     return true;
 }
 
+/*
+ * Mono glyph from a Windows HOSTDATA_BLT header (hdr, see ppc_mac_gpu_pm4_2d) plus a header-less 0x19 packet:
+ * dst (y<<16|x), size (h<<16|w), bits[] a continuous byte stream, bit 7 of each byte first.
+ */
+static void ppc_mac_gpu_hostdata_stream(PPCMacGPUState *s, const uint32_t *hdr, uint32_t pos, uint32_t size,
+                                        const uint32_t *bits, uint32_t nbits_dw)
+{
+    uint32_t gmc = hdr[0], po = hdr[1];
+    uint32_t src_dt = (gmc >> 12) & 3;
+    uint32_t off = gpu_po_offset(s, po);
+    uint32_t pitch = (po & 0x3FC00000) >> 16;
+    uint32_t bpp = gpu_gmc_bpp(gmc);
+    uint32_t w = size & 0xFFFF, h = size >> 16, dx = pos & 0xFFFF, dy = pos >> 16;
+    bool lsb = gmc & (1u << 14), clip = gmc & (1u << 3);
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    if (g_seq_log_enabled > 0) {
+        char buf[400] = "";
+        for (uint32_t i = 0; i < nbits_dw && i < 24; i++) {
+            sprintf(buf + strlen(buf), " %08x", bits[i]);
+        }
+        seq_log("GLYPH w=%u h=%u dw=%u%s", w, h, nbits_dw, buf);
+    }
+    if (!w || !h || !pitch || (uint64_t)w * h > (uint64_t)nbits_dw * 32) {
+        return;
+    }
+    gpu_vram_access(s, GPU_ROWS(off, pitch, dy, h), true);
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t k = y * w + x, px = dx + x, py = dy + y;
+            uint32_t word = bits[k / 32];
+            /* a byte stream in memory order (low byte of the dword first), bit 7 of each byte first */
+            uint32_t sh = ((k >> 3) & 3) * 8 + (lsb ? (k & 7) : 7 - (k & 7));
+            bool bit = (word >> sh) & 1;
+
+            if (clip && (px < (hdr[2] & 0xFFFF) || py < (hdr[2] >> 16) ||
+                         px >= (hdr[3] & 0xFFFF) || py >= (hdr[3] >> 16))) {
+                continue;
+            }
+            if (bit || src_dt == 0) {
+                fill_vram_px(s, vram, (uint64_t)off + (uint64_t)py * pitch + (uint64_t)px * bpp,
+                             bit ? hdr[4] : hdr[5], bpp);
+            }
+        }
+    }
+    memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)dy * pitch, (uint64_t)h * pitch);
+}
+
 /* ROP3 on 32-bit words: bit (P<<2 | S<<1 | D) of the code gives the result. */
 static uint32_t gpu_rop3(uint32_t rop, uint32_t pat, uint32_t src, uint32_t dst)
 {
@@ -5895,7 +5943,42 @@ static bool ppc_mac_gpu_pm4_2d(PPCMacGPUState *s, uint32_t opcode,
         .brush_yx = s->regs.brush_y_x, .brush_data = s->regs.brush_data,
     };
 
+    /*
+     * Windows (ati2mtag) sends a mono glyph as a HOSTDATA_BLT header with no size (d[6] = d[7] = 0, nine dwords),
+     * followed by header-less packets, opcode 0x19: dst (y<<16|x), size (h<<16|w), then the bitmap as ONE
+     * continuous bit stream (no row padding: an 11x11 glyph is 4 dwords).  The header is kept, as for 0x1b.
+     */
+    static uint32_t hd_hdr[9];
+    static bool hd_valid;
+
+    if (opcode == 0x94 && n == 9 && !(d[7] & 0xFFFF)) {
+        memcpy(hd_hdr, d, sizeof(hd_hdr));
+        hd_valid = ((d[0] >> 12) & 3) <= 1;     /* mono fg/bg or fg/leave */
+        seq_log("HDHDR %08x %08x %08x %08x %08x %08x %08x %08x %08x", d[0], d[1], d[2], d[3], d[4], d[5], d[6],
+                d[7], d[8]);
+        return true;
+    }
+    if (opcode == 0x19 && hd_valid && n >= 3) {
+        ppc_mac_gpu_hostdata_stream(s, hd_hdr, d[0], d[1], d + 2, n - 2);
+        return true;
+    }
+    /*
+     * Windows colour HOSTDATA_BLT: gmc, dst PITCH_OFFSET, two clip words (zero), dst (y<<16|x), size (h<<16|w),
+     * dword count (= n - 7), then the pixels.  Re-laid out as the form ppc_mac_gpu_hostdata_mono reads.
+     */
+    if (opcode == 0x94 && n > 9 && ((d[0] >> 12) & 3) == 3 && d[6] == n - 7 && (d[5] & 0xFFFF) && (d[5] >> 16)) {
+        uint32_t *t = g_new(uint32_t, n + 2);
+        bool ok;
+
+        t[0] = d[0]; t[1] = d[1]; t[2] = d[2]; t[3] = d[3]; t[4] = t[5] = 0;
+        t[6] = d[4]; t[7] = d[5]; t[8] = 0;
+        memcpy(t + 9, d + 7, (n - 7) * 4);
+        ok = ppc_mac_gpu_hostdata_mono(s, t, n + 2);
+        g_free(t);
+        return ok;
+    }
     if (opcode == 0x94 && n >= 9) {
+        seq_log("HD94 n=%u d: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", n, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], n > 9 ? d[9] : 0, n > 10 ? d[10] : 0);
         return ppc_mac_gpu_hostdata_mono(s, d, n);
     }
     if (opcode == 0x9b && n >= 4) {
@@ -8315,6 +8398,13 @@ static bool ppc_mac_gpu_mmio_read_stub_3d(PPCMacGPUState *s, hwaddr addr, unsign
             break;
         }
 
+        /* WORKAROUND (x86, evidence: SP3 ati2mtag.sys 2008, polling loop (VA f6a4fd49 in one run) polls [MMIO+0x7b0] & 0x1f == 8 forever
+         * during the Windows XP SP3 "Installing Devices" step, then the screen falls back to text mode).  Meaning of
+         * the register is not documented; 8 is the value the driver waits for, so answer it. */
+        if (GUEST_LE && addr == 0x07b0) {
+            val = 8;
+            break;
+        }
         trace_ppc_mac_gpu_mmio_read_unimpl(size, addr,
                                             ppc_mac_gpu_reg_name(addr));
         /*
