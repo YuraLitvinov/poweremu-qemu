@@ -8442,9 +8442,25 @@ static bool ppc_mac_gpu_mmio_read_stub_3d(PPCMacGPUState *s, hwaddr addr, unsign
         /* WORKAROUND (x86, evidence: SP3 ati2mtag.sys 2008, polling loop (VA f6a4fd49 in one run) polls [MMIO+0x7b0] & 0x1f == 8 forever
          * during the Windows XP SP3 "Installing Devices" step, then the screen falls back to text mode).  Meaning of
          * the register is not documented; 8 is the value the driver waits for, so answer it. */
-        if (GUEST_LE && addr == 0x07b0) {
+        if (GUEST_LE && addr == 0x07b0 && !getenv("PPCGPU_NO_7B0")) {
             val = 8;
             break;
+        }
+        /* Same Windows wait-for-idle function family (ati2mtag.sys, rva 0x70d10 and 0x6fa80), other branches:
+         * [0x790] & 0x1f == 2, or [0x790] & 0xf == 8, then [0xa10] & 0xffff == 0x3333, each without a timeout.
+         * Unobserved so far (the 0x7b0 branch is the one normal boots take), kept so a first-boot session cannot
+         * spin in them (bugcheck 0xEA THREAD_STUCK_IN_DEVICE_DRIVER_M): 0x790 alternates 2 and 8. */
+        if (GUEST_LE && !getenv("PPCGPU_NO_7B0")) {
+            static unsigned w790;
+
+            if (addr == 0x0790) {
+                val = (w790++ & 1) ? 8 : 2;
+                break;
+            }
+            if (addr == 0x0a10) {
+                val = 0x3333;
+                break;
+            }
         }
         trace_ppc_mac_gpu_mmio_read_unimpl(size, addr,
                                             ppc_mac_gpu_reg_name(addr));
@@ -8868,11 +8884,44 @@ static void gpu_caller_probe(hwaddr addr)
 #endif
 }
 
+/*
+ * Stuck-poll detector (x86/KVM): a driver waiting for a status bit that never comes reads the same register,
+ * getting the same answer, forever (Windows then bugchecks with THREAD_STUCK_IN_DEVICE_DRIVER).  After 100000 such
+ * reads in a row (and at 10^6, 10^7) say which register, what it returned and where in the guest the reads come
+ * from, on stderr, with no debug switch needed.
+ */
+static void gpu_poll_watch(hwaddr addr, uint64_t val)
+{
+#if defined(__x86_64__) && !PPC_MAC_GPU_BE
+    static hwaddr last_addr = ~0ull;
+    static uint64_t last_val;
+    static uint64_t run;
+
+    if (addr == last_addr && val == last_val) {
+        run++;
+        if ((run == 100000 || run == 1000000 || run == 10000000) && current_cpu) {
+            struct kvm_regs kr;
+
+            if (ioctl(current_cpu->kvm_fd, KVM_GET_REGS, &kr) == 0) {
+                fprintf(stderr, "[POLL_STUCK] reg=0x%04" PRIx64 " (%s) read %" PRIu64 " times in a row, always 0x%"
+                        PRIx64 ", guest rip=0x%" PRIx64 "\n", (uint64_t)addr, ppc_mac_gpu_reg_name(addr), run, val,
+                        (uint64_t)kr.rip);
+            }
+        }
+    } else {
+        last_addr = addr;
+        last_val = val;
+        run = 1;
+    }
+#endif
+}
+
 /* Every register read, with the value the emulator answered (PPCGPU_DEBUG_LOG=1). */
 static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr, unsigned int size)
 {
     uint64_t val = ppc_mac_gpu_mmio_read_impl(opaque, addr, size);
 
+    gpu_poll_watch(addr, val);
     if (unlikely(gpu_debug_enabled())) {
         gpu_track_pass = gpu_tracked_reg(addr);
         gpu_debug_log("MMIO_RD size=%u addr=0x%04"PRIx64" (%s) = 0x%"PRIx64,
