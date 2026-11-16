@@ -3438,7 +3438,7 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
 
     /* Windows' ati2mtag draws with 3D_DRAW_IMMD (0x29): one leading dword, VAP_VF_CNTL, vertex data; it is
      * DRAW_IMMD_2 (0x35) with that extra dword in front. */
-    if (opcode == 0x29 && body_dw >= 2 && !getenv("R300_NO_IMMD29")) {
+    if (opcode == 0x29 && body_dw >= 2) {
         opcode = 0x35;
         d++;
         body_dw--;
@@ -5978,6 +5978,18 @@ static bool ppc_mac_gpu_pm4_2d(PPCMacGPUState *s, uint32_t opcode,
      */
     static uint32_t hd_hdr[9];
     static bool hd_valid;
+    {   /* debug: PPCGPU_SKIP_OP=<hex opcode> drops that 2D packet type (bisecting what draws what) */
+        static int skip = -2;
+
+        if (skip == -2) {
+            const char *e = getenv("PPCGPU_SKIP_OP");
+
+            skip = e ? (int)strtoul(e, NULL, 16) : -1;
+        }
+        if (skip >= 0 && opcode == (uint32_t)skip) {
+            return true;
+        }
+    }
 
     if (opcode == 0x94 && n == 9 && !(d[7] & 0xFFFF)) {
         memcpy(hd_hdr, d, sizeof(hd_hdr));
@@ -5988,6 +6000,37 @@ static bool ppc_mac_gpu_pm4_2d(PPCMacGPUState *s, uint32_t opcode,
     }
     if (opcode == 0x19 && hd_valid && n >= 3) {
         ppc_mac_gpu_hostdata_stream(s, hd_hdr, d[0], d[1], d + 2, n - 2);
+        return true;
+    }
+    /*
+     * Windows 8-bit indexed HOSTDATA_BLT.  A type-3 0x2c packet (257 dwords: a flag word, then 256 colours) loads
+     * the palette; the 0x94 packet is {gmc, dst PITCH_OFFSET, 0, 0, dst (y<<16|x), size (h<<16|w), dword count,
+     * bytes}: one palette index per pixel, rows packed with no padding (count == ceil(w * h / 4)).  Drawn on
+     * 32-bit destinations.
+     */
+    static uint32_t win_pal[256];
+
+    if (opcode == 0x2c && n == 257) {
+        memcpy(win_pal, d + 1, sizeof(win_pal));
+        return true;
+    }
+    if (opcode == 0x94 && n > 9 && ((d[0] >> 12) & 3) == 1 && d[6] == n - 7 && (d[5] & 0xFFFF) && (d[5] >> 16) &&
+        (uint64_t)d[6] == ((uint64_t)(d[5] & 0xFFFF) * (d[5] >> 16) + 3) / 4 && gpu_gmc_bpp(d[0]) == 4) {
+        uint32_t off = gpu_po_offset(s, d[1]), pitch = (d[1] & 0x3FC00000) >> 16;
+        uint32_t dx = d[4] & 0xFFFF, dy = d[4] >> 16, w = d[5] & 0xFFFF, h = d[5] >> 16;
+        const uint8_t *px = (const uint8_t *)(d + 7);
+        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+        if (pitch && (uint64_t)off + (uint64_t)(dy + h) * pitch <= s->vram_size) {
+            gpu_vram_access(s, GPU_ROWS(off, pitch, dy, h), true);
+            for (uint32_t y = 0; y < h; y++) {
+                for (uint32_t x = 0; x < w; x++) {
+                    gpu_px_put(s, vram, (uint64_t)off + (uint64_t)(dy + y) * pitch + (uint64_t)(dx + x) * 4,
+                               win_pal[px[y * w + x]], 4);
+                }
+            }
+            memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)dy * pitch, (uint64_t)h * pitch);
+        }
         return true;
     }
     /*

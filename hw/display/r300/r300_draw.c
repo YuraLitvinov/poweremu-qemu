@@ -511,8 +511,12 @@ static void rs_values(const R300State *st, const Layout *l, const Route *r,
 static uint32_t sc_bias(const R300State *st)
 {
     static uint32_t bias = 1440;
+    static int off = -1;
 
-    if (bias == 1440 && st->win_immd && !getenv("R300_NO_BIAS1088")) {
+    if (off < 0) {
+        off = getenv("R300_NO_BIAS1088") != NULL;
+    }
+    if (bias == 1440 && st->win_immd && !off) {
         for (int i = 0; i < 8; i++) {
             uint32_t v = r300_reg(st, SC_CLIPRECT_TL_0 + 4 * i);
 
