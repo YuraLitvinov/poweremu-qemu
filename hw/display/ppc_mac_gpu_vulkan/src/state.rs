@@ -172,6 +172,8 @@ pub struct PipeKey {
 pub enum ProgKey {
     Id(u32),
     Text(String),
+    /// 64-bit hash of the GLSL bytes (length mixed in): what draws use, so no String is built per draw.
+    Hash(u64),
 }
 
 /// The pipelines of one GLSL source.

@@ -298,6 +298,13 @@ static void gpu_sync_at(PPCMacGPUState *s, uint32_t why)
     }
 }
 
+/* The device wrote VRAM: mark it dirty for the display, and tell the renderer to collect the log before its next draw. */
+static inline void gpu_vram_dirty(PPCMacGPUState *s, uint64_t addr, uint64_t size)
+{
+    s->vram_dev_dirty = true;
+    memory_region_set_dirty(&s->vram, addr, size);
+}
+
 /*
  * A CPU-side 2D operation is about to read (write_access=false) or write
  * VRAM rows [lo, hi).  Flush batched 3D work only if it overlaps: work in
@@ -941,7 +948,7 @@ static bool gpu_tracked_reg(hwaddr addr)
     case 0x01EC: case 0x01F0:   /* unnamed registers read by the driver after the memory init (caller probe) */
     case 0x0334: case 0x07FC:   /* ?, PM4_MICRO_CNTL */
     case 0x0804: case 0x0888:
-    case 0x0908: case 0x1608:
+    case 0x0908: case 0x1608: case 0x1FB4:
         return true;
     default:
         return false;
@@ -1343,7 +1350,7 @@ static void ppc_mac_gpu_vga_bank_write(void *opaque, hwaddr addr, uint64_t val,
 
         if (off < s->vram_size) {
             vram[off] = val >> (8 * i);
-            memory_region_set_dirty(&s->vram, off, 1);
+            gpu_vram_dirty(s, off, 1);
         }
     }
 }
@@ -1993,7 +2000,7 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
         gpu_vram_access(s, off, off + 4, true);
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
         memcpy(vram + off, &wire_val, 4);
-        memory_region_set_dirty(&s->vram, off, 4);
+        gpu_vram_dirty(s, off, 4);
         gpu_debug_log("SCRATCH_WB reg%d=0x%x -> VRAM[0x%x]",
                       reg_idx, wb_val, off);
     } else {
@@ -2034,7 +2041,7 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
             uint32_t off = addr - fb_base;
             memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) + off,
                    &wire_val, 4);
-            memory_region_set_dirty(&s->vram, off, 4);
+            gpu_vram_dirty(s, off, 4);
         } else {
             address_space_write(&address_space_memory, addr,
                                 MEMTXATTRS_UNSPECIFIED, &wire_val, 4);
@@ -2290,7 +2297,7 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
         }
         memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                (gpu_addr - fb_base), bytes, 4);
-        memory_region_set_dirty(&s->vram, gpu_addr - fb_base, 4);
+        gpu_vram_dirty(s, gpu_addr - fb_base, 4);
         return true;
     }
     if (ppc_mac_gpu_agp_translate(s, gpu_addr, &phys) ||
@@ -2417,7 +2424,7 @@ static void r300_zmask_clear(PPCMacGPUState *s)
             stw_le_p(vram + off + i, v);
         }
     }
-    memory_region_set_dirty(&s->vram, off, bpr * rows);
+    gpu_vram_dirty(s, off, bpr * rows);
     static int logged;
     if (logged++ < 4) {
         qemu_log("ppc-mac-gpu r300: 3D_CLEAR_ZMASK: depth at 0x%x, %u rows of "
@@ -2482,7 +2489,7 @@ static void r300_cmask_clear(PPCMacGPUState *s)
             stw_le_p(vram + off + i, w);
         }
     }
-    memory_region_set_dirty(&s->vram, off, bpr * rows);
+    gpu_vram_dirty(s, off, bpr * rows);
     static int logged;
     if (logged++ < 4) {
         qemu_log("ppc-mac-gpu r300: 3D_CLEAR_CMASK: colour at 0x%x, %u rows of "
@@ -2814,7 +2821,7 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
             }
         }
     }
-    memory_region_set_dirty(&s->vram, dst + (uint64_t)iy0 * dpitch,
+    gpu_vram_dirty(s, dst + (uint64_t)iy0 * dpitch,
                             (uint64_t)dpitch * h);
     static int logged;
     if (logged++ < 3) {
@@ -3049,7 +3056,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             if (!r300_read_raw(s, gart_addr, vram_p + gart_scratch, rt_len)) {
                 memset(vram_p + gart_scratch, 0, rt_len);
             }
-            memory_region_set_dirty(&s->vram, gart_scratch, rt_len);
+            gpu_vram_dirty(s, gart_scratch, rt_len);
             pkt.rt_gpu_addr = gart_scratch;
             gart_len = rt_len;
         }
@@ -3218,7 +3225,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         r300_aa_resolve(s, &pkt);
         if (gart_backup) {
             memcpy(memory_region_get_ram_ptr(&s->vram) + gart_scratch, gart_backup, gart_len);
-            memory_region_set_dirty(&s->vram, gart_scratch, gart_len);
+            gpu_vram_dirty(s, gart_scratch, gart_len);
             g_free(gart_backup);
         }
         r300_draw_free(&pkt);
@@ -3249,6 +3256,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (sync_each < 0) {
             sync_each = getenv("R300_SYNC") != NULL;   /* debug: no batching */
         }
+        pkt.harvest_hint = s->vram_dev_dirty || s->kick_epoch != s->last_draw_epoch;
+        s->vram_dev_dirty = false;
+        s->last_draw_epoch = s->kick_epoch;
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
@@ -3277,7 +3287,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         *row++ = v;
                     }
                 }
-                memory_region_set_dirty(&s->vram, zo + (uint64_t)y0 * pitch_b, (uint64_t)(y1 - y0) * pitch_b);
+                gpu_vram_dirty(s, zo + (uint64_t)y0 * pitch_b, (uint64_t)(y1 - y0) * pitch_b);
             }
         }
         if (gart_backup) {
@@ -3301,7 +3311,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 }
             }
             memcpy(vram_p + gart_scratch, gart_backup, gart_len);
-            memory_region_set_dirty(&s->vram, gart_scratch, gart_len);
+            gpu_vram_dirty(s, gart_scratch, gart_len);
             g_free(gart_backup);
             gart_backup = NULL;
         }
@@ -3402,9 +3412,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
              * to them this would say the CPU overwrote what they drew. */
             uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
             if (!s->renderer->set_dirty_source) {
-                memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
+                gpu_vram_dirty(s, pkt.rt_gpu_addr, len);
                 for (uint32_t k = 1; k < pkt.num_cb; k++) {
-                    memory_region_set_dirty(&s->vram, pkt.cb[k].gpu_addr,
+                    gpu_vram_dirty(s, pkt.cb[k].gpu_addr,
                                             (uint64_t)pkt.cb[k].pitch * pkt.cb[k].bpp *
                                             pkt.rt_height);
                 }
@@ -3423,7 +3433,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     }
     if (gart_backup) {                          /* no renderer drew: nothing to copy, scratch untouched */
         memcpy(memory_region_get_ram_ptr(&s->vram) + gart_scratch, gart_backup, gart_len);
-        memory_region_set_dirty(&s->vram, gart_scratch, gart_len);
+        gpu_vram_dirty(s, gart_scratch, gart_len);
         g_free(gart_backup);
     }
     r300_draw_free(&pkt);
@@ -3956,7 +3966,7 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
                              (uint64_t)s->host_data_dst_y * s->host_data_pitch;
             uint64_t len = (uint64_t)s->host_data_h * s->host_data_pitch;
             if (start + len <= s->vram_size) {
-                memory_region_set_dirty(&s->vram, start, len);
+                gpu_vram_dirty(s, start, len);
             }
             s->host_data_active = false;
             s->display_invalid = true;
@@ -4011,7 +4021,7 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
                   (uint64_t)s->host_data_w * bpp
                 : (uint64_t)s->host_data_w * bpp;
             if (dirty_start + dirty_len <= s->vram_size) {
-                memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+                gpu_vram_dirty(s, dirty_start, dirty_len);
             }
             if (g_frame_tracker) {
                 frame_tracker_record_detail(g_frame_tracker,
@@ -4591,7 +4601,7 @@ static bool ppc_mac_gpu_hostdata_mono(PPCMacGPUState *s, const uint32_t *d,
             }
         }
     }
-    memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)dy * pitch,
+    gpu_vram_dirty(s, (uint64_t)off + (uint64_t)dy * pitch,
                             (uint64_t)h * pitch);
     return true;
 }
@@ -4641,7 +4651,7 @@ static void ppc_mac_gpu_hostdata_stream(PPCMacGPUState *s, const uint32_t *hdr, 
             }
         }
     }
-    memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)dy * pitch, (uint64_t)h * pitch);
+    gpu_vram_dirty(s, (uint64_t)off + (uint64_t)dy * pitch, (uint64_t)h * pitch);
 }
 
 /* ROP3 on 32-bit words: bit (P<<2 | S<<1 | D) of the code gives the result. */
@@ -4861,7 +4871,7 @@ static void ppc_mac_gpu_2d_op(PPCMacGPUState *s, const Gpu2DOp *op)
         if (ylo < 0) {
             ylo = 0;
         }
-        memory_region_set_dirty(&s->vram, (uint64_t)doff + (uint64_t)ylo * dpitch,
+        gpu_vram_dirty(s, (uint64_t)doff + (uint64_t)ylo * dpitch,
                                 (uint64_t)h * dpitch);
     }
 }
@@ -4966,7 +4976,7 @@ static void ppc_mac_gpu_2d_line(PPCMacGPUState *s, uint32_t end)
             y0 += sy;
         }
     }
-    memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)ymin * pitch,
+    gpu_vram_dirty(s, (uint64_t)off + (uint64_t)ymin * pitch,
                             (uint64_t)(ymax - ymin + 1) * pitch);
 }
 
@@ -5344,7 +5354,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         uint64_t dirty_len = (blit_h > 1)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
-        memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+        gpu_vram_dirty(s, dirty_start, dirty_len);
 
         /*
          * SRT write-through: if this 2D BLIT wrote to a VRAM offset
@@ -5465,7 +5475,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         uint64_t fill_dirty_len = (blit_h > 1)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
-        memory_region_set_dirty(&s->vram, fill_dirty_start, fill_dirty_len);
+        gpu_vram_dirty(s, fill_dirty_start, fill_dirty_len);
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
     }
@@ -5779,7 +5789,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
         if (dirty_start + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+            gpu_vram_dirty(s, dirty_start, dirty_len);
         }
         s->display_invalid = true;
 
@@ -5839,7 +5849,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
         if (dirty_start + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+            gpu_vram_dirty(s, dirty_start, dirty_len);
         }
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
@@ -6029,7 +6039,7 @@ static bool ppc_mac_gpu_pm4_2d(PPCMacGPUState *s, uint32_t opcode,
                                win_pal[px[y * w + x]], 4);
                 }
             }
-            memory_region_set_dirty(&s->vram, (uint64_t)off + (uint64_t)dy * pitch, (uint64_t)h * pitch);
+            gpu_vram_dirty(s, (uint64_t)off + (uint64_t)dy * pitch, (uint64_t)h * pitch);
         }
         return true;
     }
@@ -6689,7 +6699,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                               (uint64_t)blit_w * bpp
                             : (uint64_t)blit_w * bpp;
                         if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
+                            gpu_vram_dirty(s,
                                                     dirty_start, dirty_len);
                         }
                         }
@@ -6965,7 +6975,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                               (uint64_t)blit_w * bpp
                             : (uint64_t)blit_w * bpp;
                         if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
+                            gpu_vram_dirty(s,
                                                     dirty_start, dirty_len);
                         }
                         r200_fill_notify(s, offset, pitch, dst_x, dst_y,
@@ -7099,7 +7109,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                               (uint64_t)blit_w * bpp
                             : (uint64_t)blit_w * bpp;
                         if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
+                            gpu_vram_dirty(s,
                                                     dirty_start, dirty_len);
                         }
                         s->display_invalid = true;
@@ -7157,6 +7167,7 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
         return;
     }
 
+    s->kick_epoch++;
     gpu_debug_log("IB_EXEC base=0x%x size=%u dwords", ib_base, ib_size_dw);
 
     /* Try GART translation first (IB is usually in system RAM) */
@@ -7254,6 +7265,7 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
         rb_data[i] = gpu_guest_dw(s, raw);
     }
 
+    s->kick_epoch++;
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
                   count, old_rptr, new_wptr, rb_bufsz);
 
@@ -7645,7 +7657,7 @@ static void ppc_mac_gpu_mm_aper_write(PPCMacGPUState *s, uint64_t off, uint64_t 
     for (unsigned i = 0; i < size; i++) {
         if (off + i < s->vram_size) {
             vram[off + i] = val >> (8 * i);
-            memory_region_set_dirty(&s->vram, off + i, 1);
+            gpu_vram_dirty(s, off + i, 1);
         }
     }
 }
@@ -7890,6 +7902,12 @@ static bool ppc_mac_gpu_mmio_read_display(PPCMacGPUState *s, hwaddr addr, unsign
         break;
     case R200_CRTC_OFFSET_CNTL:
         val = s->regs.crtc_offset_cntl;
+        if (GUEST_LE && !getenv("PPCGPU_KEEP_TRIG")) {
+            /* CRTC_GUI_TRIG_OFFSET (bit 30): the driver sets it to latch CRTC_OFFSET at the next vblank and the
+             * hardware clears it once it has.  Linux r100_page_flip busy-waits on it (RCU stalls when it stays
+             * set); the flip here takes effect at the next display refresh, so it reads back as done. */
+            val &= ~(1u << 30);
+        }
         break;
     case R200_CRTC_PITCH:
         val = s->regs.crtc_pitch;
@@ -8505,6 +8523,14 @@ static bool ppc_mac_gpu_mmio_read_stub_3d(PPCMacGPUState *s, hwaddr addr, unsign
                 val = 0x3333;
                 break;
             }
+            /* Windows 3DMark2001 "Benchmark" (DirectX fullscreen mode change): ati2cqag.dll, a wait-with-timeout loop
+             * at rva 0x7a40 whose condition (rva 0x7300) reads [0x1fb4] until (value & 0x80000000) == 0x80000000 (the
+             * object holds pointer 0x1fb4, mask 0x80000000).  Without the bit the call runs for ~20 s and the
+             * display watchdog bugchecks (THREAD_STUCK_IN_DEVICE_DRIVER_M).  Meaning of the register unknown. */
+            if (addr == 0x1fb4) {
+                val = 0x80000000;
+                break;
+            }
         }
         trace_ppc_mac_gpu_mmio_read_unimpl(size, addr,
                                             ppc_mac_gpu_reg_name(addr));
@@ -8903,14 +8929,14 @@ static uint64_t ppc_mac_gpu_mmio_read_impl(void *opaque, hwaddr addr,
 static void gpu_caller_probe(hwaddr addr)
 {
 #if defined(__x86_64__) && !PPC_MAC_GPU_BE
-    static const uint32_t watch[] = { 0x01EC, 0x01F0, 0x0334, 0x07FC, 0x0804, 0x0888, 0x0908, 0x1608 };
+    static const uint32_t watch[] = { 0x01EC, 0x01F0, 0x0334, 0x07FC, 0x0804, 0x0888, 0x0908, 0x1608, 0x1FB4, 0x0044 };
     static unsigned cnt[ARRAY_SIZE(watch)];
 
     for (unsigned i = 0; i < ARRAY_SIZE(watch); i++) {
         if (watch[i] != (addr & ~3ull)) {
             continue;
         }
-        if ((++cnt[i] == 1 || cnt[i] == 10) && current_cpu) {
+        if ((++cnt[i] == 1 || cnt[i] == 10 || cnt[i] == 100 || cnt[i] == 10000) && current_cpu) {
             struct kvm_regs kr;
             uint32_t stk[24] = {0};
 
@@ -8939,11 +8965,20 @@ static void gpu_poll_watch(hwaddr addr, uint64_t val)
 #if defined(__x86_64__) && !PPC_MAC_GPU_BE
     static hwaddr last_addr = ~0ull;
     static uint64_t last_val;
-    static uint64_t run;
+    static uint64_t run, n1 = 100000;
+    static bool init;
 
+    if (!init) {
+        const char *e = getenv("PPCGPU_POLL_N");
+
+        init = true;
+        if (e && strtoull(e, NULL, 0)) {
+            n1 = strtoull(e, NULL, 0);
+        }
+    }
     if (addr == last_addr && val == last_val) {
         run++;
-        if ((run == 100000 || run == 1000000 || run == 10000000) && current_cpu) {
+        if ((run == n1 || run == n1 * 10 || run == n1 * 100) && current_cpu) {
             struct kvm_regs kr;
 
             if (ioctl(current_cpu->kvm_fd, KVM_GET_REGS, &kr) == 0) {
@@ -10181,7 +10216,7 @@ static void ppc_mac_gpu_vram_bswap_write(void *opaque, hwaddr addr,
     default:
         break;
     }
-    memory_region_set_dirty(&s->vram, addr, size);
+    gpu_vram_dirty(s, addr, size);
 }
 #endif
 
@@ -10292,7 +10327,7 @@ static void r300_zconv(PPCMacGPUState *s, bool to_card)
         }
     }
     g_free(tmp);
-    memory_region_set_dirty(&s->vram, s->r3_zconv_off, card);
+    gpu_vram_dirty(s, s->r3_zconv_off, card);
     static int logged;
     if (logged++ < 6) {
         qemu_log("ppc-mac-gpu r300: depth at 0x%x (%ux%u, %u samples) %s the "
@@ -11154,7 +11189,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     s->surface_width = 0;
     s->surface_height = 0;
     s->surface_stride = 0;
-    memory_region_set_dirty(&s->vram, 0, s->vram_size);
+    gpu_vram_dirty(s, 0, s->vram_size);
     /*
      * The pointer has to be handed to the window again.  Its picture and
      * position are restored above, but they reached the window in the first

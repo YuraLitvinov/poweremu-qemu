@@ -148,6 +148,7 @@ typedef struct R300DrawPacket {
      * puts the (never changed) colour target in scratch VRAM instead of at rt_gpu_addr.
      */
     bool rt_dummy;
+    bool harvest_hint;          /* the renderer must collect the VRAM dirty log before this draw */
     /*
      * Viewport depth range and z clipping.  gl_Position.z is clip-space z mapped to Vulkan's 0..w clip volume
      * (GL: (z + w) / 2, D3D clip space VAP_CNTL.DX_CLIP_SPACE_DEF: z), and the viewport's depth range applies the

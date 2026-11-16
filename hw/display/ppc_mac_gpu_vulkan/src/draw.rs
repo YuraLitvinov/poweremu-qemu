@@ -84,7 +84,11 @@ impl Vk {
             want_z = false;
         }
 
-        self.harvest();
+        // The CPU's writes (and the device's own, e.g. the 2D engine uploading a texture) only need collecting when
+        // something could have written since the last draw; the device says so.
+        if pkt.harvest_hint {
+            self.harvest();
+        }
         {
             let uu = pkt.uniforms;
             self.dump_draw(pkt, &uu, ns, want_z);
@@ -288,7 +292,7 @@ impl Vk {
             dclamp: !pkt.depth_clip,
         };
         let glsl: &CStr = unsafe { CStr::from_ptr(pkt.glsl) };
-        let key = ProgKey::Text(glsl.to_string_lossy().into_owned());
+        let key = ProgKey::Hash(prog_hash(glsl.to_bytes()));
         let mut pipe = vk::Pipeline::null();
         let mut lpipe = vk::Pipeline::null();
         if pkt.num_verts != 0 {
@@ -700,4 +704,20 @@ impl Vk {
             }
         }
     }
+}
+
+
+/// A fast 64-bit hash of a shader's text (eight bytes at a time, length mixed in).
+fn prog_hash(b: &[u8]) -> u64 {
+    let mut h: u64 = 0x9E37_79B9_7F4A_7C15 ^ (b.len() as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    let mut it = b.chunks_exact(8);
+    for c in &mut it {
+        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        h = (h ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+    }
+    for &x in it.remainder() {
+        h = (h ^ x as u64).wrapping_mul(0x100_0000_01B3);
+    }
+    h ^ (h >> 32)
 }

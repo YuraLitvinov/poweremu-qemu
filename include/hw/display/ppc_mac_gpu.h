@@ -615,6 +615,12 @@ struct PPCMacGPUState {
     /* Parent */
     PCIDevice pci;
 
+    /* The renderer collects the CPU's and the device's VRAM writes (the dirty log) only when this says something could
+     * have written since its last draw: a new command submission (CPU writes before the kick), or the device's own
+     * writes (2D engine, uploads), flagged by gpu_vram_dirty(). */
+    bool vram_dev_dirty;
+    uint32_t kick_epoch, last_draw_epoch;
+
     /* Scratch for vertex assembly, reused across draws.
      *
      * These were a g_new0/g_free pair inside the draw path.  Warcraft issues
