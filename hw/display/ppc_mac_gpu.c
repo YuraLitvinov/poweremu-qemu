@@ -3438,10 +3438,11 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
 
     /* Windows' ati2mtag draws with 3D_DRAW_IMMD (0x29): one leading dword, VAP_VF_CNTL, vertex data; it is
      * DRAW_IMMD_2 (0x35) with that extra dword in front. */
-    if (opcode == 0x29 && body_dw >= 2) {
+    if (opcode == 0x29 && body_dw >= 2 && !getenv("R300_NO_IMMD29")) {
         opcode = 0x35;
         d++;
         body_dw--;
+        s->r3->win_immd = true;
     }
     bool draw = opcode == 0x34 || opcode == 0x35 || opcode == 0x36;
 

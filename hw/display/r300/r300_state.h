@@ -37,6 +37,7 @@ typedef struct R300State {
     uint32_t pvs_upload_dw;                    /* next dword to write */
     uint64_t pvs_gen;       /* bumps when PVS code/constants change */
     uint64_t draws;
+    bool win_immd;          /* a 3D_DRAW_IMMD (0x29) packet was seen: the guest runs the Windows driver (see sc_bias) */
     uint32_t le_screen_h;   /* little-endian (Linux) guest: the screen height, else 0.  Linux clips with
                              * the SC_CLIPRECT registers and leaves the scissor open, and the colour buffer
                              * is screen-sized */

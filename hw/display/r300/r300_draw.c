@@ -503,14 +503,16 @@ static void rs_values(const R300State *st, const Layout *l, const Route *r,
  * Scissor and clip rectangle coordinates carry a bias so they stay positive: the Linux driver (and Apple's) uses
  * 1440.  The Windows driver (ati2mtag) uses 1088: its clip rectangles for sprites it crops (the Start button's
  * flag and label) only line up with its vertex positions that way, and read with 1440 they are empty, which
- * clips every fragment.  A rectangle coordinate in 1000..1439 cannot come from a 1440 bias (it would be a
- * negative coordinate), so the first one seen switches to 1088 for good.  WORKAROUND, narrow and evidenced.
+ * clips every fragment.  Once the guest has sent a 3D_DRAW_IMMD packet (only the Windows driver does; Mesa never
+ * does) a rectangle coordinate in 1000..1439 means a 1088 bias; the first one seen switches to 1088 for good.
+ * Without the IMMD condition this misfired on Linux (windows partly off-screen have slightly negative clip
+ * coordinates, 1440 - n).  WORKAROUND, narrow and evidenced.
  */
 static uint32_t sc_bias(const R300State *st)
 {
     static uint32_t bias = 1440;
 
-    if (bias == 1440) {
+    if (bias == 1440 && st->win_immd && !getenv("R300_NO_BIAS1088")) {
         for (int i = 0; i < 8; i++) {
             uint32_t v = r300_reg(st, SC_CLIPRECT_TL_0 + 4 * i);
 
