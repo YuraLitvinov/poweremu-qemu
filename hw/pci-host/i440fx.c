@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/range.h"
+#include "qemu/host-utils.h"
 #include "hw/i386/pc.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_host.h"
@@ -347,6 +348,121 @@ static const TypeInfo i440fx_info = {
     },
 };
 
+
+/*
+ * Intel 82443BX (440BX) host bridge: an i440FX plus the AGP target side.
+ * Datasheet: Intel 290633 (82443BX).  Only what the guests' AGP drivers
+ * (Linux agpgart intel-agp, Windows agp440.sys) read is modelled: the AGP
+ * capability, AGPCTRL/APSIZE/ATTBASE and the aperture BAR.  The aperture
+ * itself does not translate yet (GART comes later).
+ */
+#define TYPE_I440BX_PCI_DEVICE "i440BX"
+OBJECT_DECLARE_SIMPLE_TYPE(PCII440BXState, I440BX_PCI_DEVICE)
+
+struct PCII440BXState {
+    PCII440FXState parent_obj;
+    MemoryRegion aperture;
+};
+
+#define I440BX_AGPCAP   0xa0
+#define I440BX_AGPCTRL  0xb0
+#define I440BX_APSIZE   0xb4
+#define I440BX_ATTBASE  0xb8
+#define I440BX_AGP_STATUS_VAL 0x1f000202 /* RQ 32, SBA, rates 1x/2x (AGP 2.0 BX) */
+
+static uint64_t i440bx_aper_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void i440bx_aper_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+}
+
+static const MemoryRegionOps i440bx_aper_ops = {
+    .read = i440bx_aper_read,
+    .write = i440bx_aper_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/* APSIZE[5:0]: 0 = 256MB, each set bit (from the top) halves it, 0x3f = 4MB */
+static uint64_t i440bx_aperture_size(PCIDevice *dev)
+{
+    return (4ULL << 20) << (6 - ctpop8(dev->config[I440BX_APSIZE] & 0x3f));
+}
+
+static void i440bx_update_aperture(PCII440BXState *b)
+{
+    PCIDevice *dev = PCI_DEVICE(b);
+    uint64_t size = i440bx_aperture_size(dev);
+    uint32_t base = pci_get_long(dev->config + PCI_BASE_ADDRESS_0);
+
+    memory_region_set_size(&b->aperture, size);
+    /* BAR size mask follows APSIZE; bits below the size read as zero */
+    pci_set_long(dev->wmask + PCI_BASE_ADDRESS_0, (uint32_t)~(size - 1));
+    pci_set_long(dev->config + PCI_BASE_ADDRESS_0,
+                 (base & ~(uint32_t)(size - 1)) | 0x8);
+}
+
+static void i440bx_write_config(PCIDevice *dev, uint32_t address,
+                                uint32_t val, int len)
+{
+    PCII440BXState *b = I440BX_PCI_DEVICE(dev);
+
+    /* AGP command (cap + 8) and AGPCTRL/APSIZE/ATTBASE are plain storage */
+    i440fx_write_config(dev, address, val, len);
+    if (ranges_overlap(address, len, I440BX_APSIZE, 1) ||
+        ranges_overlap(address, len, PCI_BASE_ADDRESS_0, 4)) {
+        i440bx_update_aperture(b);
+    }
+}
+
+static void i440bx_realize(PCIDevice *dev, Error **errp)
+{
+    PCII440BXState *b = I440BX_PCI_DEVICE(dev);
+    Error *err = NULL;
+
+    i440fx_realize(dev, &err);
+    if (err) {
+        error_propagate(errp, err);
+        return;
+    }
+
+    /* AGP capability: id, next, version 2.0, status, command */
+    pci_add_capability(dev, PCI_CAP_ID_AGP, I440BX_AGPCAP, 8, errp);
+    dev->config[I440BX_AGPCAP + 2] = 0x20;
+    pci_set_long(dev->config + I440BX_AGPCAP + 4, I440BX_AGP_STATUS_VAL);
+    pci_set_long(dev->wmask + I440BX_AGPCAP + 8, 0x00000107); /* ENABLE, SBA, rate */
+    dev->wmask[I440BX_AGPCTRL] = 0xff;
+    dev->wmask[I440BX_APSIZE] = 0x3f;
+    pci_set_long(dev->wmask + I440BX_ATTBASE, 0xfffff000);
+
+    memory_region_init_io(&b->aperture, OBJECT(dev), &i440bx_aper_ops, b,
+                          "i440bx-agp-aperture", 256 * MiB);
+    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &b->aperture);
+    i440bx_update_aperture(b);
+}
+
+static void i440bx_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize = i440bx_realize;
+    k->config_write = i440bx_write_config;
+    k->device_id = 0x7190;
+    k->revision = 0x03;
+    dc->desc = "Intel 82443BX host bridge";
+}
+
+static const TypeInfo i440bx_info = {
+    .name          = TYPE_I440BX_PCI_DEVICE,
+    .parent        = TYPE_I440FX_PCI_DEVICE,
+    .instance_size = sizeof(PCII440BXState),
+    .class_init    = i440bx_class_init,
+};
+
 static const char *i440fx_pcihost_root_bus_path(PCIHostState *host_bridge,
                                                 PCIBus *rootbus)
 {
@@ -404,6 +520,7 @@ static const TypeInfo i440fx_pcihost_info = {
 static void i440fx_register_types(void)
 {
     type_register_static(&i440fx_info);
+    type_register_static(&i440bx_info);
     type_register_static(&i440fx_pcihost_info);
 }
 

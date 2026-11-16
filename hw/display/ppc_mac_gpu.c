@@ -1,12 +1,12 @@
 /*
- * PPC Mac GPU - ATI Radeon 9200 (RV280) compatible display device for QEMU
+ * PPC Mac GPU - ATI Radeon 9700 PRO (R300) display device for QEMU
  *
- * Emulates enough of the RV280 register interface for Mac OS X Tiger/Leopard
+ * Emulates enough of the Radeon register interface for Mac OS X Tiger/Leopard
  * ATI kext attachment and accelerated framebuffer operation on PowerMac G4.
  *
- * Strategy: Radeon compatibility path. We present PCI IDs that match the
- * Radeon 9200 PRO (RV280), which Tiger's ATIRadeon9700.kext will recognize
- * and attach to. We emulate only the registers the driver actually touches.
+ * Strategy: we present the PCI ID of the Radeon 9700 PRO Mac Edition (R300,
+ * 1002:4E44), which Tiger's ATIRadeon9700.kext recognizes and attaches to.
+ * We emulate only the registers the driver actually touches.
  *
  * Host targets: Intel macOS + Apple Silicon macOS (both via Metal or SW).
  * Guest targets: Mac OS X Tiger 10.4.11 PPC, Leopard 10.5 PPC.
@@ -38,6 +38,8 @@
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 #include "exec/tswap.h"
+#include "ppc_mac_gpu_byteorder.h"
+#include "ppc_mac_gpu_scanout.h"
 #include "vga_int.h"
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
@@ -46,6 +48,11 @@
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
 #include "system/system.h"
+#if defined(__x86_64__) && !PPC_MAC_GPU_BE
+#include <sys/ioctl.h>
+#include <linux/kvm.h>
+#include "exec/cpu-common.h"
+#endif
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
@@ -60,7 +67,8 @@ uint32_t uninorth_get_agp_gart_gen(void);
  */
 static inline uint32_t gpu_guest_dw(PPCMacGPUState *s, uint32_t raw)
 {
-    return s->swap ? be32_to_cpu(raw) : le32_to_cpu(raw);
+    (void)s;
+    return GUEST_TO_CPU32(raw);
 }
 
 /* The page table entry the last successful GART translation read (address and
@@ -137,8 +145,10 @@ static void fb_write_watch(const char *path, const char *src_kind,
         dst_x, dst_y, w, h, from_srt, nonzero_sample);
 }
 
+#ifdef CONFIG_DARWIN
 /* Set by the Metal backend when it tracks frames; NULL otherwise. */
 FrameTracker *g_frame_tracker;
+#endif
 
 static void frame_tracker_record_2d_event(PassEventType type,
                                           uint32_t surface_offset,
@@ -173,7 +183,7 @@ static void frame_tracker_record_2d_event(PassEventType type,
 }
 
 /* Global BLIT region table — maps RT regions to screen positions.
- * Populated by BITBLT_MULTI, consumed by sw_draw_3d for coordinate mapping. */
+ * Populated by BITBLT_MULTI, consumed by the 3D draw path for coordinate mapping. */
 BlitRegionTable g_blit_region_table;
 
 /*
@@ -263,314 +273,47 @@ static FILE *g_seq_log;
 static uint64_t g_seq;
 static int g_in_pm4;            /* > 0 while executing PM4 packets */
 
-static bool r200_direct_enabled(void);
-
-/* Finish batched direct-R200 rendering before VRAM is read on the CPU side. */
+/* Finish batched renderer work before VRAM is read on the CPU side. */
 static void r200_fence_drain(PPCMacGPUState *s, uint32_t done);
-/* Why batches get flushed: histogram logged with the renderer stats. */
-static uint64_t r200_flush_why[0x10000 / 4 + 8];
-static uint64_t r200_flush_total;
-static struct {
-    uint64_t presents, draws, ops2d, flushes, flush_us, flips;
-    int64_t since;
-} r200_rate;
+
+/* Register-access flushes are tagged by register; others by a tag below. */
+#define GPU_WHY_REG(a)   ((uint32_t)(a) / 4)
+#define GPU_WHY_TAG(t)   (0x4000u + (t))
+enum { GPU_WHY_T3 = 1, GPU_WHY_DISPLAY, GPU_WHY_FENCE, GPU_WHY_OTHER };
+#define gpu_sync(s) gpu_sync_at((s), GPU_WHY_TAG(GPU_WHY_OTHER))
+enum { GPU_WHY_2D = 0x40 };
 
 /*
- * Running totals for PowerEmu's performance overlay (the "perf" property):
- * a frame is a flip or a write into the scanout that follows 3D drawing;
- * textures are counted per draw by where they are read from; vram_high is
- * the highest VRAM byte any render target, depth buffer or texture used.
+ * Everything that must see finished drawing comes through gpu_sync_at, so
+ * the renderer's flush and the fence queue are the only places that wait.
  */
-static struct {
-    uint64_t frames, draws, tex_vram, tex_agp, agp_bytes, vram_high;
-    bool drew;
-} r200_perf;
-
-static void r200_perf_present(void)
+static void gpu_sync_at(PPCMacGPUState *s, uint32_t why)
 {
-    if (r200_perf.drew) {
-        r200_perf.frames++;
-        r200_perf.drew = false;
-    }
-}
-
-static void r200_perf_high(uint64_t end)
-{
-    if (end > r200_perf.vram_high) {
-        r200_perf.vram_high = end;
-    }
-}
-
-/*
- * Draws on a worker thread.
- * ------------------------
- * A host sample put 16.7% of the vCPU thread in this device model, with the
- * draw path the largest named function in the whole profile -- while the
- * machine around it sat with most of its cores idle. The emulator is one
- * thread per guest CPU and the guest has one CPU, so the only way to use
- * those cores is to take work out of that thread.
- *
- * What makes it safe is a contract the guest already keeps. Real hardware
- * reads vertex memory asynchronously, so a driver must not reuse a buffer
- * until a fence says the GPU is done with it -- and this device already
- * implements those fences. Reading guest memory from a worker is therefore
- * not a new hazard; it is the hazard the interface was designed around.
- *
- * What is *not* safe is reading registers, because the guest keeps writing
- * them while the worker runs. Each job therefore carries a snapshot. The
- * copy is the whole device state by value: the fields a draw reads besides
- * the registers are three pointers and a size, and copying them along with
- * the registers is cheaper than auditing which ones a future change might
- * add.
- *
- * Ordering rides on r200_flush_at(), which everything that needs to see
- * finished drawing already calls. Draining there keeps 2D blits, scanout,
- * fences and register reads in the order the guest asked for, without any
- * new ordering rules to get wrong.
- *
- * Off by default: PPCGPU_ASYNC_DRAW=1 turns it on. A threading fault in a
- * device model is the kind that corrupts rarely rather than failing
- * cleanly, so this does not become the default until it has been measured
- * and lived with.
- */
-typedef struct R200DrawJob {
-    PPCMacGPUState state;       /* snapshot: registers by value */
-    uint32_t *body;             /* the PM4 body, copied */
-    uint32_t body_dw;
-    int src;
-    struct R200DrawJob *next;
-} R200DrawJob;
-
-static struct {
-    QemuThread thread;
-    QemuMutex lock;
-    QemuCond wake;              /* work arrived, or stop */
-    QemuCond idle;              /* queue drained */
-    R200DrawJob *head, *tail;
-    unsigned inflight;          /* queued + currently running */
-    bool started;
-    bool stop;
-} r200_async;
-
-static bool r200_async_enabled(void)
-{
-    static int on = -1;
-
-    if (on < 0) {
-        const char *e = getenv("PPCGPU_ASYNC_DRAW");
-        on = e && e[0] == '1';
-    }
-    return on;
-}
-
-/*
- * Submit to the renderer with the big lock held.
- *
- * Every other caller of the renderer runs on the vCPU thread or the main
- * loop, and those are already serialised against each other by the BQL --
- * which is exactly why this device could call Metal freely before draws
- * moved off-thread, and why Metal asserted the moment they did. Taking the
- * same lock here restores that guarantee without touching the thirty other
- * call sites, and without serialising the part worth parallelising: by the
- * time a draw reaches this point its vertices are already fetched and
- * transformed, which is the expensive half.
- */
-static int r200_render_draw(PPCMacGPUState *s, uint8_t *vram,
-                            const R200DrawPacket *pkt)
-{
-    bool need_bql = !bql_locked();
-    int r;
-
-    if (need_bql) {
-        bql_lock();
-    }
-    r = s->renderer->draw_r200(s->renderer_opaque, vram, s->vram_size, pkt);
-    if (need_bql) {
-        bql_unlock();
-    }
-    return r;
-}
-
-/* Forward declaration: the worker runs the ordinary draw path. */
-static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
-                                      uint32_t body_dw, int src);
-
-static void *r200_async_worker(void *opaque)
-{
-    qemu_mutex_lock(&r200_async.lock);
-    for (;;) {
-        R200DrawJob *job;
-
-        while (!r200_async.head && !r200_async.stop) {
-            qemu_cond_wait(&r200_async.wake, &r200_async.lock);
-        }
-        if (!r200_async.head && r200_async.stop) {
-            break;
-        }
-        job = r200_async.head;
-        r200_async.head = job->next;
-        if (!r200_async.head) {
-            r200_async.tail = NULL;
-        }
-        /*
-         * Unlocked while drawing: this is the whole point, and the job owns
-         * everything it touches. inflight is not decremented until the draw
-         * is finished, so a drain waits for the work and not merely for the
-         * queue to empty.
-         */
-        qemu_mutex_unlock(&r200_async.lock);
-        ppc_mac_gpu_r200_draw_now(&job->state, job->body, job->body_dw,
-                                  job->src);
-        g_free(job->body);
-        g_free(job->state.draw_verts);
-        g_free(job->state.draw_idx);
-        g_free(job);
-        qemu_mutex_lock(&r200_async.lock);
-        if (--r200_async.inflight == 0) {
-            qemu_cond_broadcast(&r200_async.idle);
-        }
-    }
-    qemu_mutex_unlock(&r200_async.lock);
-    return NULL;
-}
-
-/* Wait until every queued draw has finished. */
-static void r200_async_drain(void)
-{
-    if (!r200_async.started) {
-        return;
-    }
-    qemu_mutex_lock(&r200_async.lock);
-    while (r200_async.inflight) {
-        qemu_cond_wait(&r200_async.idle, &r200_async.lock);
-    }
-    qemu_mutex_unlock(&r200_async.lock);
-}
-
-static bool r200_async_submit(PPCMacGPUState *s, const uint32_t *d,
-                              uint32_t body_dw, int src)
-{
-    R200DrawJob *job;
-
-    if (!r200_async_enabled()) {
-        return false;
-    }
-    if (!r200_async.started) {
-        qemu_mutex_init(&r200_async.lock);
-        qemu_cond_init(&r200_async.wake);
-        qemu_cond_init(&r200_async.idle);
-        r200_async.started = true;
-        qemu_thread_create(&r200_async.thread, "r200-draw",
-                           r200_async_worker, NULL, QEMU_THREAD_JOINABLE);
-    }
-
-    job = g_new(R200DrawJob, 1);
-    job->state = *s;                    /* registers and pointers, by value */
-    /*
-     * The scratch buffers are the one thing that must not be shared. A
-     * snapshot copies their pointers, and the worker growing one would
-     * g_renew memory the device still points at -- which surfaces much
-     * later, as a heap abort inside an unrelated allocation. Give the job
-     * its own, allocated on first use and freed with the job.
-     */
-    job->state.draw_verts = NULL;
-    job->state.draw_verts_cap = 0;
-    job->state.draw_idx = NULL;
-    job->state.draw_idx_cap = 0;
-    job->body_dw = body_dw;
-    job->src = src;
-    job->next = NULL;
-    job->body = g_memdup2(d, (size_t)body_dw * 4);
-
-    qemu_mutex_lock(&r200_async.lock);
-    r200_async.inflight++;
-    if (r200_async.tail) {
-        r200_async.tail->next = job;
-    } else {
-        r200_async.head = job;
-    }
-    r200_async.tail = job;
-    qemu_cond_signal(&r200_async.wake);
-    qemu_mutex_unlock(&r200_async.lock);
-    return true;
-}
-
-static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
-{
-    /*
-     * Everything that must see finished drawing comes through here, so this
-     * is the only place that has to wait for the workers -- no new ordering
-     * rules, and none to forget at a new call site.
-     */
-    r200_async_drain();
-    if (s->renderer && s->renderer->flush_r200) {
-        int64_t t0 = g_get_monotonic_time();
-        bool did = s->renderer->flush_r200(s->renderer_opaque);
-        if (did) {
-            r200_rate.flushes++;
-            r200_rate.flush_us += g_get_monotonic_time() - t0;
-        }
-        if (did) {
-            r200_flush_why[MIN(why, (uint32_t)ARRAY_SIZE(r200_flush_why) - 1)]++;
-            if (++r200_flush_total % 1000 == 0) {
-                GString *g = g_string_new("ppc-mac-gpu r200: flush causes:");
-                for (int k = 0; k < 5; k++) {
-                    uint32_t best = 0;
-                    for (uint32_t i = 1; i < ARRAY_SIZE(r200_flush_why); i++) {
-                        if (r200_flush_why[i] > r200_flush_why[best]) {
-                            best = i;
-                        }
-                    }
-                    if (!r200_flush_why[best]) {
-                        break;
-                    }
-                    g_string_append_printf(g, " %s0x%x=%llu",
-                        best >= 0x4000 ? "tag" : "reg", best >= 0x4000 ?
-                        best - 0x4000 : best * 4,
-                        (unsigned long long)r200_flush_why[best]);
-                    r200_flush_why[best] = 0;
-                }
-                qemu_log("%s\n", g->str);
-                g_string_free(g, TRUE);
-                memset(r200_flush_why, 0, sizeof(r200_flush_why));
-            }
-        }
+    (void)why;
+    if (s->renderer && s->renderer->flush_sync) {
+        s->renderer->flush_sync(s->renderer_opaque);
         if (s->regs.r200_fence_n) {
             r200_fence_drain(s, s->regs.r200_fence_last_seq);
         }
     }
 }
-/* Register-access flushes are tagged by register; others by a tag below. */
-#define R200_WHY_REG(a)   ((uint32_t)(a) / 4)
-#define R200_WHY_TAG(t)   (0x4000u + (t))
-enum { R200_WHY_T3 = 1, R200_WHY_DISPLAY, R200_WHY_FENCE, R200_WHY_OTHER };
-#define r200_flush(s) r200_flush_at((s), R200_WHY_TAG(R200_WHY_OTHER))
-enum { R200_WHY_2D = 0x40 };
 
 /*
  * A CPU-side 2D operation is about to read (write_access=false) or write
  * VRAM rows [lo, hi).  Flush batched 3D work only if it overlaps: work in
  * flight that neither reads nor writes these bytes can keep running.
  */
-static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
-                             bool write_access, uint32_t tag)
+static void gpu_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+                            bool write_access)
 {
-    if (write_access && tag <= 5) {
-        r200_rate.ops2d++;
-        if (lo < (uint64_t)s->regs.crtc_offset + (uint64_t)s->disp.stride * s->disp.height &&
-            hi > s->regs.crtc_offset) {
-            r200_rate.presents++;          /* 2D write into the scanout */
-            r200_perf_present();
-        }
-    }
-    if (!s->renderer || !s->renderer->range_busy_r200 || hi <= lo) {
+    if (!s->renderer || !s->renderer->range_busy_sync || hi <= lo) {
         return;
     }
-    if (s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, write_access)) {
-        r200_flush_at(s, R200_WHY_TAG(R200_WHY_2D + tag));
+    if (s->renderer->range_busy_sync(s->renderer_opaque, lo, hi, write_access)) {
+        gpu_sync_at(s, GPU_WHY_TAG(GPU_WHY_2D));
     }
 }
-#define R200_ROWS(off, pitch, y, h) \
+#define GPU_ROWS(off, pitch, y, h) \
     (uint64_t)(off) + (uint64_t)(y) * (pitch), \
     (uint64_t)(off) + ((uint64_t)(y) + (h)) * (pitch)
 
@@ -622,8 +365,8 @@ typedef struct {
     bool live, settled;
 } PEWindow;
 
-static PEWindow pe_windows[PE_WINDOW_MAX];
-static int64_t pe_windows_printed_us;
+static G_GNUC_UNUSED PEWindow pe_windows[PE_WINDOW_MAX];  /* BE blit path only */
+static G_GNUC_UNUSED int64_t pe_windows_printed_us;
 
 /*
  * What a run of copies is, told from the copies alone.
@@ -719,7 +462,7 @@ static PEHarmonyArea pe_area_of_copy(uint32_t surface,
     return a;
 }
 
-static const char *pe_window_kind(const PEWindow *e)
+static G_GNUC_UNUSED const char *pe_window_kind(const PEWindow *e)
 {
     return pe_area_name(pe_area_of_copy(e->surface, e->x0, e->y0, e->x1, e->y1,
                                         e->scr_w, e->scr_h));
@@ -766,7 +509,7 @@ bool ppc_mac_gpu_harmony_tiles(const uint8_t **tiles, int *cols, int *rows,
  * towards showing a little too much of the guest rather than cutting the
  * edge off one of its windows.
  */
-static void pe_harmony_mark(uint32_t surface,
+static G_GNUC_UNUSED void pe_harmony_mark(uint32_t surface,
                               uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                               uint32_t scr_w, uint32_t scr_h)
 {
@@ -842,7 +585,7 @@ static void pe_harmony_mark(uint32_t surface,
     }
 }
 
-static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
+static G_GNUC_UNUSED void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
                                uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                uint32_t scr_w, uint32_t scr_h)
 {
@@ -947,7 +690,7 @@ static void G_GNUC_PRINTF(1, 2) seq_log(const char *fmt, ...)
     fputc('\n', g_seq_log);
 }
 
-static void blit_path_log(const char *path, const char *fmt, ...)
+static void G_GNUC_PRINTF(2, 3) blit_path_log(const char *path, const char *fmt, ...)
 {
     static FILE *f = NULL;
     if (!f) {
@@ -1038,6 +781,9 @@ static int post_probe_find_or_add_reg(uint32_t reg)
  * Register name lookup for tracing
  * ======================================================================== */
 
+static int ppc_mac_gpu_post_reg(uint32_t addr);
+static const char *ppc_mac_gpu_post_reg_name(uint32_t addr);
+
 static const char *ppc_mac_gpu_reg_name(hwaddr addr)
 {
     switch (addr & ~3ULL) {
@@ -1127,6 +873,15 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_GPIO_DVI_DDC:        return "GPIO_DVI_DDC";
     case R200_GPIO_MONID:          return "GPIO_MONID";
     default:
+        if (ppc_mac_gpu_post_reg_name(addr)) {
+            return ppc_mac_gpu_post_reg_name(addr);
+        }
+        if ((addr & ~3u) == 0xE4) {
+            return "CONFIG_XSTRAP";
+        }
+        if ((addr & ~3u) == 0xE8) {
+            return "CONFIG_BONDS";
+        }
         if (addr >= R200_BIOS_0_SCRATCH && addr <= R200_BIOS_7_SCRATCH) {
             return "BIOS_SCRATCH";
         }
@@ -1147,17 +902,6 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
 static FILE *gpu_debug_fp = NULL;
 static uint64_t gpu_debug_seq = 0;
 
-static bool gpu_verify_fetch(void)
-{
-    static int on = -1;
-
-    if (on < 0) {
-        const char *e = getenv("PPCGPU_VERIFY_FETCH");
-        on = e && e[0] == '1';
-    }
-    return on;
-}
-
 static bool gpu_debug_enabled(void)
 {
     static int enabled = -1;
@@ -1169,20 +913,46 @@ static bool gpu_debug_enabled(void)
     return enabled;
 }
 
-/* PPCGPU_VP=0 puts vertex programs aside, for comparing against the
- * fixed-function path when a program draws something unexpected. */
-static bool gpu_vp_disabled(void)
+/* PPCGPU_TRACK_ONLY=1: the debug log keeps only the registers read out of ati2mtag.sys (Catalyst 10.2) while
+ * hunting the XSTRAP/BONDS/MC_STATUS bits: reads and writes of these, with the value answered. */
+static bool gpu_track_pass;
+static bool gpu_track_only(void)
 {
-    static int off = -1;
-    if (off < 0) {
-        const char *e = getenv("PPCGPU_VP");
-        off = e && e[0] == '0';
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PPCGPU_TRACK_ONLY") != NULL;
     }
-    return off;
+    return on;
 }
 
-static void gpu_debug_log(const char *fmt, ...)
+static bool gpu_tracked_reg(hwaddr addr)
 {
+    switch (addr & ~3ull) {
+    case 0x00A0: case 0x00A4:   /* AMCGPIO_A/Y_MIR: signature probe, index/data port */
+    case 0x00E0:                /* CONFIG_CNTL: revision field */
+    case 0x00E4:                /* CONFIG_XSTRAP */
+    case 0x00E8:                /* CONFIG_BONDS */
+    case 0x0150:                /* MC_STATUS: waited on for (status & 0xF) == 0xF */
+    case 0x0158:                /* MEM_SDRAM_MODE_REG: bit 31 toggled on each retry */
+    case 0x0174:                /* AGP_CNTL: read right after BONDS */
+    case 0x0040: case 0x0044:   /* GEN_INT_CNTL / GEN_INT_STATUS: does the driver enable the vblank interrupt? */
+        return true;
+    case 0x01EC: case 0x01F0:   /* unnamed registers read by the driver after the memory init (caller probe) */
+    case 0x0334: case 0x07FC:   /* ?, PM4_MICRO_CNTL */
+    case 0x0804: case 0x0888:
+    case 0x0908: case 0x1608:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void G_GNUC_PRINTF(1, 2) gpu_debug_log(const char *fmt, ...)
+{
+    if (gpu_track_only() && !gpu_track_pass) {
+        return;
+    }
     /* Per-access debug log: opt-in (PPCGPU_DEBUG_LOG=1).  It writes and
      * flushes a line for every register access, which on its own costs a
      * large share of guest graphics performance. */
@@ -1308,7 +1078,7 @@ static void ppc_mac_gpu_vblank(void *opaque)
  * taking it would size the shadow buffer (and the surface handed to the UI)
  * shorter than the rows read out of it.
  */
-static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
+static void gpu_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
 {
     uint32_t min = s->disp.width * ((s->disp.bpp + 7) / 8);
 
@@ -1337,8 +1107,8 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     uint32_t v_total_disp = s->regs.crtc_v_total_disp;
     uint32_t pitch = s->regs.crtc_pitch;
     /* VRAM pixel byte order: a big-endian guest's XRGB is [X, R, G, B] in memory */
-    const pixman_format_code_t fmt32 = s->swap ? PIXMAN_BE_x8r8g8b8 : PIXMAN_x8r8g8b8;
-    const pixman_format_code_t fmt24 = s->swap ? PIXMAN_BE_r8g8b8 : PIXMAN_r8g8b8;
+    const pixman_format_code_t fmt32 = GUEST_FMT32();
+    const pixman_format_code_t fmt24 = GUEST_FMT24();
 
     /* Check if CRTC is enabled in extended mode */
     if (!(crtc_gen & R200_CRTC_EN) && !(crtc_gen & R200_CRTC_EXT_DISP_EN)) {
@@ -1469,9 +1239,13 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
      * run past its end.  Keep the display consistent instead.
      */
     if (m->stride < m->width * ((m->bpp + 7) / 8)) {
-        fprintf(stderr, "[STRIDE_CHANGE] stride %u too small for %ux%u@%u, "
-                "using %u\n", m->stride, m->width, m->height, m->bpp,
-                m->width * ((m->bpp + 7) / 8));
+        static int small_stride_logs;
+
+        if (small_stride_logs++ < 5) {
+            fprintf(stderr, "[STRIDE_CHANGE] stride %u too small for %ux%u@%u, "
+                    "using %u\n", m->stride, m->width, m->height, m->bpp,
+                    m->width * ((m->bpp + 7) / 8));
+        }
         m->stride = m->width * ((m->bpp + 7) / 8);
     }
 
@@ -1485,8 +1259,14 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
 
     /* Check if mode changed */
     if (memcmp(&old, m, sizeof(old)) != 0) {
-        fprintf(stderr, "GPU MODE: %ux%u bpp=%u stride=%u offset=0x%x pitch_reg=0x%x crtc_gen=0x%x\n",
-                m->width, m->height, m->bpp, m->stride, m->offset, pitch, crtc_gen);
+        /* Say so when the mode itself changes; a page flip moves the offset
+         * every frame and is no mode change. */
+        if (old.width != m->width || old.height != m->height || old.bpp != m->bpp ||
+            old.stride != m->stride || old.crtc_ext != m->crtc_ext) {
+            fprintf(stderr, "GPU MODE: %ux%u bpp=%u stride=%u%s (crtc_gen=0x%x)\n",
+                    m->width, m->height, m->bpp, m->stride,
+                    m->crtc_ext ? "" : " [CRTC not in extended mode]", crtc_gen);
+        }
         if (old.stride != m->stride) {
             fprintf(stderr, "[STRIDE_CHANGE] update_display_mode: "
                     "%u -> %u (override=%s val=%u)\n",
@@ -1512,16 +1292,115 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
  * expecting LE XRGB: bytes [B, G, R, X] in memory.
  * A bswap32 per pixel converts between the two.
  */
-static void ppc_mac_gpu_bswap_line32(bool swap, uint32_t *dst,
-                                     const uint32_t *src, int width)
+static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src, int width)
 {
-    if (!swap) {
-        /* A little-endian (x86) guest writes XRGB as [B, G, R, X] already. */
-        memcpy(dst, src, (size_t)width * 4);
-        return;
+    GUEST_LINE32(dst, src, width);
+}
+
+/*
+ * The VGA aperture's bank window.  In an extended mode the 64 KB window at
+ * 0xa0000 shows the card's VRAM, one 32 KB half at a time: MEM_VGA_WP_SEL
+ * (writes) and MEM_VGA_RP_SEL (reads) hold a block number for the low half in
+ * bits 15:0 and for the high half in bits 31:16.  A block is 32 KB when
+ * CRTC_EXT_CNTL.VGA_ATI_LINEAR (bit 3) is set and 8 KB when it is clear (the
+ * BIOS's VBE function 4F05 writes position*2, position*2+1 or position*8,
+ * position*8+4 for a 64 KB granularity).  Standard VGA modes keep using the
+ * VGA core's own memory.
+ */
+static uint64_t ppc_mac_gpu_vga_bank_off(PPCMacGPUState *s, hwaddr a, bool write)
+{
+    uint32_t sel = s->r300_shadow[(write ? 0x38 : 0x3C) / 4];
+    uint32_t blk = (a & 0x8000) ? sel >> 16 : sel & 0xFFFF;
+    uint32_t unit = (s->regs.crtc_ext_cntl & 8) ? 0x8000 : 0x2000;
+
+    return (uint64_t)blk * unit + (a & 0x7FFF);
+}
+
+static uint64_t ppc_mac_gpu_vga_bank_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint64_t v = 0;
+
+    for (unsigned i = 0; i < size; i++) {
+        uint64_t off = ppc_mac_gpu_vga_bank_off(s, addr + i, false);
+
+        if (off < s->vram_size) {
+            v |= (uint64_t)vram[off] << (8 * i);
+        }
     }
-    for (int i = 0; i < width; i++) {
-        dst[i] = bswap32(src[i]);
+    return v;
+}
+
+static void ppc_mac_gpu_vga_bank_write(void *opaque, hwaddr addr, uint64_t val,
+                                       unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    for (unsigned i = 0; i < size; i++) {
+        uint64_t off = ppc_mac_gpu_vga_bank_off(s, addr + i, true);
+
+        if (off < s->vram_size) {
+            vram[off] = val >> (8 * i);
+            memory_region_set_dirty(&s->vram, off, 1);
+        }
+    }
+}
+
+static const MemoryRegionOps ppc_mac_gpu_vga_bank_ops = {
+    .read = ppc_mac_gpu_vga_bank_read,
+    .write = ppc_mac_gpu_vga_bank_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* The bank window replaces the VGA core's window while the CRTC is in an extended mode. */
+static void ppc_mac_gpu_vga_bank_update(PPCMacGPUState *s)
+{
+    if (s->legacy_vga) {
+        bool on = (s->regs.crtc_gen_cntl & R200_CRTC_EXT_DISP_EN) != 0;
+
+        if (getenv("PPCGPU_VGA_LOG")) {
+            fprintf(stderr, "VGA bank window %s (crtc_gen=%08x)\n", on ? "on" : "off",
+                    s->regs.crtc_gen_cntl);
+        }
+        memory_region_set_enabled(&s->vga_bank, on);
+    }
+}
+
+/*
+ * One DAC.  The VGA ports (3c8/3c9, programmed by a PC BIOS) and the card's own
+ * PALETTE_INDEX/PALETTE_DATA registers address the same lookup table, so with
+ * the legacy VGA core present that core's palette is the table: 6 bits per
+ * channel, or 8 when DAC_CNTL.DAC_8BIT_EN is set.  Entries read and write as
+ * 0x00RRGGBB.
+ */
+static uint32_t gpu_dac_get(PPCMacGPUState *s, unsigned i)
+{
+    if (s->legacy_vga) {
+        const uint8_t *p = &s->vga->palette[(i & 0xFF) * 3];
+
+        if (s->vga->dac_8bit) {
+            return p[0] << 16 | p[1] << 8 | p[2];
+        }
+        return ((p[0] << 2 | p[0] >> 4) << 16) | ((p[1] << 2 | p[1] >> 4) << 8) |
+               (p[2] << 2 | p[2] >> 4);
+    }
+    return s->regs.palette[i & 0xFF] & 0xFFFFFF;
+}
+
+static void gpu_dac_set(PPCMacGPUState *s, unsigned i, uint32_t rgb)
+{
+    s->regs.palette[i & 0xFF] = rgb;
+    if (s->legacy_vga) {
+        uint8_t *p = &s->vga->palette[(i & 0xFF) * 3];
+        int sh = s->vga->dac_8bit ? 0 : 2;
+
+        p[0] = (rgb >> 16 & 0xFF) >> sh;
+        p[1] = (rgb >> 8 & 0xFF) >> sh;
+        p[2] = (rgb & 0xFF) >> sh;
     }
 }
 
@@ -1530,7 +1409,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     PPCMacGPUState *s = opaque;
 
     if (s->legacy_vga) {
-        if (!(s->regs.crtc_gen_cntl & R200_CRTC_EXT_DISP_EN)) {
+        if (!(s->regs.crtc_gen_cntl & R200_CRTC_EXT_DISP_EN) || getenv("PPCGPU_FORCE_VGA")) {
             if (!s->vga_shown) {
                 /* back to VGA: it must redraw into a fresh surface */
                 s->vga_shown = true;
@@ -1538,6 +1417,19 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 s->vga->last_width = s->vga->last_height = 0;
                 s->vga->last_scr_width = s->vga->last_scr_height = 0;
                 s->vga->last_depth = 0;
+            }
+            if (getenv("PPCGPU_VGA_LOG")) {
+                static int64_t last;
+                int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+                if (now - last > 2000) {
+                    last = now;
+                    fprintf(stderr, "VGA core: crtc_gen=%08x ext_cntl=%08x ar_index=%02x sr1=%02x gr6=%02x "
+                            "cr17=%02x gmode=%d size=%dx%d depth=%d\n", s->regs.crtc_gen_cntl,
+                            s->regs.crtc_ext_cntl, s->vga->ar_index, s->vga->sr[1], s->vga->gr[6],
+                            s->vga->cr[0x17], s->vga->graphic_mode, s->vga->last_width,
+                            s->vga->last_height, s->vga->last_depth);
+                }
             }
             s->vga->hw_ops->gfx_update(s->vga);
             return;
@@ -1565,60 +1457,15 @@ static void ppc_mac_gpu_display_update(void *opaque)
         dpy_mouse_set(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
     }
 
-    /*
-     * The frame-rate meter: how many times a second the picture on screen
-     * actually changed (a refresh in which at least one scanout row
-     * differed from the last one), which is what a person sees, against how
-     * often the display asked.  The draw and flip counters below say how
-     * hard the card works, not how fast the screen moves.
-     */
-    {
-        static struct { int64_t since; uint32_t polls, frames, rows; } fps;
-        int64_t t = g_get_monotonic_time();
-        fps.polls++;
-        if (!fps.since) {
-            fps.since = t;
-        } else if (t - fps.since >= 1000000) {
-            if (fps.frames) {
-                double sec = (t - fps.since) / 1e6;
-                qemu_log("ppc-mac-gpu fps: %.1f frames/s (display polled %.0f/s, "
-                         "%u rows changed per frame)\n", fps.frames / sec,
-                         fps.polls / sec, fps.rows / fps.frames);
-            }
-            fps.polls = fps.frames = fps.rows = 0;
-            fps.since = t;
-        }
-        s->fps_frames_ptr = &fps.frames;
-        s->fps_rows_ptr = &fps.rows;
-    }
-    {
-        int64_t now = g_get_monotonic_time();
-        if (!r200_rate.since) {
-            r200_rate.since = now;
-        } else if (now - r200_rate.since >= 1000000) {
-            if (r200_rate.draws || r200_rate.ops2d) {
-                double sec = (now - r200_rate.since) / 1e6;
-                qemu_log("ppc-mac-gpu rate: %.1f flips/s, %.1f present-ops/s, "
-                         "%.0f draws/s, "
-                         "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%\n",
-                         r200_rate.flips / sec,
-                         r200_rate.presents / sec, r200_rate.draws / sec,
-                         r200_rate.ops2d / sec, r200_rate.flushes / sec,
-                         r200_rate.flush_us / (sec * 1e4));
-            }
-            memset(&r200_rate, 0, sizeof(r200_rate));
-            r200_rate.since = now;
-        }
-    }
     if (s->disp.stride && s->disp.height) {
         uint64_t lo = s->regs.crtc_offset;
         uint64_t hi = lo + (uint64_t)s->disp.stride * s->disp.height;
-        if (s->renderer && s->renderer->range_busy_r200 &&
-            s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false)) {
-            r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+        if (s->renderer && s->renderer->range_busy_sync &&
+            s->renderer->range_busy_sync(s->renderer_opaque, lo, hi, false)) {
+            gpu_sync_at(s, GPU_WHY_TAG(GPU_WHY_DISPLAY));
         }
     } else {
-        r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+        gpu_sync_at(s, GPU_WHY_TAG(GPU_WHY_DISPLAY));
     }
     bool mode_changed;
     uint8_t *vram_ptr;
@@ -1647,8 +1494,11 @@ static void ppc_mac_gpu_display_update(void *opaque)
     {
         static int phase_d_frame = 0;
         phase_d_frame++;
-        if (phase_d_frame == 500 || phase_d_frame == 700 ||
-            phase_d_frame == 1000 || phase_d_frame == 1500) {
+        /* A PowerPC-era probe of the Mac window-texture range; quiet unless
+         * PPCGPU_TILE_CHECK=1 */
+        if ((phase_d_frame == 500 || phase_d_frame == 700 ||
+             phase_d_frame == 1000 || phase_d_frame == 1500) &&
+            getenv("PPCGPU_TILE_CHECK")) {
             int nonzero_count = 0;
             uint32_t first_nz_off = 0, first_nz_val = 0;
             for (uint64_t a = 0x353000; a < 0x413000; a += 64) {
@@ -1714,19 +1564,39 @@ static void ppc_mac_gpu_display_update(void *opaque)
             for (uint32_t y = 0; y < height; y++) {
                 const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
                 uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
+                GUEST_SCAN16(sp, dp, width, is565);
+            }
+        }
+        dpy_gfx_update_full(s->con);
+        return;
+    }
+
+    /* 8bpp (VBE 256-colour and the like): indices through the DAC */
+    if (s->disp.bpp == 8) {
+        uint64_t need = (uint64_t)width * 4 * height;
+        uint32_t pal[256];
+
+        if (!s->shadow_buf || s->shadow_buf_size < need) {
+            g_free(s->shadow_buf);
+            s->shadow_buf = g_malloc(need);
+            s->shadow_buf_size = need;
+            mode_changed = true;
+        }
+        if (mode_changed || s->display_invalid) {
+            s->display_invalid = false;
+            dpy_gfx_replace_surface(s->con, qemu_create_displaysurface_from(
+                width, height, PIXMAN_x8r8g8b8, width * 4, s->shadow_buf));
+        }
+        for (unsigned i = 0; i < 256; i++) {
+            pal[i] = gpu_dac_get(s, i);
+        }
+        if ((uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
+            for (uint32_t y = 0; y < height; y++) {
+                const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
+                uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
+
                 for (uint32_t x = 0; x < width; x++) {
-                    uint32_t v = s->swap ? (uint32_t)((sp[2 * x] << 8) | sp[2 * x + 1])
-                                         : (uint32_t)(sp[2 * x] | (sp[2 * x + 1] << 8));
-                    uint32_t r, g, b;
-                    if (is565) {
-                        r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31;
-                        r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4);
-                    } else {
-                        r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31;
-                        r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2);
-                    }
-                    b = (b << 3) | (b >> 2);
-                    dp[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                    dp[x] = pal[sp[x]];
                 }
             }
         }
@@ -1734,7 +1604,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
         return;
     }
 
-    /* 8bpp and other non-32bpp modes */
+    /* other non-32bpp modes */
     if (bpp_bytes != 4) {
         static int non32_count = 0;
         if (non32_count < 3) {
@@ -1827,21 +1697,6 @@ static void ppc_mac_gpu_display_update(void *opaque)
                         any_rt_changed = true;
                     }
                 }
-            }
-
-            if (fb_changed || any_rt_changed) {
-                fprintf(stderr, "[VRAM_WRITE_TRAP] frame=%u fb_changed=%d",
-                        trap_frame, fb_changed);
-                {
-                    int ri;
-                    for (ri = 0; ri < rt_count; ri++) {
-                        fprintf(stderr, " rt[0x%x]_changed=%d",
-                                rt_offsets[ri],
-                                (rt_crcs[ri] != prev_rt_crcs[ri]) ? 1 : 0);
-                    }
-                }
-                fprintf(stderr, "\n");
-                trap_log++;
             }
 
             prev_fb_crc = fb_crc;
@@ -2009,7 +1864,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     uint32_t *tmp = g_new(uint32_t, width);
     for (y = 0; y < (int)height; y++) {
         uint32_t *row = dst + (size_t)y * stride_u32;
-        ppc_mac_gpu_bswap_line32(s->swap, tmp, src + (size_t)y * stride_u32, width);
+        ppc_mac_gpu_bswap_line32(tmp, src + (size_t)y * stride_u32, width);
         if (surface_replaced || memcmp(row, tmp, (size_t)width * 4)) {
             memcpy(row, tmp, (size_t)width * 4);
             if (lo < 0) {
@@ -2019,6 +1874,40 @@ static void ppc_mac_gpu_display_update(void *opaque)
         }
     }
     g_free(tmp);
+
+    /* x86 guest: the hardware cursor (see ppc_mac_gpu_cursor_sync) is blended over the copied frame; the rows
+     * it covers are always republished, which also erases it from where it was. */
+    if (GUEST_LE && s->hwc_visible && s->hwc_w == 64) {
+        int cx = s->hwc_x, cy = s->hwc_y;
+        int y0 = MAX(cy, 0), y1 = MIN(cy + 64, (int)height);
+        int x0 = MAX(cx, 0), x1 = MIN(cx + 64, (int)width);
+
+        if (y0 < y1 && x0 < x1) {
+            for (y = y0; y < y1; y++) {
+                uint32_t *row = dst + (size_t)y * stride_u32;
+
+                for (int x = x0; x < x1; x++) {
+                    uint32_t c = s->hwc_pix[(y - cy) * 64 + (x - cx)];
+                    uint32_t a = c >> 24, d = row[x], inv = 255 - a;
+
+                    if (a) {
+                        /* the image is premultiplied ARGB */
+                        uint32_t r = MIN(255u, ((c >> 16) & 255) + (((d >> 16) & 255) * inv + 127) / 255);
+                        uint32_t g = MIN(255u, ((c >> 8) & 255) + (((d >> 8) & 255) * inv + 127) / 255);
+                        uint32_t b = MIN(255u, (c & 255) + ((d & 255) * inv + 127) / 255);
+
+                        row[x] = r << 16 | g << 8 | b;
+                    }
+                }
+            }
+            if (lo < 0 || y0 < lo) {
+                lo = y0;
+            }
+            if (y1 > hi) {
+                hi = y1;
+            }
+        }
+    }
 
     if (surface_replaced) {
         dpy_gfx_update_full(s->con);
@@ -2101,7 +1990,7 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
                       reg_idx, wb_val, wb_addr, (uint64_t)phys);
     } else if (wb_addr >= fb_base && wb_addr + 4 <= fb_base + s->vram_size) {
         uint32_t off = wb_addr - fb_base;
-        r200_vram_access(s, off, off + 4, true, 6);
+        gpu_vram_access(s, off, off + 4, true);
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
         memcpy(vram + off, &wire_val, 4);
         memory_region_set_dirty(&s->vram, off, 4);
@@ -2156,20 +2045,13 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
                         &wire_val, 4);
 }
 
-static void ppc_mac_gpu_scratch_writeback(PPCMacGPUState *s, int reg_idx)
-{
-    if (reg_idx >= 0 && reg_idx <= 5) {
-        ppc_mac_gpu_scratch_writeback_val(s, reg_idx, s->regs.scratch_reg[reg_idx]);
-    }
-}
-
 /* Tell the renderer about a 2D fill (mirrors depth-buffer clears). */
 static void r200_fill_notify(PPCMacGPUState *s, uint32_t offset, uint32_t pitch,
                              uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                              uint32_t bpp, uint32_t value)
 {
-    if (r200_direct_enabled() && s->renderer && s->renderer->fill_notify_r200) {
-        s->renderer->fill_notify_r200(s->renderer_opaque, offset, pitch,
+    if (s->renderer && s->renderer->fill_notify) {
+        s->renderer->fill_notify(s->renderer_opaque, offset, pitch,
                                       x, y, w, h, bpp, value);
     }
 }
@@ -2275,22 +2157,22 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
     }
     bool sync_fences = fence_mode == 0;
     if (sync_fences) {
-        r200_flush_at(s, R200_WHY_TAG(R200_WHY_FENCE));
+        gpu_sync_at(s, GPU_WHY_TAG(GPU_WHY_FENCE));
         ppc_mac_gpu_scratch_writeback_val(s, idx, val);
         return;
     }
-    if (r200_direct_enabled() && s->renderer && s->renderer->submit_r200) {
+    if (s->renderer && s->renderer->submit_fence) {
         if (!r200_fence_bh) {
             r200_fence_bh = qemu_bh_new(r200_fence_bh_cb, s);
         }
-        seq = s->renderer->submit_r200(s->renderer_opaque,
+        seq = s->renderer->submit_fence(s->renderer_opaque,
                                        r200_fence_done_cb, s);
     }
     if (!seq && s->regs.r200_fence_n) {
         seq = s->regs.r200_fence_last_seq;      /* keep fences in order */
     }
     if (!seq || s->regs.r200_fence_n == ARRAY_SIZE(s->regs.r200_fence_q)) {
-        r200_flush_at(s, R200_WHY_TAG(R200_WHY_FENCE));
+        gpu_sync_at(s, GPU_WHY_TAG(GPU_WHY_FENCE));
         ppc_mac_gpu_scratch_writeback_val(s, idx, val);
         return;
     }
@@ -2360,7 +2242,7 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
  * the common path.  With $R300_DUMP set, the 3D state at the first draws
  * (and every 1000th) is written out for reverse engineering.
  */
-static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr);
+static uint8_t *gpu_agp_page(PPCMacGPUState *s, uint32_t gpu_addr);
 static uint32_t g_r300_arm_rt;      /* debug: drag-frame capture target */
 static void r300_surfwatch_update(PPCMacGPUState *s);
 static void r300_surface_changed(PPCMacGPUState *s);
@@ -2380,7 +2262,7 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
         return true;
     }
     while (len) {
-        uint8_t *page = r200_agp_page(s, gpu_addr);
+        uint8_t *page = gpu_agp_page(s, gpu_addr);
         uint32_t n = MIN(len, 0x1000 - (gpu_addr & 0xFFF));
         if (!page) {
             return false;
@@ -2393,10 +2275,6 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
     return true;
 }
 
-static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
-                                        hwaddr *phys_addr);
-static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
-                                      hwaddr *phys_addr);
 
 /* A dword the card writes back to guest GPU memory (VRAM or AGP/GART),
  * bytes as given (lowest address first). */
@@ -2407,8 +2285,8 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
     hwaddr phys;
 
     if (gpu_addr >= fb_base && (uint64_t)gpu_addr - fb_base + 4 <= s->vram_size) {
-        if (s->renderer && s->renderer->flush_r200) {
-            s->renderer->flush_r200(s->renderer_opaque);
+        if (s->renderer && s->renderer->flush_sync) {
+            s->renderer->flush_sync(s->renderer_opaque);
         }
         memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                (gpu_addr - fb_base), bytes, 4);
@@ -2529,8 +2407,8 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     if (off + bpr * rows > s->vram_size) {
         rows = (s->vram_size - off) / bpr;
     }
-    if (s->renderer && s->renderer->flush_r200) {
-        s->renderer->flush_r200(s->renderer_opaque);
+    if (s->renderer && s->renderer->flush_sync) {
+        s->renderer->flush_sync(s->renderer_opaque);
     }
     for (uint64_t i = 0; i < bpr * rows; i += bpp) {
         if (bpp == 4) {
@@ -2590,8 +2468,8 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     if (off + bpr * rows > s->vram_size) {
         rows = (s->vram_size - off) / bpr;
     }
-    if (s->renderer && s->renderer->flush_r200) {
-        s->renderer->flush_r200(s->renderer_opaque);
+    if (s->renderer && s->renderer->flush_sync) {
+        s->renderer->flush_sync(s->renderer_opaque);
     }
     if (bpp == 4) {
         uint32_t w = r300_swap_mode(v, endian);
@@ -2855,12 +2733,12 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
         r300_warn_once("multisampled colour buffer outside VRAM", NULL);
         return;
     }
-    if (s->renderer && s->renderer->flush_r200) {
+    if (s->renderer && s->renderer->flush_sync) {
         bool need_bql = !bql_locked();
         if (need_bql) {
             bql_lock();
         }
-        s->renderer->flush_r200(s->renderer_opaque);
+        s->renderer->flush_sync(s->renderer_opaque);
         if (need_bql) {
             bql_unlock();
         }
@@ -3015,13 +2893,42 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
-    s->r3->le_guest = !s->swap;
-    s->r3->le_screen_h = s->swap ? 0 : s->disp.height;
+    s->r3->le_screen_h = GUEST_LE ? s->disp.height : 0;
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
                                 s, &pkt, &err) :
         r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
                         r300_read_raw, s, &pkt, &err);
+    {
+        FILE *dl = r300_drawlog();
+
+        if (dl) {
+            fprintf(dl, "  built ok=%d err=%s verts=%u line_verts=%u scissor=%u,%u-%u,%u\n",
+                    build_ok, build_ok ? "-" : err, build_ok ? pkt.num_verts : 0,
+                    build_ok ? pkt.num_line_verts : 0, pkt.scissor[0], pkt.scissor[1],
+                    pkt.scissor[2], pkt.scissor[3]);
+            {
+                uint32_t c0 = r300_reg(s->r3, 0x22D0);
+
+                fprintf(dl, "  pvs code_cntl0=%08x cntl1=%08x const=%08x flow=%08x:", c0,
+                        r300_reg(s->r3, 0x22D8), r300_reg(s->r3, 0x22D4), r300_reg(s->r3, 0x22DC));
+                for (uint32_t pc = c0 & 0x3FF; pc <= ((c0 >> 20) & 0x3FF) && pc < 16; pc++) {
+                    const uint32_t *w = &s->r3->pvs_mem[pc * 4];
+
+                    fprintf(dl, " [%u]%08x.%08x.%08x.%08x", pc, w[0], w[1], w[2], w[3]);
+                }
+                fprintf(dl, "\n");
+            }
+            for (uint32_t v = 0; build_ok && pkt.verts && v < pkt.num_verts && v < 12; v++) {
+                const R300Vertex *x = &pkt.verts[v];
+
+                fprintf(dl, "   v%u pos %.3f %.3f %.3f %.3f  t0 %.4f %.4f %.4f %.4f  t1 %.4f %.4f %.4f %.4f\n", v,
+                        x->pos[0], x->pos[1], x->pos[2], x->pos[3], x->v[0][0], x->v[0][1],
+                        x->v[0][2], x->v[0][3], x->v[1][0], x->v[1][1], x->v[1][2], x->v[1][3]);
+            }
+            fflush(dl);
+        }
+    }
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
         fprintf(s->r3_dump, "TRY op %02x vf %08x ok %d err %s tex0 en %u off %06x "
@@ -3114,9 +3021,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 return;
             }
             gart_scratch = (s->vram_size - rt_len) & ~0xFFFu;
-            r200_vram_access(s, gart_scratch, gart_scratch + rt_len, true, 1);
-            if (s->renderer && s->renderer->flush_r200) {
-                s->renderer->flush_r200(s->renderer_opaque);
+            gpu_vram_access(s, gart_scratch, gart_scratch + rt_len, true);
+            if (s->renderer && s->renderer->flush_sync) {
+                s->renderer->flush_sync(s->renderer_opaque);
             }
             memcpy(gart_backup, vram_p + gart_scratch, rt_len);
             /* what the buffer holds now, for blends and rows the draw leaves alone */
@@ -3147,7 +3054,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         uint32_t ga = td->gpu_addr;
         if (r300_to_vram(s, &td->gpu_addr, tlen)) {
             /* the card's own copies (texture uploads) write this memory: let them land before it is read */
-            r200_vram_access(s, td->gpu_addr, (uint64_t)td->gpu_addr + tlen, false, 1);
+            gpu_vram_access(s, td->gpu_addr, (uint64_t)td->gpu_addr + tlen, false);
             continue;
         }
         /* AGP/GART texture: copy the texels out of guest memory (freed
@@ -3327,7 +3234,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
         }
-        if (cbzb_clear && rr >= 0 && s->renderer->flush_r200) {
+        if (cbzb_clear && rr >= 0 && s->renderer->flush_sync) {
             uint32_t zpitch_reg = r300_reg(s->r3, 0x4F24);
             uint32_t zo = r300_reg(s->r3, 0x4F20) & ~0xFu;
             uint32_t pitch_b = (zpitch_reg & 0x3FFC) * 4;
@@ -3344,7 +3251,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 uint8_t *vram_p = memory_region_get_ram_ptr(&s->vram);
 
                 /* the colour half is drawn and written back first, then the Z unit's half lands beside it */
-                s->renderer->flush_r200(s->renderer_opaque);
+                s->renderer->flush_sync(s->renderer_opaque);
                 for (uint32_t y = y0; y < y1; y++) {
                     uint32_t *row = (uint32_t *)(vram_p + zo + (uint64_t)y * pitch_b) + x0;
                     for (uint32_t x = x0; x < x1; x++) {
@@ -3359,12 +3266,12 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             uint8_t *vram_p = memory_region_get_ram_ptr(&s->vram);
             uint32_t pitch_b = pkt.rt_pitch * pkt.rt_bpp;
 
-            if (rr >= 0 && s->renderer->flush_r200) {
-                s->renderer->flush_r200(s->renderer_opaque);
+            if (rr >= 0 && s->renderer->flush_sync) {
+                s->renderer->flush_sync(s->renderer_opaque);
                 uint64_t off = (uint64_t)gart_y0 * pitch_b, end = (uint64_t)gart_y1 * pitch_b;
                 while (off < end) {
                     uint32_t ga = gart_addr + off;
-                    uint8_t *page = r200_agp_page(s, ga);
+                    uint8_t *page = gpu_agp_page(s, ga);
                     uint32_t n = MIN(end - off, 0x1000 - (ga & 0xFFF));
                     if (!page) {
                         r300_warn_once("GART colour buffer page not mapped", NULL);
@@ -3382,8 +3289,8 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (rr < 0) {
             r300_warn_once("renderer rejected a draw", NULL);
         } else {
-            if (sync_each && s->renderer->flush_r200) {
-                s->renderer->flush_r200(s->renderer_opaque);
+            if (sync_each && s->renderer->flush_sync) {
+                s->renderer->flush_sync(s->renderer_opaque);
             }
             /*
              * Debug ($R300_DUMP): after a present that samples an
@@ -3405,7 +3312,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 } else if (armed_left && pkt.rt_gpu_addr == arm_rt) {
                     char path[256];
                     FILE *f;
-                    s->renderer->flush_r200(s->renderer_opaque);
+                    s->renderer->flush_sync(s->renderer_opaque);
                     snprintf(path, sizeof(path), "%s.step%02u_p%u_h%u.bin",
                              getenv("R300_DUMP"), step, pkt.rt_pitch * pkt.rt_bpp,
                              pkt.rt_height);
@@ -3449,7 +3356,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                     reads <= 1500) {
                     char path[256];
                     FILE *f;
-                    s->renderer->flush_r200(s->renderer_opaque);
+                    s->renderer->flush_sync(s->renderer_opaque);
                     snprintf(path, sizeof(path), "%s.%02d.tex_%06x_%ux%u_p%u.bin",
                              getenv("R300_DUMP"), reads / 150, pkt.tex[0].gpu_addr,
                              pkt.tex[0].width, pkt.tex[0].height,
@@ -3470,7 +3377,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                             (unsigned long long)s->r3->draws);
                 }
             }
-            /* As the R200 path does: the display and the dirty-tracking
+            /* The display and the dirty-tracking
              * scanout only refresh what they are told changed.  Not for
              * renderers that read the dirty log as CPU writes (Vulkan):
              * to them this would say the CPU overwrote what they drew. */
@@ -3483,16 +3390,12 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                                             pkt.rt_height);
                 }
             }
-            r200_rate.draws++;
-            r200_perf.draws++;
-            r200_perf.drew = true;
-            r200_perf_high(pkt.rt_gpu_addr + len);
             /* The compositor presents by drawing the visible frame buffer
              * at the card's 3D pitch (a multiple of 32 pixels): scan out
-             * at that pitch, as the R200 path does for its present BLT. */
+             * at that pitch, as the present BLT does. */
             if (pkt.rt_gpu_addr == s->disp.offset &&
                 pkt.rt_pitch * pkt.rt_bpp != s->disp.stride) {
-                r200_set_present_pitch(s, pkt.rt_pitch * pkt.rt_bpp);
+                gpu_set_present_pitch(s, pkt.rt_pitch * pkt.rt_bpp);
             }
         }
         if (need_bql) {
@@ -3659,8 +3562,10 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
 static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
                                     uint32_t ib_base,
                                     uint32_t ib_size_dw);
+#if PPC_MAC_GPU_BE
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s);
 static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s);
+#endif
 static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned int size);
 
@@ -3702,7 +3607,7 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
      * The R300 driver (ATIRadeon9700) programs the table base at 0x0AB0
      * (low word; 0x0AB4 high) and leaves AIC_PT_BASE (0x01D8) at zero.
      */
-    uint32_t pt_base = (s->r300 && s->r300_aic_pt_base) ? s->r300_aic_pt_base
+    uint32_t pt_base = s->r300_aic_pt_base ? s->r300_aic_pt_base
                                                         : s->regs.aic_pt_base;
     hwaddr pte_addr = (hwaddr)pt_base + page_idx * 4;
     uint32_t pte_raw = 0;
@@ -3872,53 +3777,6 @@ static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
     return buf;
 }
 
-/*
- * How the guest actually talks to us.  A paravirtual device would replace
- * trapping register accesses with commands in shared memory, so measuring
- * the split says what such a rewrite could win.  PPCGPU_TRAFFIC=1 prints it
- * once a second.
- */
-static struct {
-    uint64_t mmio_writes, mmio_reads, ring_dwords, type0_regs, draws;
-    int64_t t0;
-} r200_traffic;
-
-static bool r200_in_pm4;          /* replaying the ring, not a guest trap */
-
-static bool r200_traffic_on(void)
-{
-    static int on = -1;
-
-    if (on < 0) {
-        on = getenv("PPCGPU_TRAFFIC") != NULL;
-    }
-    return on;
-}
-
-static void r200_traffic_tick(void)
-{
-    int64_t now;
-
-    if (!r200_traffic_on()) {
-        return;
-    }
-    now = g_get_monotonic_time();
-    if (!r200_traffic.t0) {
-        r200_traffic.t0 = now;
-        return;
-    }
-    if (now - r200_traffic.t0 >= 1000000) {
-        double secs = (now - r200_traffic.t0) / 1e6;
-        fprintf(stderr, "[TRAFFIC] %.0f mmio-writes/s %.0f mmio-reads/s "
-                "%.0f ring-dwords/s %.0f type0-regs/s %.0f draws/s\n",
-                r200_traffic.mmio_writes / secs, r200_traffic.mmio_reads / secs,
-                r200_traffic.ring_dwords / secs, r200_traffic.type0_regs / secs,
-                r200_traffic.draws / secs);
-        memset(&r200_traffic, 0, sizeof(r200_traffic));
-        r200_traffic.t0 = now;
-    }
-}
-
 static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
                                            uint32_t reg_base,
                                            bool one_reg_wr,
@@ -3949,13 +3807,7 @@ static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
         gpu_debug_log("PM4_EXEC type0 reg=0x%04x val=0x%x%s",
                       reg_addr, val, one_reg_wr ? " [ONE_REG]" : "");
 
-        if (unlikely(r200_traffic_on())) {
-            r200_in_pm4 = true;
-            ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
-            r200_in_pm4 = false;
-        } else {
-            ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
-        }
+        ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
     }
 }
 
@@ -4238,7 +4090,9 @@ static int mc_register_tiled_surface(PPCMacGPUState *s,
      * store linearly too, or a window uploaded by blit and composited by
      * the 3D engine comes out scrambled.
      */
-    if (no_tiling || s->r300) {
+    (void)no_tiling;
+    return -1;
+    if (0) {
         return -1;
     }
 
@@ -4288,25 +4142,6 @@ static int mc_register_tiled_surface(PPCMacGPUState *s,
     }
 
     return -1;  /* full */
-}
-
-/*
- * Unregister a tiled surface by base address.
- */
-static void mc_unregister_tiled_surface(PPCMacGPUState *s, uint32_t base)
-{
-    for (int i = 0; i < MC_TILED_SURFACE_MAX; i++) {
-        if (s->tiled_surfaces[i].active && s->tiled_surfaces[i].base == base) {
-            s->tiled_surfaces[i].active = false;
-            static int unreg_log_count = 0;
-            if (unreg_log_count < 20) {
-                blit_path_log("SURFACE_UNREG",
-                    "slot=%d base=0x%06x was=%s",
-                    i, base, s->tiled_surfaces[i].label);
-                unreg_log_count++;
-            }
-        }
-    }
 }
 
 /*
@@ -4494,14 +4329,10 @@ static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
                                 uint64_t addr, uint32_t color, uint32_t bpp)
 {
     if (bpp == 4) {
-        mc_vram_write32(s, vram, addr, s->swap ? be32_to_cpu(color) : color);
+        mc_vram_write32(s, vram, addr, GUEST_TO_CPU32(color));
     } else if (addr + bpp <= s->vram_size) {
         if (bpp == 2) {
-            if (s->swap) {
-                stw_be_p(vram + addr, color);
-            } else {
-                stw_le_p(vram + addr, color);
-            }
+                GUEST_STW_P(vram + addr, color);
         } else {
             vram[addr] = color;
         }
@@ -4566,20 +4397,20 @@ static inline uint32_t mc_vram_read32(PPCMacGPUState *s, uint8_t *vram,
 }
 
 /*
- * Byte offset into VRAM that a PITCH_OFFSET register value names.  A Linux
- * driver adds the card's MC_FB_LOCATION base to every surface offset (VRAM
- * sits at 0xe0000000 in its address space); the PowerMac drivers use plain
- * VRAM offsets, so the base is only removed for little-endian guests.
+ * Byte offset into VRAM that a PITCH_OFFSET register value names.  The offset
+ * is a GPU address: the memory controller maps the MC_FB_LOCATION range onto
+ * VRAM, so its start is removed, whatever the guest.  Linux puts VRAM at
+ * 0xe0000000 in that space; the PowerMac drivers leave the start at 0, where
+ * this changes nothing.  (An offset below the start is taken as already
+ * relative to VRAM.)
  */
 static uint32_t gpu_po_offset(PPCMacGPUState *s, uint32_t po)
 {
     uint32_t off = (po & 0x3FFFFF) << 10;
+    uint32_t fb = (s->regs.mc_fb_location & 0xFFFF) << 16;
 
-    if (!s->swap) {
-        uint32_t fb = (s->regs.mc_fb_location & 0xFFFF) << 16;
-        if (off >= fb) {
-            off -= fb;
-        }
+    if (off >= fb) {
+        off -= fb;
     }
     return off;
 }
@@ -4608,7 +4439,7 @@ static inline uint8_t *gpu_px_ptr(PPCMacGPUState *s, uint8_t *vram, uint64_t a,
     if (a > 0xFFFFFFFFull) {
         return NULL;
     }
-    uint8_t *pg = r200_agp_page(s, (uint32_t)a);
+    uint8_t *pg = gpu_agp_page(s, (uint32_t)a);
     return pg ? pg + (a & 0xFFF) : NULL;
 }
 
@@ -4620,7 +4451,7 @@ static inline uint32_t gpu_px_get(PPCMacGPUState *s, const uint8_t *vram,
     if (!p) {
         return 0;
     }
-    return bpp == 4 ? ldl_le_p(p) : bpp == 2 ? lduw_le_p(p) : *p;
+    return bpp == 4 ? GUEST_LDL_P(p) : bpp == 2 ? GUEST_LDUW_P(p) : *p;
 }
 
 static inline void gpu_px_put(PPCMacGPUState *s, uint8_t *vram, uint64_t a,
@@ -4630,9 +4461,9 @@ static inline void gpu_px_put(PPCMacGPUState *s, uint8_t *vram, uint64_t a,
 
     if (p) {
         if (bpp == 4) {
-            stl_le_p(p, v);
+            GUEST_STL_P(p, v);
         } else if (bpp == 2) {
-            stw_le_p(p, v);
+            GUEST_STW_P(p, v);
         } else {
             *p = v;
         }
@@ -4702,7 +4533,7 @@ static bool ppc_mac_gpu_hostdata_mono(PPCMacGPUState *s, const uint32_t *d,
     if ((uint64_t)n - 9 < (uint64_t)wps * h) {
         h = (n - 9) / wps;
     }
-    r200_vram_access(s, R200_ROWS(off, pitch, dy, h), true, 1);
+    gpu_vram_access(s, GPU_ROWS(off, pitch, dy, h), true);
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
             uint32_t px = dx + x, py = dy + y;
@@ -4752,31 +4583,46 @@ static uint32_t gpu_rop3(uint32_t rop, uint32_t pat, uint32_t src, uint32_t dst)
 }
 
 /*
- * The 2D engine for a little-endian guest: one rectangle operation, started by
- * a write to DST_WIDTH_HEIGHT (0x1598) or DST_HEIGHT_WIDTH (0x143c).  It takes
- * the ROP3, the source (screen memory) and the brush (solid or 8x8 mono) from
- * DP_GUI_MASTER_CNTL, honours the copy direction in DP_CNTL and the scissor,
- * and is independent of the PowerMac code paths.
+ * One 2D rectangle operation, however it was started: a write to
+ * DST_WIDTH_HEIGHT / DST_HEIGHT_WIDTH, or a PM4 BITBLT_MULTI / PAINT_MULTI
+ * packet.  Offsets and pitches are resolved already (PITCH_OFFSET words or
+ * the legacy registers); coordinates are plain x, y; the scissor is
+ * [clip_x0, clip_x1) x [clip_y0, clip_y1).
  */
-static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
+typedef struct Gpu2DOp {
+    uint32_t gmc;                   /* DP_GUI_MASTER_CNTL: ROP3, source, brush, bpp */
+    uint32_t dst_off, dst_pitch, src_off, src_pitch;
+    int dx, dy, sx, sy;             /* first pixel; the far corner if reversed */
+    uint32_t w, h;
+    bool xl2r, yt2b;                /* DP_CNTL copy direction */
+    bool auto_dir;                  /* pick the direction so an overlapping copy is safe */
+    bool clip;
+    int clip_x0, clip_y0, clip_x1, clip_y1;
+    uint32_t frgd, bkgd;            /* brush colours */
+    uint32_t brush_yx;
+    const uint32_t *brush_data;     /* 8x8 mono pattern, 2 dwords */
+} Gpu2DOp;
+
+/*
+ * The 2D engine.  It takes the ROP3, the source (screen memory, system memory
+ * through the GART, or host data) and the brush (solid or 8x8 mono) from
+ * DP_GUI_MASTER_CNTL, honours the copy direction and the scissor.  Pixels are
+ * in the guest's byte order (gpu_px_get/put).
+ */
+static void ppc_mac_gpu_2d_op(PPCMacGPUState *s, const Gpu2DOp *op)
 {
-    uint32_t gmc = s->regs.dp_gui_master_cntl;
-    uint32_t dpo = (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) ? s->regs.dst_pitch_offset
-                                                          : s->regs.default_pitch_offset;
-    uint32_t spo = (gmc & R200_GMC_SRC_PITCH_OFFSET_CNTL) ? s->regs.src_pitch_offset
-                                                          : s->regs.default_pitch_offset;
-    uint32_t doff = gpu_po_offset(s, dpo), dpitch = (dpo & 0x3FC00000) >> 16;
-    uint32_t soff = gpu_po_offset(s, spo), spitch = (spo & 0x3FC00000) >> 16;
+    uint32_t gmc = op->gmc;
+    uint32_t doff = op->dst_off, dpitch = op->dst_pitch;
+    uint32_t soff = op->src_off, spitch = op->src_pitch;
+    uint32_t w = op->w, h = op->h;
     uint32_t bpp = gpu_gmc_bpp(gmc), rop = (gmc >> 16) & 0xFF;
     uint32_t src_src = (gmc >> 24) & 7, brush = (gmc >> 4) & 0xF;
-    bool xl2r = s->regs.dp_cntl & 1, yt2b = s->regs.dp_cntl & 2;
-    bool clip = gmc & R200_GMC_DST_CLIPPING, lsb = gmc & (1u << 14);
-    int dx = s->regs.dst_y_x & 0xFFFF, dy = s->regs.dst_y_x >> 16;
-    int sx = s->regs.src_y_x & 0xFFFF, sy = s->regs.src_y_x >> 16;
-    int cx0 = (int16_t)(s->regs.sc_top_left & 0xFFFF), cy0 = (int16_t)(s->regs.sc_top_left >> 16);
-    int cx1 = (int16_t)(s->regs.sc_bottom_right & 0xFFFF);
-    int cy1 = (int16_t)(s->regs.sc_bottom_right >> 16);
-    bool need_src = rop & 0xAA ? (rop & 0xAA) != ((rop & 0x55) << 1) : false;
+    bool xl2r = op->xl2r, yt2b = op->yt2b;
+    bool clip = op->clip, lsb = gmc & (1u << 14);
+    int dx = op->dx, dy = op->dy, sx = op->sx, sy = op->sy;
+    /* the ROP3 index is P<<2 | S<<1 | D: it needs the source when the result
+     * differs between S=0 and S=1 for some P and D (index pairs k, k+2) */
+    bool need_src = ((rop ^ (rop >> 2)) & 0x33) != 0;
     uint32_t mask = bpp == 4 ? 0xFFFFFFFFu : bpp == 2 ? 0xFFFF : 0xFF;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
@@ -4789,11 +4635,73 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
                     need_src && (uint64_t)soff + (uint64_t)spitch * (sy > 0 ? sy : 0) >= s->vram_size ? " SRC-OUTSIDE-VRAM" : "");
         }
     }
-    if (!w || !h || !dpitch || (src_src == 3 && need_src)) {
-        return;     /* host-data sources arrive in HOSTDATA_BLT packets */
+    if (!w || !h || !dpitch) {
+        return;
+    }
+    if (src_src == 3) {
+        /* Host data: the pixels arrive through the HOST_DATA registers (or
+         * a HOSTDATA_BLT packet, which has its own handler). */
+        s->host_data_offset = doff;
+        s->host_data_pitch = dpitch;
+        s->host_data_macro_tile = false;
+        s->host_data_dst_x = dx;
+        s->host_data_dst_y = dy;
+        s->host_data_w = w;
+        s->host_data_h = h;
+        s->host_data_cur_x = 0;
+        s->host_data_cur_y = 0;
+        s->host_data_bpp = bpp;
+        s->host_data_active = true;
+        return;
     }
     if (need_src && src_src != 2) {
         need_src = false;
+    }
+    if (op->auto_dir && need_src && soff == doff && spitch == dpitch) {
+        /* A copy inside one surface: walk it the way memmove would, so
+         * overlapping rectangles come out right.  The reversed walk starts
+         * at the far corner. */
+        if (dy > sy) {
+            yt2b = false;
+            dy += (int)h - 1;
+            sy += (int)h - 1;
+        } else if (dy == sy && dx > sx) {
+            xl2r = false;
+            dx += (int)w - 1;
+            sx += (int)w - 1;
+        }
+    }
+    if (clip) {
+        /* the scissor is a rectangle, so clip the rectangle itself */
+        int xmin = xl2r ? dx : dx - (int)w + 1, ymin = yt2b ? dy : dy - (int)h + 1;
+        int x0 = MAX(xmin, op->clip_x0), x1 = MIN(xmin + (int)w, op->clip_x1);
+        int y0 = MAX(ymin, op->clip_y0), y1 = MIN(ymin + (int)h, op->clip_y1);
+
+        if (x0 >= x1 || y0 >= y1) {
+            return;
+        }
+        if (xl2r) {
+            sx += x0 - xmin;
+            dx = x0;
+        } else {
+            sx -= (xmin + (int)w) - x1;
+            dx = x1 - 1;
+        }
+        if (yt2b) {
+            sy += y0 - ymin;
+            dy = y0;
+        } else {
+            sy -= (ymin + (int)h) - y1;
+            dy = y1 - 1;
+        }
+        w = x1 - x0;
+        h = y1 - y0;
+        clip = false;
+    }
+    if (rop == 0xCC && src_src == 2 && soff >= 0x100000) {
+        /* the renderer maps 3D coordinates through a copy out of an
+         * off-screen render target */
+        blit_region_record(soff, spitch, sx, sy, dx, dy, w, h);
     }
     if (brush != 13 && brush != 15 && brush > 1) {
         static bool warned;
@@ -4805,11 +4713,11 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
     }
     bool dgtt = doff >= s->vram_size, sgtt = need_src && soff >= s->vram_size;
     if (!dgtt) {
-        r200_vram_access(s, R200_ROWS(doff, dpitch, dy < 0 ? 0 : MIN(dy, dy + (int)h - 1), h), true, 1);
+        gpu_vram_access(s, GPU_ROWS(doff, dpitch, dy < 0 ? 0 : MIN(dy, dy + (int)h - 1), h), true);
     }
     if (need_src && !sgtt) {
         /* a download reads what the renderer wrote: make it visible first */
-        r200_vram_access(s, R200_ROWS(soff, spitch, sy < 0 ? 0 : MIN(sy, sy + (int)h - 1), h), false, 1);
+        gpu_vram_access(s, GPU_ROWS(soff, spitch, sy < 0 ? 0 : MIN(sy, sy + (int)h - 1), h), false);
     }
     for (uint32_t j = 0; j < h; j++) {
         int y = yt2b ? dy + (int)j : dy - (int)j;
@@ -4820,7 +4728,7 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
         }
         /* fast paths: solid pattern copy and screen copy of whole rows */
         if (rop == 0xF0 && brush == 13 && !clip && !dgtt) {
-            uint32_t col = s->regs.dp_brush_frgd_clr & mask;
+            uint32_t col = op->frgd & mask;
             int x0 = xl2r ? dx : dx - (int)w + 1;
             for (uint32_t i = 0; i < w; i++) {
                 gpu_px_put(s, vram, (uint64_t)doff + (uint64_t)y * dpitch +
@@ -4849,20 +4757,20 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
             int xs = xl2r ? sx + (int)i : sx - (int)i;
             uint32_t pat = 0, src = 0, bit = 1;
 
-            if (x < 0 || (clip && (x < cx0 || x > cx1 || y < cy0 || y > cy1))) {
+            if (x < 0) {
                 continue;
             }
             if (brush == 13) {
-                pat = s->regs.dp_brush_frgd_clr;
+                pat = op->frgd;
             } else if (brush <= 1) {
-                int bx = (x + (s->regs.brush_y_x & 0xFFFF)) & 7;
-                int by = (y + (s->regs.brush_y_x >> 16)) & 7;
-                uint32_t row = (s->regs.brush_data[by >> 2] >> ((by & 3) * 8)) & 0xFF;
+                int bx = (x + (op->brush_yx & 0xFFFF)) & 7;
+                int by = (y + (op->brush_yx >> 16)) & 7;
+                uint32_t row = (op->brush_data[by >> 2] >> ((by & 3) * 8)) & 0xFF;
                 bit = lsb ? (row >> bx) & 1 : (row >> (7 - bx)) & 1;
                 if (!bit && brush == 1) {
                     continue;           /* mono pattern, background left alone */
                 }
-                pat = bit ? s->regs.dp_brush_frgd_clr : s->regs.dp_brush_bkgd_clr;
+                pat = bit ? op->frgd : op->bkgd;
             }
             if (need_src) {
                 src = gpu_px_get(s, vram, (uint64_t)soff + (uint64_t)ys * spitch +
@@ -4880,6 +4788,63 @@ static void ppc_mac_gpu_2d_le(PPCMacGPUState *s, uint32_t w, uint32_t h)
         memory_region_set_dirty(&s->vram, (uint64_t)doff + (uint64_t)ylo * dpitch,
                                 (uint64_t)h * dpitch);
     }
+}
+
+/* The register-triggered form: DST_WIDTH_HEIGHT / DST_HEIGHT_WIDTH.  With `legacy`
+ * the surfaces come from the separate DST_OFFSET/DST_PITCH and SRC_OFFSET/SRC_PITCH
+ * registers (byte pitches) instead of the PITCH_OFFSET words. */
+static void ppc_mac_gpu_2d(PPCMacGPUState *s, uint32_t w, uint32_t h, bool legacy)
+{
+    uint32_t gmc = s->regs.dp_gui_master_cntl;
+    uint32_t dpo = (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) ? s->regs.dst_pitch_offset
+                                                          : s->regs.default_pitch_offset;
+    uint32_t spo = (gmc & R200_GMC_SRC_PITCH_OFFSET_CNTL) ? s->regs.src_pitch_offset
+                                                          : s->regs.default_pitch_offset;
+    Gpu2DOp op = {
+        .gmc = gmc,
+        .dst_off = gpu_po_offset(s, dpo), .dst_pitch = (dpo & 0x3FC00000) >> 16,
+        .src_off = gpu_po_offset(s, spo), .src_pitch = (spo & 0x3FC00000) >> 16,
+        .dx = s->regs.dst_y_x & 0xFFFF, .dy = s->regs.dst_y_x >> 16,
+        .sx = s->regs.src_y_x & 0xFFFF, .sy = s->regs.src_y_x >> 16,
+        .w = w, .h = h,
+        .xl2r = s->regs.dp_cntl & 1, .yt2b = s->regs.dp_cntl & 2,
+        .clip = gmc & R200_GMC_DST_CLIPPING,
+        .clip_x0 = (int16_t)(s->regs.sc_top_left & 0xFFFF),
+        .clip_y0 = (int16_t)(s->regs.sc_top_left >> 16),
+        .clip_x1 = (int16_t)(s->regs.sc_bottom_right & 0xFFFF),
+        .clip_y1 = (int16_t)(s->regs.sc_bottom_right >> 16),
+        .frgd = s->regs.dp_brush_frgd_clr, .bkgd = s->regs.dp_brush_bkgd_clr,
+        .brush_yx = s->regs.brush_y_x, .brush_data = s->regs.brush_data,
+    };
+
+    if (legacy) {
+        op.dst_off = s->regs.dst_offset;
+        op.dst_pitch = s->regs.dst_pitch;
+        op.src_off = s->regs.src_offset;
+        op.src_pitch = s->regs.src_pitch ? s->regs.src_pitch : op.dst_pitch;
+    }
+    ppc_mac_gpu_2d_op(s, &op);
+}
+
+/*
+ * The PowerPC build still carries its own rectangle engines
+ * (ppc_mac_gpu_2d_blit and _sep).  PPCGPU_2D_UNIFIED=1 runs the shared
+ * ppc_mac_gpu_2d instead, to compare the two before the old ones go.  The
+ * x86 build always uses the shared engine.
+ */
+static bool gpu_unified_2d(void)
+{
+#if PPC_MAC_GPU_BE
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_2D_UNIFIED");
+        on = e && e[0] == '1';
+    }
+    return on;
+#else
+    return true;
+#endif
 }
 
 /* DST_LINE_END write: draw the line DST_LINE_START..end in the brush colour. */
@@ -4901,7 +4866,7 @@ static void ppc_mac_gpu_2d_line(PPCMacGPUState *s, uint32_t end)
     if (!pitch) {
         return;
     }
-    r200_vram_access(s, R200_ROWS(off, pitch, ymin, ymax - ymin + 1), true, 1);
+    gpu_vram_access(s, GPU_ROWS(off, pitch, ymin, ymax - ymin + 1), true);
     for (;;) {
         bool in = !clip ||
             (x0 >= (int)(s->regs.sc_top_left & 0xFFFF) && y0 >= (int)(s->regs.sc_top_left >> 16) &&
@@ -4929,6 +4894,7 @@ static void ppc_mac_gpu_2d_line(PPCMacGPUState *s, uint32_t end)
                             (uint64_t)(ymax - ymin + 1) * pitch);
 }
 
+#if PPC_MAC_GPU_BE
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
 {
     /*
@@ -5041,10 +5007,10 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         }
     }
 
-    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+    gpu_vram_access(s, GPU_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true);
     if (src_offset < s->vram_size) {
-        r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
-                                      src_y, blit_h), false, 1);
+        gpu_vram_access(s, GPU_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
+                                      src_y, blit_h), false);
     }
     seq_log("REG  rop=%02x src=%06x/%u (%u,%u) dst=%06x/%u (%u,%u) %ux%u",
             rop3, src_offset, src_pitch, src_x, src_y,
@@ -5149,84 +5115,6 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         /* Try shadow RT redirect first: if the 3D renderer has a
          * cached shadow RT covering this BLIT source, read pixels
          * from the shadow buffer instead of VRAM. */
-        if (!r200_direct_enabled() && s->renderer && s->renderer->blit_2d) {
-            PPCMacGPUBlit blit_desc = {
-                .src_x = src_x, .src_y = src_y,
-                .src_offset = src_offset,
-                .src_pitch = src_pitch,
-                .dst_x = dst_x, .dst_y = dst_y,
-                .dst_offset = dst_offset,
-                .dst_pitch = dst_pitch,
-                .width = blit_w, .height = blit_h,
-                .rop3 = rop3,
-                .bpp = bpp * 8,
-            };
-            int blit_ret = s->renderer->blit_2d(
-                s->renderer_opaque, vram, &blit_desc);
-            if (blit_ret == 0) {
-                /* Shadow RT handled the BLIT — mark dirty */
-                if (dst_offset <= 0x10000) {
-                    fb_write_watch("mmio_srt_present", "srt",
-                                   src_offset, dst_offset,
-                                   dst_x, dst_y, blit_w, blit_h,
-                                   true, true);
-                }
-                uint64_t dirty_start = (uint64_t)dst_offset +
-                                       (uint64_t)dst_y * dst_pitch +
-                                       (uint64_t)dst_x * bpp;
-                uint64_t dirty_len = (blit_h > 1)
-                    ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
-                    : (uint64_t)blit_w * bpp;
-                memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
-
-                /* Phase A/C: stride override for shadow RT path */
-                if (dst_offset == s->regs.crtc_offset &&
-                    s->disp.bpp == 32 && dst_pitch > 0 &&
-                    blit_w >= 256 && blit_h >= 256) {
-                    static int srt_present_log = 0;
-                    if (srt_present_log < 50) {
-                        fprintf(stderr,
-                            "[PRESENT_BLIT] MMIO_SRT: "
-                            "src=0x%x+%u dst=0x%x+%u "
-                            "sxy=%u,%u dxy=%u,%u %ux%u "
-                            "crtc_stride=%u\n",
-                            src_offset, src_pitch,
-                            dst_offset, dst_pitch,
-                            src_x, src_y, dst_x, dst_y,
-                            blit_w, blit_h,
-                            s->disp.stride);
-                        srt_present_log++;
-                    }
-                    if (dst_pitch != s->disp.stride ||
-                        !s->disp_stride_override_active) {
-                        static int srt_so_log = 0;
-                        if (srt_so_log < 20) {
-                            fprintf(stderr,
-                                "[STRIDE_CHANGE] MMIO_SRT: "
-                                "override %s %u -> %u\n",
-                                s->disp_stride_override_active
-                                    ? "update" : "activate",
-                                s->disp.stride, dst_pitch);
-                            srt_so_log++;
-                        }
-                    }
-                    r200_set_present_pitch(s, dst_pitch);
-                }
-
-                /* SRT write-through: metal_blit_2d read from source SRT
-                 * and wrote to VRAM, but if the DESTINATION also has an
-                 * SRT (intra-RT moves during window drag), update it. */
-                if (!r200_direct_enabled() && s->renderer->srt_write_through &&
-                    dst_offset != s->regs.crtc_offset) {
-                    s->renderer->srt_write_through(
-                        s->renderer_opaque, vram,
-                        dst_offset, dst_pitch,
-                        dst_x, dst_y, blit_w, blit_h,
-                        bpp * 8);
-                }
-                return;
-            }
-        }
 
         if (dst_offset <= 0x10000) {
             fb_write_watch(src_is_gart ? "mmio_gart_blit" : "mmio_vram_blit",
@@ -5389,14 +5277,6 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
          * window bodies via 2D BLITs, and the SRT must reflect this
          * content so that PRESENT_BLITs show the moved window.
          */
-        if (!r200_direct_enabled() && s->renderer && s->renderer->srt_write_through &&
-            dst_offset != s->regs.crtc_offset) {
-            s->renderer->srt_write_through(
-                s->renderer_opaque, vram,
-                dst_offset, dst_pitch,
-                dst_x, dst_y, blit_w, blit_h,
-                bpp * 8);
-        }
         if (dst_offset == s->regs.crtc_offset) {
             /*
              * The screen's size comes from the CRTC rather than from
@@ -5456,7 +5336,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                     mmio_nosrt_so++;
                 }
             }
-            r200_set_present_pitch(s, dst_pitch);
+            gpu_set_present_pitch(s, dst_pitch);
 
             /* Content probe: check if source VRAM has non-zero data */
             {
@@ -5515,7 +5395,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
     }
     /* Other ROP3 values: silently ignore for now */
 }
+#endif
 
+#if PPC_MAC_GPU_BE
 /*
  * Execute a 2D blit using separate SRC_OFFSET/SRC_PITCH and
  * DST_OFFSET/DST_PITCH registers.  Triggered by DST_HEIGHT_WIDTH (0x143C).
@@ -5563,10 +5445,10 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         return;
     }
 
-    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 2);
+    gpu_vram_access(s, GPU_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true);
     if (src_offset < s->vram_size) {
-        r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
-                                      src_y, blit_h), false, 2);
+        gpu_vram_access(s, GPU_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
+                                      src_y, blit_h), false);
     }
     seq_log("SEP  rop=%02x srctype=%u src=%06x/%u (%u,%u) "
             "dst=%06x/%u (%u,%u) %ux%u",
@@ -5700,9 +5582,9 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                          * view after the 0x15D4 swap; store the CPU view.
                          * A swap equal to the aperture's is a plain copy.
                          */
-                        if (s->r300 && bpp == 4 && s->r300_src_swap != 2) {
+                        if (bpp == 4 && s->r300_src_swap != 2) {
                             pixel = bswap32(r300_swap_mode(pixel, s->r300_src_swap));
-                        } else if (s->r300 && bpp == 2 && s->r300_src_swap == 0) {
+                        } else if (bpp == 2 && s->r300_src_swap == 0) {
                             pixel = r300_swap_mode(pixel, 1);
                         }
                         xlate_ok++;
@@ -5861,7 +5743,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                     mmio_so_log++;
                 }
             }
-            r200_set_present_pitch(s, dst_pitch);
+            gpu_set_present_pitch(s, dst_pitch);
         }
     } else if (rop3 == 0xF0) {
         /* Pattern fill — MC helper handles tiling */
@@ -5888,290 +5770,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         s->display_invalid = true;
     }
 }
-
-/*
- * Snapshot 3D register state from the shadow array for a draw call.
- */
-static void ppc_mac_gpu_snapshot_3d_state(PPCMacGPUState *s,
-                                           PPCMacGPU3DState *state)
-{
-    /* Helper to read from the 3D shadow array */
-    #define RD3D(addr) s->regs.regs_3d[R200_3D_IDX(addr)]
-
-    state->se_vtx_fmt_0     = RD3D(R200_SE_VTX_FMT_0);
-    state->se_vtx_fmt_1     = RD3D(R200_SE_VTX_FMT_1);
-    state->se_vte_cntl      = RD3D(R200_SE_VTE_CNTL);
-    state->pp_cntl          = RD3D(R200_PP_CNTL);
-    state->pp_misc          = RD3D(R200_PP_MISC);
-
-    /* Texture unit 0 — R200 register bank */
-    state->pp_txfilter_0    = RD3D(R200_PP_TXFILTER_0);
-    state->pp_txformat_0    = RD3D(R200_PP_TXFORMAT_0);
-    state->pp_txformat_x_0  = RD3D(R200_PP_TXFORMAT_X_0);
-    state->pp_txsize_0      = RD3D(R200_PP_TXSIZE_0);
-    state->pp_txpitch_0     = RD3D(R200_PP_TXPITCH_0);
-    state->pp_txoffset_0    = RD3D(R200_PP_TXOFFSET_0);
-
-    /* Texture unit 0 — R100 register bank (Apple kext uses these) */
-    state->r100_pp_txfilter_0  = RD3D(R100_PP_TXFILTER_0);
-    state->r100_pp_txformat_0  = RD3D(R100_PP_TXFORMAT_0);
-    state->r100_pp_txoffset_0  = RD3D(R100_PP_TXOFFSET_0);
-    state->r100_pp_tex_size_0  = RD3D(R100_PP_TEX_SIZE_0);
-    state->r100_pp_tex_pitch_0 = RD3D(R100_PP_TEX_PITCH_0);
-
-    /* Texture combiners */
-    state->pp_txcblend_0    = RD3D(R200_PP_TXCBLEND_0);
-    state->pp_txcblend2_0   = RD3D(R200_PP_TXCBLEND2_0);
-    state->pp_txablend_0    = RD3D(R200_PP_TXABLEND_0);
-    state->pp_txablend2_0   = RD3D(R200_PP_TXABLEND2_0);
-
-    /* Render backend */
-    state->rb3d_cntl        = RD3D(R200_RB3D_CNTL);
-    state->rb3d_coloroffset = RD3D(R200_RB3D_COLOROFFSET);
-    state->rb3d_colorpitch  = RD3D(R200_RB3D_COLORPITCH);
-    state->rb3d_blendcntl   = RD3D(R200_RB3D_BLENDCNTL);
-    state->rb3d_ablendcntl  = RD3D(R200_RB3D_ABLENDCNTL);
-    state->rb3d_cblendcntl  = RD3D(R200_RB3D_CBLENDCNTL);
-    state->rb3d_zstencilcntl = RD3D(R200_RB3D_ZSTENCILCNTL);
-
-    /* Setup engine */
-    state->se_cntl          = RD3D(R200_SE_CNTL);
-    state->re_cntl          = RD3D(R200_RE_CNTL);
-
-    /* Viewport */
-    state->se_vport_xscale  = RD3D(R200_SE_VPORT_XSCALE);
-    state->se_vport_xoffset = RD3D(R200_SE_VPORT_XOFFSET);
-    state->se_vport_yscale  = RD3D(R200_SE_VPORT_YSCALE);
-    state->se_vport_yoffset = RD3D(R200_SE_VPORT_YOFFSET);
-    state->se_vport_zscale  = RD3D(R200_SE_VPORT_ZSCALE);
-    state->se_vport_zoffset = RD3D(R200_SE_VPORT_ZOFFSET);
-
-    /* 3D scissor */
-    state->re_top_left      = RD3D(R200_RE_TOP_LEFT);
-    state->re_width_height  = RD3D(R200_RE_WIDTH_HEIGHT);
-
-    /* Screen dimensions from display mode */
-    state->screen_width     = s->disp.width;
-    state->screen_height    = s->disp.height;
-
-    #undef RD3D
-}
-
-/*
- * Log 3D draw state for compositor analysis.
- * Writes to /tmp/gpu_3d_draws.log with all relevant state per draw.
- */
-static void ppc_mac_gpu_log_3d_draw(const PPCMacGPU3DState *st,
-                                     const PPCMacGPU3DDrawCmd *cmd)
-{
-    static FILE *f3d = NULL;
-    static uint64_t draw_count = 0;
-
-    if (!f3d) {
-        f3d = fopen("/tmp/gpu_3d_draws.log", "w");
-        if (!f3d) return;
-        fprintf(f3d, "=== 3D Draw Command Log ===\n");
-    }
-
-    if (draw_count >= 2000) {
-        /* Limit log size */
-        if (draw_count == 2000) {
-            fprintf(f3d, "--- LOG LIMIT REACHED (2000 draws) ---\n");
-            fflush(f3d);
-        }
-        draw_count++;
-        return;
-    }
-
-    const char *opname = "UNKNOWN";
-    switch (cmd->opcode) {
-    case R200_3D_DRAW_VBUF: opname = "DRAW_VBUF"; break;
-    case R200_3D_DRAW_IMMD: opname = "DRAW_IMMD"; break;
-    case R200_3D_DRAW_INDX: opname = "DRAW_INDX"; break;
-    }
-
-    const char *primname = "?";
-    switch (cmd->prim_type) {
-    case 0: primname = "NONE"; break;
-    case 1: primname = "POINTS"; break;
-    case 2: primname = "LINES"; break;
-    case 3: primname = "LINE_STRIP"; break;
-    case 4: primname = "TRI_LIST"; break;
-    case 5: primname = "TRI_FAN"; break;
-    case 6: primname = "TRI_STRIP"; break;
-    case 7: primname = "TRI_TYPE2"; break;
-    case 8: primname = "RECT_LIST"; break;
-    case 9: primname = "3VRT_POINTS"; break;
-    case 10: primname = "3VRT_LINES"; break;
-    case 11: primname = "POINT_SPRITES"; break;
-    case 12: primname = "LINE_LOOP"; break;
-    case 13: primname = "QUAD_LIST"; break;
-    case 14: primname = "QUAD_STRIP"; break;
-    case 15: primname = "POLYGON"; break;
-    }
-
-    /* Decode texture format */
-    uint32_t txfmt_raw = st->pp_txformat_0 & 0x1F;
-    const char *txfmt_name = "?";
-    switch (txfmt_raw) {
-    case 0x06: txfmt_name = "ARGB8888"; break;
-    case 0x07: txfmt_name = "RGBA8888"; break;
-    case 0x15: txfmt_name = "XRGB8888"; break;
-    case 0x05: txfmt_name = "RGB565"; break;
-    case 0x04: txfmt_name = "ARGB1555"; break;
-    case 0x11: txfmt_name = "ARGB4444"; break;
-    case 0x01: txfmt_name = "AI88"; break;
-    case 0x00: txfmt_name = "I8"; break;
-    default: txfmt_name = "OTHER"; break;
-    }
-
-    /* Decode texture size */
-    uint32_t tex_w = (st->pp_txsize_0 & 0x7FF) + 1;
-    uint32_t tex_h = ((st->pp_txsize_0 >> 16) & 0x7FF) + 1;
-    uint32_t tex_pitch = (st->pp_txpitch_0 & 0x3FFF) + 32;
-    uint32_t tex_offset = st->pp_txoffset_0;
-    /*
-     * R200 PP_CNTL texture enable bits are at positions 4, 8, 12, 16, 20, 24
-     * (NOT at bits 0-5 like R100). Bit 4 = TEX_0_ENABLE.
-     */
-    bool tex0_enabled = (st->pp_cntl >> 4) & 1;
-
-    /* Decode color target */
-    uint32_t color_off = st->rb3d_coloroffset;
-    uint32_t color_pitch_raw = st->rb3d_colorpitch;
-    uint32_t color_pitch_val = (color_pitch_raw & 0x3FFF) * 8;  /* in bytes */
-    bool micro_tile = (color_pitch_raw >> 15) & 1;
-    bool macro_tile = (color_pitch_raw >> 16) & 1;
-    bool color_tile = micro_tile || macro_tile;
-
-    /* Decode blend */
-    uint32_t blend = st->rb3d_blendcntl;
-    bool blend_enable = (blend >> 24) & 1;
-    uint32_t src_blend = blend & 0xF;
-    uint32_t dst_blend = (blend >> 16) & 0xF;
-
-    /* Decode viewport (floats stored as uint32_t) */
-    float vp_xscale, vp_xoff, vp_yscale, vp_yoff;
-    memcpy(&vp_xscale, &st->se_vport_xscale, 4);
-    memcpy(&vp_xoff, &st->se_vport_xoffset, 4);
-    memcpy(&vp_yscale, &st->se_vport_yscale, 4);
-    memcpy(&vp_yoff, &st->se_vport_yoffset, 4);
-
-    /* Decode vertex format */
-    bool vtx_xy = st->se_vtx_fmt_0 & 1;
-    bool vtx_z = (st->se_vtx_fmt_0 >> 1) & 1;
-    bool vtx_w = (st->se_vtx_fmt_0 >> 2) & 1;
-    bool vtx_color_packed = (st->se_vtx_fmt_0 >> 4) & 1;
-    uint32_t vtx_color_cnt = (st->se_vtx_fmt_0 >> 8) & 7;
-    uint32_t tex0_comp_cnt = st->se_vtx_fmt_1 & 7;  /* 0=S,1=ST,2=STR,3=STRQ */
-    bool vte_xy_fmt = (st->se_vte_cntl >> 8) & 1;  /* 1=screen-space coords */
-
-    /* Decode scissor */
-    uint32_t sc_x = st->re_top_left & 0x3FFF;
-    uint32_t sc_y = (st->re_top_left >> 16) & 0x3FFF;
-    uint32_t sc_w = st->re_width_height & 0x3FFF;
-    uint32_t sc_h = (st->re_width_height >> 16) & 0x3FFF;
-
-    fprintf(f3d,
-        "\n[3D_DRAW #%llu]\n"
-        "  opcode=%s  prim=%s  verts=%u\n"
-        "  color_off=0x%06x  color_pitch=%u  color_tile=%d\n"
-        "  tex0_en=%d  tex0_off=0x%06x  tex0_pitch=%u  tex0_size=%ux%u  tex0_fmt=%s(0x%x)\n"
-        "  blend_en=%d  src_blend=0x%x  dst_blend=0x%x\n"
-        "  vtx_fmt0=0x%08x  vtx_fmt1=0x%08x  vte_cntl=0x%08x\n"
-        "  vtx: xy=%d z=%d w=%d color_packed=%d color_cnt=%u tex0_comp=%u screen_space=%d\n"
-        "  viewport: xscale=%.1f xoff=%.1f yscale=%.1f yoff=%.1f\n"
-        "  scissor: (%u,%u) %ux%u\n"
-        "  se_cntl=0x%08x  re_cntl=0x%08x  pp_cntl=0x%08x\n"
-        "  rb3d_cntl=0x%08x  zstencil=0x%08x\n",
-        (unsigned long long)draw_count,
-        opname, primname, cmd->num_vertices,
-        color_off, color_pitch_val, color_tile,
-        tex0_enabled, tex_offset, tex_pitch, tex_w, tex_h, txfmt_name, txfmt_raw,
-        blend_enable, src_blend, dst_blend,
-        st->se_vtx_fmt_0, st->se_vtx_fmt_1, st->se_vte_cntl,
-        vtx_xy, vtx_z, vtx_w, vtx_color_packed, vtx_color_cnt, tex0_comp_cnt, vte_xy_fmt,
-        vp_xscale, vp_xoff, vp_yscale, vp_yoff,
-        sc_x, sc_y, sc_w, sc_h,
-        st->se_cntl, st->re_cntl, st->pp_cntl,
-        st->rb3d_cntl, st->rb3d_zstencilcntl);
-
-    /* For DRAW_IMMD, dump the first few vertex data words */
-    if (cmd->opcode == R200_3D_DRAW_IMMD && cmd->vertex_data && cmd->vertex_data_dwords > 0) {
-        uint32_t dump_count = cmd->vertex_data_dwords < 32 ? cmd->vertex_data_dwords : 32;
-        fprintf(f3d, "  immd_data[%u]:", cmd->vertex_data_dwords);
-        for (uint32_t i = 0; i < dump_count; i++) {
-            if (i % 8 == 0 && i > 0) fprintf(f3d, "\n               ");
-            float fval;
-            memcpy(&fval, &cmd->vertex_data[i], 4);
-            fprintf(f3d, " %08x(%.2f)", cmd->vertex_data[i], fval);
-        }
-        fprintf(f3d, "\n");
-    }
-
-    /* For DRAW_VBUF, log VB and AOS info */
-    if (cmd->opcode == R200_3D_DRAW_VBUF) {
-        fprintf(f3d, "  vb_addr=0x%08x  vb_stride=%u (bytes)\n",
-                cmd->vb_addr, cmd->vb_stride);
-    }
-
-    /* For DRAW_INDX, log index data */
-    if (cmd->opcode == R200_3D_DRAW_INDX && cmd->index_data) {
-        uint32_t idx_dump = cmd->num_indices < 16 ? cmd->num_indices : 16;
-        fprintf(f3d, "  indices[%u]:", cmd->num_indices);
-        for (uint32_t i = 0; i < idx_dump; i++) {
-            fprintf(f3d, " %u", cmd->index_data[i]);
-        }
-        fprintf(f3d, "\n");
-    }
-
-    draw_count++;
-
-    if (draw_count % 50 == 0) {
-        fflush(f3d);
-    }
-}
-
-/*
- * Dispatch a 3D draw command to the renderer backend.
- *
- * For DRAW_VBUF with GART vertex buffers, we resolve the GART address,
- * read vertex data from system RAM, and convert to DRAW_IMMD so the
- * renderer backend doesn't need GART access.
- */
-/* ========================================================================
- * Direct R200 draw path
- *
- * Decodes one R200 vertex-buffer draw into an R200DrawPacket: vertices are
- * fetched from their AOS arrays (VRAM or AGP), transformed by the TCL MVP
- * matrix and the viewport into window pixels, assembled into a triangle
- * list, and handed to the renderer, which draws straight into VRAM.
- *
- * Register usage follows what Apple's R200 driver actually programs (from a
- * Quartz Extreme trace): texture units 0-2 are written at the R100 register
- * addresses (PP_TXFILTER_0 0x1C54, PP_TXFORMAT_0 0x1C58, PP_TXOFFSET_0
- * 0x1C5C, PP_TEX_SIZE_0 0x1D04, PP_TEX_PITCH_0 0x1D08, PP_TFACTOR_0 0x1C68,
- * stride 0x18 / 8), units 3-5 at the R200 ones.  Everything else is R200.
- * ======================================================================== */
-
-static bool r200_direct_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("PPCGPU_R200_DIRECT");
-        enabled = !(e && e[0] == '0');
-    }
-    return enabled;
-}
-
-#define R3D(a) (s->regs.regs_3d[R200_3D_IDX(a)])
-
-static inline float r200_f32(uint32_t bits)
-{
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
+#endif
 
 /*
  * Read guest-GPU memory (VRAM via MC_FB_LOCATION, else AGP/PCI GART) into
@@ -6186,14 +5785,16 @@ static inline float r200_f32(uint32_t bits)
  * every fence.
  */
 static struct { uint32_t tag; uint8_t *host; hwaddr pte; uint32_t pte_raw; } r200_agp_tc[1024];
+#if PPC_MAC_GPU_BE
 static uint32_t r200_agp_tc_gen;
+#endif
 
 static void r200_agp_tc_flush(void)
 {
     memset(r200_agp_tc, 0, sizeof(r200_agp_tc));
 }
 
-static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
+static uint8_t *gpu_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
 {
     /*
      * PowerMac: the AGP bridge says when the GART changes
@@ -6203,10 +5804,10 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
      * flush is a no-op there), so a hit is trusted only if the entry it came
      * from still holds the value it had when the translation was made.
      */
-    bool ppc = s->swap;
     uint32_t page = gpu_addr >> 12;
     uint32_t i = page & (ARRAY_SIZE(r200_agp_tc) - 1);
-    if (ppc) {
+#if PPC_MAC_GPU_BE
+    {
         uint32_t g = uninorth_get_agp_gart_gen();
         if (g != r200_agp_tc_gen) {
             r200_agp_tc_gen = g;
@@ -6215,7 +5816,9 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
         if (r200_agp_tc[i].tag == page + 1) {
             return r200_agp_tc[i].host;
         }
-    } else if (r200_agp_tc[i].tag == page + 1) {
+    }
+#else
+    if (r200_agp_tc[i].tag == page + 1) {
         uint32_t cur = 0;
         if (address_space_read(&address_space_memory, r200_agp_tc[i].pte,
                                MEMTXATTRS_UNSPECIFIED, &cur, 4) == MEMTX_OK &&
@@ -6223,6 +5826,7 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
             return r200_agp_tc[i].host;
         }
     }
+#endif
     hwaddr phys;
     if (!ppc_mac_gpu_agp_translate(s, page << 12, &phys) &&
         !ppc_mac_gpu_gart_translate(s, page << 12, &phys)) {
@@ -6243,1905 +5847,6 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
     r200_agp_tc[i].pte = r200_last_pte_addr;
     r200_agp_tc[i].pte_raw = r200_last_pte_raw;
     return h;
-}
-
-static bool r200_read_dwords(PPCMacGPUState *s, uint32_t gpu_addr,
-                             uint32_t *dst, uint32_t count)
-{
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t len = count * 4;
-    uint8_t buf[256];
-
-    if (len > sizeof(buf)) {
-        return false;
-    }
-    if (gpu_addr >= fb_base && gpu_addr - fb_base + len <= s->vram_size) {
-        /*
-         * Byte-swap straight out of VRAM.  Going via the bounce buffer made
-         * a second copy of every vertex fetched, and this is the path
-         * almost every fetch takes; the copy was a third of all the time
-         * the emulator spent in memmove.
-         */
-        const uint8_t *src = (const uint8_t *)
-            memory_region_get_ram_ptr(&s->vram) + (gpu_addr - fb_base);
-        for (uint32_t i = 0; i < count; i++) {
-            dst[i] = ldl_be_p(src + i * 4);
-        }
-        return true;
-    } else {
-        uint32_t done = 0;
-        while (done < len) {
-            hwaddr phys;
-            uint32_t a = gpu_addr + done;
-            uint32_t chunk = MIN(0x1000 - (a & 0xFFF), len - done);
-            uint8_t *hp = r200_agp_page(s, a);
-            if (hp) {
-                memcpy(buf + done, hp + (a & 0xFFF), chunk);
-                done += chunk;
-                continue;
-            }
-            if (!ppc_mac_gpu_agp_translate(s, a, &phys) &&
-                !ppc_mac_gpu_gart_translate(s, a, &phys)) {
-                return false;
-            }
-            if (address_space_read(&address_space_memory, phys,
-                                   MEMTXATTRS_UNSPECIFIED, buf + done,
-                                   chunk) != MEMTX_OK) {
-                return false;
-            }
-            done += chunk;
-        }
-    }
-    for (uint32_t i = 0; i < count; i++) {
-        dst[i] = ldl_be_p(buf + i * 4);
-    }
-    return true;
-}
-
-static void r200_warn_once(uint32_t *mask, uint32_t bit, const char *fmt, ...)
-    G_GNUC_PRINTF(3, 4);
-static void r200_warn_once(uint32_t *mask, uint32_t bit, const char *fmt, ...)
-{
-    if (*mask & bit) {
-        return;
-    }
-    *mask |= bit;
-    va_list ap;
-    va_start(ap, fmt);
-    char *msg = g_strdup_vprintf(fmt, ap);
-    va_end(ap);
-    qemu_log("ppc-mac-gpu r200: %s\n", msg);
-    g_free(msg);
-}
-
-static uint32_t r200_warned;
-
-/* Texture unit n: R100 register addresses for units 0-2, R200 for 3-5. */
-/*
- * Fetch `have` words into dst and zero it out to `fill`.
- *
- * Both counts are tiny -- at most 16, and usually two or three -- so this
- * replaces a memcpy and a memset whose lengths are only known at run time.
- * They were called once per attribute per vertex, a couple of million times
- * a second, and the call overhead dwarfed the handful of words each one
- * moved: together they were the emulator's hottest memmove by a wide
- * margin.  A plain word loop the compiler can see through is faster.
- */
-static inline void r200_fetch_words(uint32_t *dst, const uint32_t *src,
-                                    uint32_t have, uint32_t fill)
-{
-    uint32_t i = 0;
-    for (; i < have; i++) {
-        dst[i] = src[i];
-    }
-    for (; i < fill; i++) {
-        dst[i] = 0;
-    }
-}
-
-/*
- * Grow the shared vertex scratch to hold at least n vertices and return it.
- *
- * Every growth must go through here.  The scratch is reachable from the
- * device, so reallocating it and storing the result only in a local leaves
- * the device pointing at freed memory -- which is not noticed here but in
- * the *next* draw, as a heap abort inside an unrelated allocation.
- */
-static R200Vertex *r200_draw_verts(PPCMacGPUState *s, uint32_t n)
-{
-    if (n > s->draw_verts_cap) {
-        s->draw_verts = g_renew(R200Vertex, s->draw_verts, n);
-        s->draw_verts_cap = n;
-    }
-    return s->draw_verts;
-}
-
-static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
-{
-    uint32_t filter, format, offset, size, pitch;
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-
-    if (n < 3) {
-        filter = R3D(0x1C54 + n * 0x18);
-        format = R3D(0x1C58 + n * 0x18);
-        offset = R3D(0x1C5C + n * 0x18);
-        size   = R3D(0x1D04 + n * 8);
-        pitch  = R3D(0x1D08 + n * 8);
-    } else {
-        filter = R3D(0x2C00 + n * 0x20);
-        format = R3D(0x2C04 + n * 0x20);
-        size   = R3D(0x2C0C + n * 0x20);
-        pitch  = R3D(0x2C10 + n * 0x20);
-        offset = R3D(0x2D00 + n * 0x18);
-    }
-
-    memset(t, 0, sizeof(*t));
-    t->enabled = 1;
-    t->format = format & 0x1F;
-    t->alpha_in_map = (format >> 6) & 1;
-    t->filter = filter;
-    uint32_t bpp = (t->format == 0 || t->format == 8) ? 1 :      /* I8, Y8 */
-                   (t->format == 1 || t->format == 3 ||          /* AI88,1555 */
-                    t->format == 4 || t->format == 5 ||          /* 565,4444 */
-                    t->format == 10 || t->format == 11) ? 2 : 4; /* YUV 4:2:2 */
-    if (format & (1 << 7)) {              /* NON_POWER2: explicit size/pitch */
-        t->width  = (size & 0x7FF) + 1;
-        t->height = ((size >> 16) & 0x7FF) + 1;
-        t->pitch  = (pitch & 0x3FE0) + 32;
-        t->denorm = 1;                    /* rectangle textures use texels */
-    } else {
-        t->width  = 1u << ((format >> 8) & 0xF);
-        t->height = 1u << ((format >> 12) & 0xF);
-        t->pitch  = t->width * bpp;
-    }
-    /* The swap only matters where byte order within a texel group does:
-     * YUV 4:2:2 (the backend applies it).  VRAM already holds the CPU's
-     * byte order, which is what 16/32-bit texel decoding expects. */
-    t->swap = offset & 3;
-    if (getenv("POWEREMU_TEX_TRACE")) {          /* every texture format, once */
-        static uint32_t seen_tex;
-        if (t->format < 32 && !(seen_tex & (1u << t->format))) {
-            seen_tex |= 1u << t->format;
-            fprintf(stderr, "ppc-mac-gpu tex: format %u (0x%08x) %ux%u offset=0x%08x\n",
-                    t->format, format, t->width, t->height, offset);
-        }
-    }
-    /* POWEREMU_YUV_TRACE: what a YUV texture really holds, to tell the
-     * 4:2:2 orderings apart (Tiger's welcome movie vs Halo's logos). */
-    if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
-        static int yuv_raw_logged;
-        if (yuv_raw_logged++ < 12) {
-            uint32_t o = offset & ~0x1Fu;
-            const uint8_t *b = (o >= fb_base && o - fb_base < s->vram_size)
-                               ? (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + (o - fb_base) : NULL;
-            fprintf(stderr, "ppc-mac-gpu yuv raw: unit %d format=0x%08x fmt=%d swap=%d offset=0x%08x "
-                     "filter=0x%08x in_vram=%d size=%dx%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                     n, format, t->format, t->swap, offset, filter, b != NULL, t->width, t->height,
-                     b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0,
-                     b ? b[4] : 0, b ? b[5] : 0, b ? b[6] : 0, b ? b[7] : 0);
-        }
-    }
-    offset &= ~0x1Fu;
-    if (offset < fb_base || offset - fb_base >= s->vram_size) {
-        /*
-         * AGP/GART texture (client storage / texture range): copy the texels
-         * out of guest memory.  Level 0 only; the caller frees host_data.
-         */
-        uint64_t len = (uint64_t)t->pitch * t->height;
-        if (t->format == 12 || t->format == 14 || t->format == 15) {
-            len = (uint64_t)t->pitch * ((t->height + 3) / 4);
-        }
-        if (len == 0 || len > 16 * 1024 * 1024) {
-            t->enabled = 0;
-            return;
-        }
-        uint8_t *buf = g_malloc(len);
-        for (uint64_t done = 0; done < len;) {
-            hwaddr phys;
-            uint32_t a = offset + done;
-            uint32_t chunk = MIN(0x1000 - (a & 0xFFF), len - done);
-            uint8_t *hp = r200_agp_page(s, a);
-            if (hp) {
-                memcpy(buf + done, hp + (a & 0xFFF), chunk);
-                done += chunk;
-                continue;
-            }
-            if ((!ppc_mac_gpu_agp_translate(s, a, &phys) &&
-                 !ppc_mac_gpu_gart_translate(s, a, &phys)) ||
-                address_space_read(&address_space_memory, phys,
-                                   MEMTXATTRS_UNSPECIFIED, buf + done,
-                                   chunk) != MEMTX_OK) {
-                r200_warn_once(&r200_warned, 2, "AGP texture at 0x%08x not "
-                               "readable", offset);
-                g_free(buf);
-                t->enabled = 0;
-                return;
-            }
-            done += chunk;
-        }
-        static int agp_logged;
-        if (agp_logged++ < 3) {
-            qemu_log("ppc-mac-gpu r200: AGP texture %ux%u fmt %u at 0x%08x\n",
-                     t->width, t->height, t->format, offset);
-        }
-        /* POWEREMU_YUV_TRACE: the frame's own bytes, from the middle row,
-         * which say which 4:2:2 order a program really uses. */
-        if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
-            /* Log each new kind of frame, not just the first ones: a game
-             * plays several videos and only some come out wrong. */
-            static uint64_t last_kind;
-            static int agp_yuv_logged;
-            uint64_t kind = ((uint64_t)t->format << 40) | ((uint64_t)t->swap << 36)
-                          | ((uint64_t)t->width << 20) | ((uint64_t)t->height << 4);
-            if (kind != last_kind && agp_yuv_logged++ < 40) {
-                last_kind = kind;
-                uint64_t mid = (uint64_t)t->pitch * (t->height / 2);
-                const uint8_t *m = (mid + 16 <= len) ? buf + mid : buf;
-                fprintf(stderr, "ppc-mac-gpu yuv agp: fmt %u swap %u %ux%u pitch %u "
-                        "mid=%02x %02x %02x %02x %02x %02x %02x %02x  "
-                        "first=%02x %02x %02x %02x\n",
-                        t->format, t->swap, t->width, t->height, t->pitch,
-                        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
-                        buf[0], buf[1], buf[2], buf[3]);
-            }
-        }
-        t->host_data = buf;
-        t->offset = 0;
-        return;
-    }
-    t->offset = offset - fb_base;
-}
-
-/* TCL constant memory accessors (vector address, component). */
-static inline float r200_vf(PPCMacGPUState *s, uint32_t addr, int c)
-{
-    return r200_f32(s->regs.tcl_vec[addr & 0x7ff][c]);
-}
-
-/* 4x4 matrix N lives at vector address 0x80 + 4N, one row per vector. */
-static void r200_mat(PPCMacGPUState *s, uint32_t n, float m[4][4])
-{
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-            m[r][c] = r200_vf(s, 0x80 + 4 * (n & 0x1f) + r, c);
-        }
-    }
-}
-
-static inline void r200_xform(const float m[4][4], const float v[4], float o[4])
-{
-    for (int r = 0; r < 4; r++) {
-        o[r] = m[r][0] * v[0] + m[r][1] * v[1] + m[r][2] * v[2] + m[r][3] * v[3];
-    }
-}
-
-static inline void r200_norm3(float v[3])
-{
-    float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    if (l > 1e-20f) {
-        v[0] /= l; v[1] /= l; v[2] /= l;
-    }
-}
-
-/*
- * R200 TCL fixed-function lighting for one vertex (GL semantics).
- * p_eye/n_eye are in lighting space; col0/col1 are the vertex colours.
- * Writes the lit primary colour to out0 and secondary (specular) to out1.
- */
-static void r200_light_vertex(PPCMacGPUState *s, const float p_eye[4],
-                              const float n_in[3], const float col0[4],
-                              const float col1[4], float out0[4], float out1[4])
-{
-    uint32_t lm0 = R3D(0x2268), lm1 = R3D(0x226C);
-    float n[3] = { n_in[0], n_in[1], n_in[2] };
-    r200_norm3(n);
-
-    /* material factor sources: 0 light-premultiplied, 1 material 0,
-     * 2.. vertex colour k-2, 0xf material 1 */
-    const float one[4] = { 1, 1, 1, 1 };
-    float fac[4][4];                      /* emissive, ambient, diffuse, specular */
-    for (int k = 0; k < 4; k++) {
-        uint32_t src = (lm1 >> (4 * k)) & 0xF;
-        uint32_t mat_base = src == 0xF ? 0xB4 : 0xB0;
-        if (src == 0) {
-            memcpy(fac[k], k == 0 ? (float[4]){ 0, 0, 0, 0 } : one, sizeof(one));
-            if (k == 0) {                 /* emissive has no premultiplied form */
-                for (int c = 0; c < 4; c++) fac[k][c] = r200_vf(s, 0xB0, c);
-            }
-        } else if (src == 1 || src == 0xF) {
-            for (int c = 0; c < 4; c++) fac[k][c] = r200_vf(s, mat_base + k, c);
-        } else {
-            const float *vc = src == 2 ? col0 : col1;
-            memcpy(fac[k], vc, sizeof(float) * 4);
-        }
-    }
-
-    float acc[3], spec[3] = { 0, 0, 0 };
-    for (int c = 0; c < 3; c++) {
-        acc[c] = fac[0][c] + r200_vf(s, 0x5C, c) * fac[1][c];   /* emissive + scene ambient */
-    }
-    float v[3] = { 0, 0, 1 };
-    if (lm0 & (1u << 2)) {                                    /* LOCAL_VIEWER */
-        v[0] = -p_eye[0]; v[1] = -p_eye[1]; v[2] = -p_eye[2];
-        r200_norm3(v);
-    }
-    float shin = r200_f32(s->regs.tcl_scalar[0x100]);
-
-    for (int i = 0; i < 8; i++) {
-        uint32_t ctl = (R3D(0x2270 + 4 * (i / 2)) >> (16 * (i & 1))) & 0xFFFF;
-        if (!(ctl & 1)) {
-            continue;
-        }
-        float l[3], att = 1.0f;
-        for (int c = 0; c < 3; c++) {
-            l[c] = r200_vf(s, 0x40 + i, c);
-        }
-        if (ctl & (1u << 3)) {                                /* local light */
-            for (int c = 0; c < 3; c++) l[c] -= p_eye[c];
-            float d = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
-            r200_norm3(l);
-            /* ATTENUATION (0x50+i) is (quadratic, linear, constant, -),
-             * the order Mesa's r200 driver uses. */
-            float aq = r200_vf(s, 0x50 + i, 0), al = r200_vf(s, 0x50 + i, 1),
-                  ac = r200_vf(s, 0x50 + i, 2);
-            float den = ac + al * d + aq * d * d;
-            if (den > 1e-20f) att = 1.0f / den;
-            if (ctl & (1u << 4)) {                            /* spot light */
-                /* HWVSPOT (0x48+i) holds the direction back towards the
-                 * light, and scalar memory the exponent (0x10+i) and
-                 * cos(cutoff) (0x18+i): the hardware lights a vertex when
-                 * dot(L, dir) >= cutoff.  Signs confirmed against Apple's
-                 * driver (Chess selection spot: 0.9962, exponent 100). */
-                float sd[3] = { r200_vf(s, 0x48 + i, 0), r200_vf(s, 0x48 + i, 1),
-                                r200_vf(s, 0x48 + i, 2) };
-                r200_norm3(sd);
-                float sexp = r200_f32(s->regs.tcl_scalar[0x10 + i]);
-                float scut = r200_f32(s->regs.tcl_scalar[0x18 + i]);
-                float cosang = l[0] * sd[0] + l[1] * sd[1] + l[2] * sd[2];
-                static int spot_logged;
-                static int spotlog = -1;
-                if (spotlog < 0) {
-                    spotlog = getenv("PPCGPU_SPOTLOG") != NULL;
-                }
-                if (spotlog && spot_logged < 8) {
-                    spot_logged++;
-                    qemu_log("r200 spot: light %d ctl=%04x dir=(%.3f,%.3f,%.3f) "
-                             "exp=%.3f coscut=%.4f cosang=%.4f d=%.2f "
-                             "atten=(%g,%g,%g,%g) att=%g\n", i, ctl,
-                             sd[0], sd[1], sd[2], sexp, scut, cosang, d,
-                             r200_vf(s, 0x50 + i, 0), r200_vf(s, 0x50 + i, 1),
-                             r200_vf(s, 0x50 + i, 2), r200_vf(s, 0x50 + i, 3),
-                             att);
-                }
-                if (cosang < scut) {
-                    continue;                         /* outside the cone */
-                }
-                if (sexp > 0.0f) {
-                    att *= powf(MAX(cosang, 0.0f), sexp);
-                }
-            }
-        } else {
-            r200_norm3(l);
-        }
-        float ndl = n[0] * l[0] + n[1] * l[1] + n[2] * l[2];
-        for (int c = 0; c < 3; c++) {
-            float t = 0;
-            if (ctl & (1u << 1)) {
-                t += r200_vf(s, 0x28 + i, c) * fac[1][c];      /* ambient */
-            }
-            if (ndl > 0) {
-                t += r200_vf(s, 0x30 + i, c) * fac[2][c] * ndl;
-            }
-            acc[c] += att * t;
-        }
-        if ((ctl & (1u << 2)) && (lm0 & (1u << 5)) && ndl > 0) {  /* specular */
-            float h[3] = { l[0] + v[0], l[1] + v[1], l[2] + v[2] };
-            r200_norm3(h);
-            float ndh = n[0] * h[0] + n[1] * h[1] + n[2] * h[2];
-            if (ndh > 0) {
-                float sp = powf(ndh, shin);
-                for (int c = 0; c < 3; c++) {
-                    spec[c] += att * r200_vf(s, 0x38 + i, c) * fac[3][c] * sp;
-                }
-            }
-        }
-    }
-    bool combine = lm0 & (1u << 6);                           /* DIFFUSE_SPECULAR_COMBINE */
-    for (int c = 0; c < 3; c++) {
-        out0[c] = MIN(MAX(acc[c] + (combine ? spec[c] : 0), 0.0f), 1.0f);
-        out1[c] = combine ? 0.0f : MIN(MAX(spec[c], 0.0f), 1.0f);
-    }
-    out0[3] = MIN(MAX(fac[2][3], 0.0f), 1.0f);                /* diffuse alpha */
-    out1[3] = 0.0f;
-}
-
-
-/* Fill the current 3D depth buffer with RB3D_DEPTHCLEARVALUE (see the
- * 3D_CLEAR_ZMASK handler). */
-static void r200_clear_depth_buffer(PPCMacGPUState *s)
-{
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t base = R3D(0x1C24) & ~0xFu;
-    uint32_t pitch_px = R3D(0x1C28) & 0x1FF8;
-    uint32_t zfmt = R3D(0x1C2C) & 0xF;
-    uint32_t bpp = zfmt == 0 ? 2 : 4;
-    uint32_t h = ((R3D(0x1C44) >> 16) & 0x7FF) + 1;
-    /* Apple's driver never programs RB3D_DEPTHCLEARVALUE; it resets to all
-     * ones (reset handler), i.e. far depth - what cleared tiles must read as
-     * for Warcraft III's LEQUAL test to pass on real hardware.  Keep the
-     * stencil byte clear for Z24S8. */
-    uint32_t value = R3D(0x3230);
-    if (value == 0xFFFFFFFFu && zfmt != 0) {
-        value = 0x00FFFFFFu;
-    }
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-
-    if (base < fb_base || pitch_px == 0) {
-        return;
-    }
-    uint64_t off = base - fb_base, pitch = (uint64_t)pitch_px * bpp;
-    if (off + pitch * h > s->vram_size) {
-        h = (s->vram_size - off) / pitch;
-    }
-    r200_vram_access(s, R200_ROWS(off, pitch, 0, h), true, 5);
-    for (uint32_t y = 0; y < h; y++) {
-        uint8_t *row = vram + off + y * pitch;
-        for (uint32_t x = 0; x < pitch_px; x++) {
-            if (bpp == 2) {
-                stw_be_p(row + 2 * x, value);
-            } else {
-                stl_be_p(row + 4 * x, value);
-            }
-        }
-    }
-}
-
-/* Vertex sources for ppc_mac_gpu_r200_draw(). */
-enum { R200_SRC_VBUF, R200_SRC_INDX, R200_SRC_IMMD };
-
-/*
- * Handle one R200 draw packet: 3D_DRAW_VBUF_2 (vertices from the AOS
- * arrays, in order), 3D_DRAW_INDX_2 (AOS arrays, 16-bit indices inline
- * after vf_cntl) or 3D_DRAW_IMMD_2 (vertices inline after vf_cntl, packed
- * per SE_VTX_FMT_0/1).  d[0] is vf_cntl; ndw counts d[].  Returns true if
- * handled — including draws deliberately skipped — so the legacy path never
- * runs in direct mode.
- */
-/*
- * The draw itself. Runs on the vCPU thread, or on the draw worker against a
- * snapshot -- it cannot tell which, and must not care: everything it reads
- * comes through `s`, which is the snapshot when a worker is running it.
- */
-static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
-                                  uint32_t ndw, int src)
-{
-    if (!r200_direct_enabled() || !s->renderer || !s->renderer->draw_r200) {
-        return false;
-    }
-
-    uint32_t vf_cntl = d[0];
-    uint32_t prim = vf_cntl & 0xF;
-    uint32_t nverts = vf_cntl >> 16;
-    if (nverts == 0) {
-        return true;
-    }
-    if (nverts > 16384) {
-        r200_warn_once(&r200_warned, 8, "draw with %u vertices skipped", nverts);
-        return true;
-    }
-
-    /* ---- Vertex attribute layout (SE_VTX_FMT_0/1) ---- */
-    uint32_t fmt0 = R3D(0x2088), fmt1 = R3D(0x208C);
-    enum { A_POS, A_NORMAL, A_COLOR0, A_COLOR1, A_SKIP, A_TEX0 };
-    int attr_kind[20], attr_extra[20], attr_comps[20], nattr = 0;
-    /*
-     * The chip's own slot number for each attribute (0 position, 1 blend
-     * weights, 2 normal, 3 fog, 4-7 colours, 8-13 texture coordinates).
-     * A vertex program reads its inputs by slot, including the ones the
-     * fixed-function path throws away, so every attribute is kept.
-     */
-    int attr_slot[20];
-#define ADD_ATTR(k, e, c, sl) do { attr_kind[nattr] = (k); attr_extra[nattr] = (e); \
-                                   attr_slot[nattr] = (sl); \
-                                   attr_comps[nattr++] = (c); } while (0)
-    ADD_ATTR(A_POS, 0, 2 + (fmt0 & 1) + ((fmt0 >> 1) & 1), 0);
-    if ((fmt0 >> 2) & 7) {
-        ADD_ATTR(A_SKIP, 0, (fmt0 >> 2) & 7, 1);       /* blend weights */
-    }
-    if (fmt0 & (1u << 6)) {
-        ADD_ATTR(A_NORMAL, 0, 3, 2);
-    }
-    if (fmt0 & (1u << 7)) {
-        ADD_ATTR(A_SKIP, 0, 1, 15);                    /* point size */
-    }
-    if (fmt0 & (1u << 8)) {
-        /* Fog, one float, in the stream between the normal and the
-         * colours. It was missing here, and a vertex that carries it
-         * shifted every attribute after it by one word. */
-        ADD_ATTR(A_SKIP, 0, 1, 3);
-    }
-    /*
-     * Colours.  The first two are the primary and the secondary; the rest
-     * are consumed but unused, while still being handed to a vertex
-     * program by their own slot number.
-     */
-    int colours_seen = 0;
-    for (int c = 0; c < 8; c++) {
-        uint32_t cf = (fmt0 >> (11 + 2 * c)) & 3;
-        if (cf) {
-            int kind = colours_seen == 0 ? A_COLOR0 : colours_seen == 1 ? A_COLOR1 : A_SKIP;
-            colours_seen++;
-            ADD_ATTR(kind, cf, cf == 1 ? 1 : cf == 2 ? 3 : 4, 4 + c);
-        }
-    }
-    for (int t = 0; t < R200_MAX_TEX; t++) {
-        uint32_t n = (fmt1 >> (3 * t)) & 7;
-        if (n) {
-            ADD_ATTR(A_TEX0 + t, 0, n, 8 + t);
-        }
-    }
-#undef ADD_ATTR
-    uint32_t vtx_dw = 0;
-    for (int a = 0; a < nattr; a++) {
-        vtx_dw += attr_comps[a];
-    }
-
-    /* ---- Where each attribute comes from ---- */
-    uint32_t arr_addr[16] = { 0 }, arr_stride[16] = { 0 }, arr_count[16] = { 0 };
-    uint32_t narrays = 0;
-    const uint32_t *inl = d + 1;          /* IMMD vertices / INDX indices */
-    uint32_t inl_dw = ndw - 1;
-    if (src == R200_SRC_IMMD) {
-        static int immd_dumps;
-        if (immd_dumps++ < 6) {
-            GString *g = g_string_new(NULL);
-            for (uint32_t i = 0; i < ndw && i < 40; i++) {
-                g_string_append_printf(g, " %08x", d[i]);
-            }
-            qemu_log("r200 IMMD_2 fmt0=%08x fmt1=%08x vte=%08x vap=%08x vtx_dw=%u "
-                     "raw:%s\n", fmt0, fmt1, R3D(0x20B0), R3D(0x2080), vtx_dw, g->str);
-            g_string_free(g, TRUE);
-        }
-        if (inl_dw < nverts * vtx_dw) {
-            r200_warn_once(&r200_warned, 32, "IMMD_2 short: %u dwords for %u "
-                           "vertices of %u", inl_dw, nverts, vtx_dw);
-            return true;
-        }
-    } else {
-        /*
-         * AOS arrays: (count | stride<<8) halves at 0x20C4 + 12*k.  The
-         * arrays are one stream: array k supplies `count` dwords per vertex,
-         * in order, and SE_VTX_FMT consumes the stream attribute by
-         * attribute - so one interleaved array can carry position, colour
-         * and texcoords (Warcraft III's text does).  Mapping array k to
-         * attribute k dropped every attribute past the arrays' number.
-         */
-        narrays = MIN(R3D(0x20C0) & 0x1F, 16u);
-        uint32_t stream_dw = 0;
-        for (uint32_t a = 0; a < narrays; a++) {
-            uint32_t attr = R3D(0x20C4 + (a / 2) * 12);
-            uint32_t half = (a & 1) ? attr >> 16 : attr & 0xFFFF;
-            arr_count[a] = half & 0xFF;
-            arr_stride[a] = (half >> 8) & 0xFF;
-            arr_addr[a] = R3D(0x20C8 + (a / 2) * 12 + (a & 1) * 4);
-            stream_dw += arr_count[a];
-        }
-        if (stream_dw != vtx_dw) {
-            r200_warn_once(&r200_warned, 32, "AOS arrays give %u dwords per "
-                           "vertex, format wants %u (fmt0=0x%x fmt1=0x%x)",
-                           stream_dw, vtx_dw, fmt0, fmt1);
-        }
-        if (src == R200_SRC_INDX && inl_dw < (nverts + 1) / 2) {
-            r200_warn_once(&r200_warned, 32, "INDX_2 short: %u index dwords "
-                           "for %u indices", inl_dw, nverts);
-            return true;
-        }
-    }
-
-    /* ---- Transform state ---- */
-    uint32_t vap = R3D(0x2080);                     /* SE_VAP_CNTL */
-    bool tcl = vap & 1;
-    /*
-     * Bit 2 puts the chip in vertex-program mode: each vertex is
-     * transformed by a program the guest uploaded, not by the matrices and
-     * lights below -- which share the same memory, so they hold program
-     * instructions now and must not be read.  The programs themselves are
-     * not run yet, so such a draw is skipped rather than drawn wrongly.
-     */
-    bool vertex_program = (vap & 4) != 0;
-    if (vertex_program) {
-        static uint32_t last_cntl[2];
-        uint32_t c1 = R3D(0x22D0), c2 = R3D(0x22D4);
-        if ((c1 != last_cntl[0] || c2 != last_cntl[1]) && getenv("POWEREMU_VP_TRACE")) {
-            uint32_t first = c1 & 0x3FF, last = (c1 >> 20) & 0x3FF;
-            last_cntl[0] = c1; last_cntl[1] = c2;
-            fprintf(stderr, "ppc-mac-gpu vp inputs: fmt0=0x%08x fmt1=0x%08x arrays=%u "
-                    "route=%08x %08x %08x %08x vte=0x%08x\n",
-                    R3D(0x2088), R3D(0x208C), narrays,
-                    R3D(0x2254), R3D(0x2258), R3D(0x225C), R3D(0x2260), R3D(0x20B0));
-            for (int a = 0; a < nattr; a++) {
-                fprintf(stderr, "    attribute %d: slot %2d, %d words\n",
-                        a, attr_slot[a], attr_comps[a]);
-            }
-            fprintf(stderr, "ppc-mac-gpu vp program: vap=0x%08x instructions %u..%u "
-                    "(position settled at %u), constants from %u, up to %u\n", vap,
-                    first, last, (c1 >> 10) & 0x3FF, c2 & 0xFF, (c2 >> 16) & 0xFF);
-            for (uint32_t i = first; i <= last && i < 128; i++) {
-                const uint32_t *w = s->regs.tcl_vec[ppc_mac_gpu_vp_inst_addr(i)];
-                PPCMacGPUVPInst in;
-                char text[128];
-                ppc_mac_gpu_vp_decode(w, &in);
-                ppc_mac_gpu_vp_disasm(&in, text, sizeof(text));
-                fprintf(stderr, "  %3u: %08x %08x %08x %08x  %s\n",
-                        i, w[0], w[1], w[2], w[3], text);
-            }
-        }
-    }
-    uint32_t mvp_n = R3D(0x2238) & 0x1F;            /* MODELPROJECT_0 */
-    float mvp[4][4];
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-            mvp[r][c] = vertex_program ? (r == c ? 1.0f : 0.0f)
-                : r200_f32(s->regs.tcl_vec[(0x80 + 4 * mvp_n + r) & 0x7ff][c]);
-        }
-    }
-    bool lighting = tcl && !vertex_program && (R3D(0x2268) & 1);
-    uint32_t tcl_fog = tcl ? (R3D(0x22C0) >> 8) & 3 : 0;
-    uint32_t texproc0 = tcl ? R3D(0x22B0) : 0, texproc1 = R3D(0x22B4);
-    float mv[4][4], itmv[4][4], texmat[R200_MAX_TEX][4][4];
-    r200_mat(s, R3D(0x2230) & 0x1F, mv);                /* MODELVIEW_0 */
-    r200_mat(s, R3D(0x2234) & 0x1F, itmv);              /* IT_MODELVIEW_0 */
-    for (int t = 0; t < R200_MAX_TEX; t++) {
-        uint32_t sel = t < 4 ? R3D(0x223C) >> (8 * t) : R3D(0x2240) >> (8 * (t - 4));
-        r200_mat(s, sel & 0x1F, texmat[t]);
-    }
-    if (lighting && (R3D(0x2270) | R3D(0x2274) | R3D(0x2278) | R3D(0x227C)) &
-        0x00300030u) {
-        r200_warn_once(&r200_warned, 128, "spot lights not modelled");
-    }
-    uint32_t vte = R3D(0x20B0);
-    float vp[6];
-    for (int i = 0; i < 6; i++) {
-        vp[i] = r200_f32(R3D(0x1D98 + 4 * i));
-    }
-    float pix_bias = (R3D(0x1C4C) & (1u << 27)) ? 0.0f : 0.5f;  /* D3D centres */
-
-    /*
-     * Resolve each vertex array to a host pointer once for the whole draw.
-     *
-     * r200_read_dwords() was called per vertex per array, and each call
-     * re-derived the framebuffer base from a register, bounds-checked, then
-     * copied into a stack buffer only to byte-swap out of it again -- two
-     * passes over every vertex. Between them the fetch and that copying were
-     * most of a 13.8% cluster in the profile.
-     *
-     * Arrays that live in VRAM, which is nearly all of them, are read
-     * straight from the host pointer with the swap done in place. Anything
-     * else -- AGP, GART, an array that runs off the end -- still goes through
-     * r200_read_dwords, which stays the one place that knows how to find
-     * memory that is not simply there.
-     */
-    uint8_t *const vram_host = memory_region_get_ram_ptr(&s->vram);
-    const uint32_t arr_fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t arr_off[16];
-    bool arr_fast[16];
-    for (uint32_t a = 0; a < narrays && a < 16; a++) {
-        arr_fast[a] = vram_host && arr_addr[a] >= arr_fb_base;
-        arr_off[a] = arr_fast[a] ? arr_addr[a] - arr_fb_base : 0;
-    }
-
-    /*
-     * Where each attribute starts in the gathered stream, when there is one
-     * array per attribute. This is a property of the draw, not of the
-     * vertex, but it used to be recomputed inside the vertex loop with an
-     * inner loop over the preceding attributes -- O(attributes squared) per
-     * vertex, for an answer that never changed.
-     */
-    /*
-     * An attribute the vertex declares but does not stream must not eat an
-     * array.
-     *
-     * With one array per attribute, the arrays line up with the attributes
-     * in order.  Mac OS X 10.5's compositor declares fog in SE_VTX_FMT_0 --
-     * a single float between the position and the colours -- but supplies
-     * only two arrays, position and colour: the fog comes from a register,
-     * not from the vertex.  Lining those up naively gave the fog the
-     * colour's array and left the colour with none, so every vertex kept
-     * whatever colour the previous draw had left.  For the Dock, whose
-     * colour comes straight from the vertex, that was a red slab.
-     *
-     * Only the attributes that contribute nothing to the result are
-     * dropped, last first, and only enough of them to make the counts
-     * agree -- so a vertex that really does stream its fog is untouched.
-     */
-    if (src != R200_SRC_IMMD && narrays > 0 && narrays < (uint32_t)nattr) {
-        for (int a = nattr - 1; a >= 0 && narrays < (uint32_t)nattr; a--) {
-            if (attr_kind[a] != A_SKIP) {
-                continue;
-            }
-            for (int k = a; k < nattr - 1; k++) {
-                attr_kind[k] = attr_kind[k + 1];
-                attr_extra[k] = attr_extra[k + 1];
-                attr_comps[k] = attr_comps[k + 1];
-                attr_slot[k] = attr_slot[k + 1];
-            }
-            nattr--;
-        }
-    }
-
-    /*
-     * The arrays say how wide each attribute really is.
-     *
-     * SE_VTX_FMT_0 says what kind of thing each attribute is; the array's
-     * own count says how many dwords of it the vertex carries.  They can
-     * disagree, and when they do the array is right -- it is what was
-     * actually written.  Mac OS X 10.5's compositor declares its colour as
-     * four floats and then streams it as one dword of packed bytes; read
-     * as four floats that gave an impossible colour and swallowed the two
-     * texture coordinates that followed it, which is why the Dock arrived
-     * as a red slab with 0xffffffff and 0xcccccccc -- opaque white and
-     * translucent grey, perfectly ordinary colours -- in the red channel.
-     *
-     * Only narrowing is honoured, and only per attribute: an array that
-     * carries more than the format asks for is left alone, since the extra
-     * words belong to whatever comes next.
-     */
-    if (narrays == (uint32_t)nattr) {
-        for (int a = 0; a < nattr; a++) {
-            uint32_t have = arr_count[a];
-            if (!have || (int)have >= attr_comps[a]) {
-                continue;
-            }
-            if ((attr_kind[a] == A_COLOR0 || attr_kind[a] == A_COLOR1 ||
-                 attr_kind[a] == A_SKIP) && have == 1) {
-                attr_extra[a] = 1;            /* packed, 0xAARRGGBB */
-            }
-            attr_comps[a] = have;
-        }
-        vtx_dw = 0;
-        for (int a = 0; a < nattr; a++) {
-            vtx_dw += attr_comps[a];
-        }
-    }
-
-    uint32_t attr_start[20];          /* matches attr_comps[] above */
-    if (narrays == (uint32_t)nattr) {
-        /*
-         * Only in this case, and only over the arrays that exist: arr_count
-         * is filled per array, so summing it across all attributes would
-         * read past what was initialised whenever the two counts differ.
-         * The original inner loop was safe for the same reason -- it ran
-         * only on this branch -- and hoisting it has to keep that.
-         */
-        uint32_t acc = 0;
-        for (int a = 0; a < nattr; a++) {
-            attr_start[a] = acc;
-            acc += arr_count[a];
-        }
-    }
-
-    /*
-     * A vertex program, if one is in charge: decoded once for the draw,
-     * with the constants it reads.  Which input register sees which
-     * attribute slot is fixed in the hardware.
-     */
-    /* Decoded once and kept: the same program runs for draw after draw. */
-    static PPCMacGPUVPInst vp_prog[PPC_MAC_GPU_VP_MAX_INST];
-    static uint32_t vp_decoded_for[2];
-    static uint32_t vp_decoded_head[4];
-    static float vp_consts[PPC_MAC_GPU_VP_CONSTS][4];
-    uint32_t vp_count = 0;
-    /*
-     * Which program input each vertex slot feeds.  Fixed in the hardware
-     * for the named attributes; the colour slots carry a program's own
-     * attributes (Halo keeps bone indices and weights there) and which
-     * input each lands in is the driver's business, not the format's.
-     * PPCGPU_VP_MAP picks between the orders while that is settled:
-     * 0 (default) 2,3,4,5 -- what the Linux driver documents
-     * 1           4,5,2,3      2  5,4,2,3      3  3,2,5,4
-     */
-    int vp_slot_to_input[16] = {
-        /* 0 pos */ 0, /* 1 weights */ 12, /* 2 normal */ 1, /* 3 fog */ 15,
-        /* 4-7 colours */ 2, 3, 4, 5,
-        /* 8-13 texture coordinates */ 6, 7, 8, 9, 10, 11,
-        /* 14 second position */ 13, /* 15 point size */ 14,
-    };
-    /*
-     * The colour slots carry a program's own attributes, and which input
-     * each lands in depends on how many the draw declares -- the driver
-     * does not use one fixed arrangement.  Measured in Halo: the last two
-     * colour slots always feed inputs 2 and 3 (its bone indices and
-     * weights), and any earlier slots feed 5 and 4, highest first.  With
-     * two slots that is the plain 2, 3 its interface draws want.
-     * PPCGPU_VP_MAP=0 goes back to the plain order throughout.
-     */
-    {
-        int colour_slot[4], ncolour = 0;
-        for (int c = 0; c < 4; c++) {
-            if ((fmt0 >> (11 + 2 * c)) & 3) {
-                colour_slot[ncolour++] = 4 + c;
-            }
-        }
-        const char *e = getenv("PPCGPU_VP_MAP");
-        /* 0 plain, 1 highest slot first, 2 lowest first -- 2 is what makes
-         * Halo's sky come out right, and is the default. */
-        int mode = e ? atoi(e) : 2;
-        if (mode && ncolour >= 2) {
-            for (int i = 0; i < ncolour - 2; i++) {
-                /* The slots left over after the last two carry the normal
-                 * and the texture coordinates; which is which is the one
-                 * thing the draw doesn't say, so it can be swapped here. */
-                vp_slot_to_input[colour_slot[i]] = mode == 1 ? 5 - i : 4 + i;
-            }
-            vp_slot_to_input[colour_slot[ncolour - 2]] = 2;
-            vp_slot_to_input[colour_slot[ncolour - 1]] = 3;
-        }
-    }
-    if (vertex_program && !gpu_vp_disabled()) {
-        uint32_t c1 = R3D(0x22D0), c2 = R3D(0x22D4);
-        uint32_t first = c1 & 0x3FF, last = (c1 >> 20) & 0x3FF;
-        uint32_t cbase = c2 & 0xFF;
-        if (last >= first && last < PPC_MAC_GPU_VP_MAX_INST) {
-            const uint32_t *head = s->regs.tcl_vec[ppc_mac_gpu_vp_inst_addr(first)];
-            vp_count = last - first + 1;
-            if (vp_decoded_for[0] != c1 || vp_decoded_for[1] != first ||
-                memcmp(vp_decoded_head, head, sizeof(vp_decoded_head)) != 0) {
-                for (uint32_t i = 0; i < vp_count; i++) {
-                    ppc_mac_gpu_vp_decode(s->regs.tcl_vec[ppc_mac_gpu_vp_inst_addr(first + i)],
-                                          &vp_prog[i]);
-                }
-                vp_decoded_for[0] = c1;
-                vp_decoded_for[1] = first;
-                memcpy(vp_decoded_head, head, sizeof(vp_decoded_head));
-            }
-        }
-        for (uint32_t i = 0; i < PPC_MAC_GPU_VP_CONSTS; i++) {
-            const uint32_t *v = s->regs.tcl_vec[ppc_mac_gpu_vp_const_addr(cbase + i) & 0x7ff];
-            for (int c = 0; c < 4; c++) {
-                vp_consts[i][c] = r200_f32(v[c]);
-            }
-        }
-    }
-
-    s->regs.stall_draws++;
-
-    /* ---- Fetch and transform vertices ---- */
-    R200Vertex *verts = r200_draw_verts(s, nverts);
-    memset(verts, 0, sizeof(R200Vertex) * nverts);
-    for (uint32_t v = 0; v < nverts; v++) {
-        R200Vertex *o = &verts[v];
-        float pos[4] = { 0, 0, 0, 1 };
-        float nrm[3] = { 0, 0, 1 };
-        /* What a vertex program would read: every attribute, by slot. */
-        float slot[16][4];
-        if (vp_count) {
-            for (int i = 0; i < 16; i++) {
-                slot[i][0] = slot[i][1] = slot[i][2] = 0.0f;
-                slot[i][3] = 1.0f;
-            }
-        }
-        o->color[0] = o->color[1] = o->color[2] = o->color[3] = 1.0f;
-        for (int t = 0; t < R200_MAX_TEX; t++) {
-            o->tex[t][3] = 1.0f;
-        }
-        /* element index: sequential, or from the inline 16-bit index list */
-        uint32_t e = v;
-        if (src == R200_SRC_INDX) {
-            uint32_t w = inl[v / 2];
-            e = (v & 1) ? w >> 16 : w & 0xFFFF;
-        }
-        const uint32_t *iv = inl + (size_t)v * vtx_dw;   /* IMMD cursor */
-        uint32_t stream[64], sn = 0;
-        if (src != R200_SRC_IMMD) {
-            /* gather this vertex's dwords from every array, in order */
-            for (uint32_t a = 0; a < narrays; a++) {
-                uint32_t n = MIN(arr_count[a], 64u - sn);
-                uint32_t off;
-
-                if (!n) {
-                    continue;
-                }
-                /*
-                 * The bounds test is per access rather than per draw because
-                 * an indexed draw picks its element from the index list and
-                 * the range it will touch is not known in advance.
-                 */
-                off = arr_off[a] + e * arr_stride[a] * 4;
-                if (a < 16 && arr_fast[a] &&
-                    (uint64_t)off + (uint64_t)n * 4 <= s->vram_size) {
-                    const uint8_t *p = vram_host + off;
-                    for (uint32_t i = 0; i < n; i++) {
-                        stream[sn + i] = ldl_be_p(p + i * 4);
-                    }
-                    /*
-                     * PPCGPU_VERIFY_FETCH=1 runs the old path as well and
-                     * reports any disagreement. Wrong vertex data does not
-                     * crash; it draws something slightly wrong, which is far
-                     * harder to attribute later than a loud complaint now.
-                     */
-                    if (unlikely(gpu_verify_fetch())) {
-                        uint32_t ref[64];
-                        if (r200_read_dwords(s, arr_addr[a] +
-                                             e * arr_stride[a] * 4, ref, n) &&
-                            memcmp(ref, stream + sn, n * 4) != 0) {
-                            r200_warn_once(&r200_warned, 512,
-                                           "fast vertex fetch differs at "
-                                           "0x%08x", arr_addr[a]);
-                        }
-                    }
-                } else if (!r200_read_dwords(s,
-                                             arr_addr[a] + e * arr_stride[a] * 4,
-                                             stream + sn, n)) {
-                    r200_warn_once(&r200_warned, 256,
-                                   "vertex fetch failed at 0x%08x", arr_addr[a]);
-                    return true;
-                }
-                sn += n;
-            }
-            iv = stream;
-        }
-        for (int a = 0; a < nattr; a++) {
-            /*
-             * Deliberately not zero-initialised: that zeroed all 64 bytes
-             * for every attribute of every vertex, which is the hottest
-             * memset in the device model. Only what can be read is cleared.
-             *
-             * "What can be read" is not simply [0, n): the packed-colour
-             * path below reads raw[0] unconditionally, so the first four
-             * words must be defined even when n is smaller. Getting that
-             * wrong gives colours built from stack garbage.
-             */
-            uint32_t raw[16];
-            const uint32_t raw_used = 4;       /* raw[0..3]: see above */
-            uint32_t n = MIN((uint32_t)attr_comps[a], 16u);
-            if (src == R200_SRC_IMMD) {
-                r200_fetch_words(raw, iv, n, MAX(n, raw_used));
-                iv += n;
-            } else {
-                uint32_t have;
-                if (narrays == (uint32_t)nattr) {
-                    /* one array per attribute: the array's count wins */
-                    iv = stream + MIN(attr_start[a], sn);
-                    have = MIN(n, arr_count[a]);
-                } else {
-                    uint32_t used = iv - stream;
-                    have = used < sn ? MIN(n, sn - used) : 0;
-                }
-                r200_fetch_words(raw, iv, have, MAX(n, raw_used));
-                if (have < n && attr_kind[a] == A_POS && n == 4 && have == 3) {
-                    raw[3] = 0x3F800000;          /* short array: w = 1 */
-                }
-                iv += have;
-            }
-            if (vp_count) {
-                int sl = attr_slot[a] & 15;
-                uint32_t have = MIN(n, 4u);
-                for (uint32_t i = 0; i < have; i++) {
-                    slot[sl][i] = r200_f32(raw[i]);
-                }
-                /* A packed colour is four bytes, not four floats. */
-                if ((attr_kind[a] == A_COLOR0 || attr_kind[a] == A_COLOR1 ||
-                     attr_kind[a] == A_SKIP) && attr_extra[a] == 1 && sl >= 4 && sl <= 7) {
-                    uint32_t c = raw[0];
-                    slot[sl][0] = ((c >> 16) & 0xFF) / 255.0f;
-                    slot[sl][1] = ((c >> 8) & 0xFF) / 255.0f;
-                    slot[sl][2] = (c & 0xFF) / 255.0f;
-                    slot[sl][3] = (c >> 24) / 255.0f;
-                }
-            }
-            switch (attr_kind[a]) {
-            case A_POS:
-                for (uint32_t i = 0; i < n && i < 4; i++) {
-                    pos[i] = r200_f32(raw[i]);
-                }
-                break;
-            case A_NORMAL:
-                for (uint32_t i = 0; i < n && i < 3; i++) {
-                    nrm[i] = r200_f32(raw[i]);
-                }
-                break;
-            case A_SKIP:
-                break;
-            case A_COLOR0:
-            case A_COLOR1: {
-                float *dstc = attr_kind[a] == A_COLOR0 ? o->color : o->spec;
-                if (attr_extra[a] == 1) {           /* packed, 0xAARRGGBB */
-                    dstc[0] = ((raw[0] >> 16) & 0xFF) / 255.0f;
-                    dstc[1] = ((raw[0] >> 8) & 0xFF) / 255.0f;
-                    dstc[2] = (raw[0] & 0xFF) / 255.0f;
-                    dstc[3] = (raw[0] >> 24) / 255.0f;
-                } else {
-                    for (uint32_t i = 0; i < n && i < 4; i++) {
-                        dstc[i] = r200_f32(raw[i]);
-                    }
-                }
-                break;
-            }
-            default: {
-                int t = attr_kind[a] - A_TEX0;
-                for (uint32_t i = 0; i < n && i < 4; i++) {
-                    o->tex[t][i] = r200_f32(raw[i]);
-                }
-                if (n == 3) {            /* s,t,q */
-                    o->tex[t][3] = o->tex[t][2];
-                    o->tex[t][2] = 0;
-                }
-                break;
-            }
-            }
-        }
-
-        if (fmt1 == 0 && v < 4) {
-            static int dump_draws;
-            if (dump_draws < 6) {
-                uint32_t raw[16];
-                qemu_log("r200 vtxdump fmt0=0x%x v%u:", fmt0, v);
-                for (int a = 0; a < nattr && a < 4 && src != R200_SRC_IMMD; a++) {
-                    if (r200_read_dwords(s, arr_addr[a] + v * arr_stride[a] * 4,
-                                         raw, MIN((uint32_t)attr_comps[a], 16u))) {
-                        for (int i = 0; i < attr_comps[a] && i < 8; i++) {
-                            qemu_log(" %08x", raw[i]);
-                        }
-                        qemu_log(" |");
-                    }
-                }
-                qemu_log("\n");
-                if (v == 3) {
-                    dump_draws++;
-                }
-            }
-        }
-
-        float clip[4];
-        if (vp_count) {
-            PPCMacGPUVPState st;
-            memset(st.temp, 0, sizeof(st.temp));
-            memset(st.out_pos, 0, sizeof(st.out_pos));
-            memset(st.out_color0, 0, sizeof(st.out_color0));
-            memset(st.out_color1, 0, sizeof(st.out_color1));
-            memset(st.out_tex, 0, sizeof(st.out_tex));
-            memset(st.out_fog, 0, sizeof(st.out_fog));
-            memset(st.out_psize, 0, sizeof(st.out_psize));
-            st.constant = (const float (*)[4])vp_consts;
-            st.wrote_pos = false;
-            st.unknown_op = 0;
-            for (int i = 0; i < 16; i++) {
-                memcpy(st.in[vp_slot_to_input[i]], slot[i], sizeof(slot[i]));
-            }
-            st.out_color0[3] = st.out_color1[3] = 1.0f;
-            for (int t = 0; t < 6; t++) {
-                st.out_tex[t][3] = 1.0f;
-            }
-            ppc_mac_gpu_vp_run(&st, vp_prog, vp_count);
-            if (getenv("POWEREMU_VP_TRACE")) {
-                static int shown; static uint32_t shown_for;
-                if (vp_count != shown_for) { shown_for = vp_count; shown = 0; }
-                if (shown++ < 3) {
-                    fprintf(stderr, "ppc-mac-gpu vp vertex (%u instructions):\n"
-                            "   v0=%.3f %.3f %.3f %.3f\n"
-                            "   v2=%.3f %.3f %.3f %.3f\n"
-                            "   v3=%.3f %.3f %.3f %.3f\n"
-                            "   v4=%.3f %.3f %.3f %.3f\n"
-                            "   v5=%.3f %.3f %.3f %.3f\n"
-                            "   c5=%.3f %.3f %.3f %.3f  c9=%.3f %.3f %.3f %.3f\n"
-                            "   -> pos=%.3f %.3f %.3f %.3f\n",
-                            vp_count,
-                            st.in[0][0], st.in[0][1], st.in[0][2], st.in[0][3],
-                            st.in[2][0], st.in[2][1], st.in[2][2], st.in[2][3],
-                            st.in[3][0], st.in[3][1], st.in[3][2], st.in[3][3],
-                            st.in[4][0], st.in[4][1], st.in[4][2], st.in[4][3],
-                            st.in[5][0], st.in[5][1], st.in[5][2], st.in[5][3],
-                            vp_consts[5][0], vp_consts[5][1], vp_consts[5][2], vp_consts[5][3],
-                            vp_consts[9][0], vp_consts[9][1], vp_consts[9][2], vp_consts[9][3],
-                            st.out_pos[0], st.out_pos[1], st.out_pos[2], st.out_pos[3]);
-                }
-            }
-            memcpy(clip, st.out_pos, sizeof(clip));
-            memcpy(o->color, st.out_color0, sizeof(o->color));
-            memcpy(o->spec, st.out_color1, sizeof(o->spec));
-            for (int t = 0; t < R200_MAX_TEX && t < 6; t++) {
-                memcpy(o->tex[t], st.out_tex[t], sizeof(o->tex[t]));
-            }
-            if (st.unknown_op) {
-                r200_warn_once(&r200_warned, 1024,
-                               "vertex program opcode %u not modelled",
-                               st.unknown_op);
-            }
-        } else if (tcl) {
-            for (int r = 0; r < 4; r++) {
-                clip[r] = mvp[r][0] * pos[0] + mvp[r][1] * pos[1] +
-                          mvp[r][2] * pos[2] + mvp[r][3] * pos[3];
-            }
-            if (lighting || texproc0 || tcl_fog) {
-                float p_eye[4], n_eye[4], n4[4] = { nrm[0], nrm[1], nrm[2], 0 };
-                if (R3D(0x2268) & (1u << 1)) {         /* LIGHT_IN_MODELSPACE */
-                    memcpy(p_eye, pos, sizeof(p_eye));
-                    memcpy(n_eye, n4, sizeof(n_eye));
-                } else {
-                    r200_xform(mv, pos, p_eye);
-                    r200_xform(itmv, n4, n_eye);
-                }
-                if (lighting) {
-                    float c0[4], c1[4];
-                    memcpy(c0, o->color, sizeof(c0));
-                    memcpy(c1, o->spec, sizeof(c1));
-                    r200_light_vertex(s, p_eye, n_eye, c0, c1, o->color, o->spec);
-                }
-                if (tcl_fog) {
-                    /* Fog parameters, vector 0x5D = (-, c, d, -) as Mesa's
-                     * r200 lays them out (FOG_C/FOG_D follow a pad word):
-                     * linear f = c + d*z with c = end/(end-start),
-                     * d = -1/(end-start); exp f = e^(d*z); exp2 f = e^(d*z^2).
-                     * Components 0/1 used to be read, which fully fogged
-                     * anything near z = 0 - Warcraft III's UI came out black. */
-                    float z = (R3D(0x22C0) & (1u << 10))
-                        ? sqrtf(p_eye[0] * p_eye[0] + p_eye[1] * p_eye[1] +
-                                p_eye[2] * p_eye[2])
-                        : fabsf(p_eye[2]);
-                    float fc = r200_vf(s, 0x5D, 1), fd = r200_vf(s, 0x5D, 2);
-                    float f = tcl_fog == 3 ? fc + fd * z
-                            : tcl_fog == 1 ? expf(fd * z) : expf(fd * z * z);
-                    o->spec[3] = MIN(MAX(f, 0.0f), 1.0f);
-                }
-                for (int t = 0; t < R200_MAX_TEX; t++) {
-                    if (!(texproc0 & ((1u << t) | (0x100u << t)))) {
-                        continue;
-                    }
-                    float in[4];
-                    uint32_t src_sel = (texproc1 >> (4 * t)) & 0xF;
-                    switch (src_sel) {
-                    case 8:  memcpy(in, pos, sizeof(in)); break;     /* object */
-                    case 9:  memcpy(in, p_eye, sizeof(in)); break;   /* eye */
-                    case 10: memcpy(in, n_eye, sizeof(in)); in[3] = 1; break;
-                    default:
-                        memcpy(in, o->tex[src_sel < R200_MAX_TEX ? src_sel : t],
-                               sizeof(in));
-                        break;
-                    }
-                    if (texproc0 & (0x100u << t)) {          /* TEXMAT_t */
-                        r200_xform(texmat[t], in, o->tex[t]);
-                    } else {
-                        memcpy(o->tex[t], in, sizeof(in));
-                    }
-                }
-            }
-        } else {
-            memcpy(clip, pos, sizeof(clip));
-        }
-        float w = clip[3] != 0.0f ? clip[3] : 1.0f;
-        float x = clip[0], y = clip[1], z = clip[2];
-        if (!(vte & (1u << 8))) {        /* VTX_XY_FMT clear: divide by w */
-            x /= w;
-            y /= w;
-        }
-        if (!(vte & (1u << 9))) {
-            z /= w;
-        }
-        if (vte & 0x01) x *= vp[0];
-        if (vte & 0x02) x += vp[1];
-        if (vte & 0x04) y *= vp[2];
-        if (vte & 0x08) y += vp[3];
-        if (vte & 0x10) z *= vp[4];
-        if (vte & 0x20) z += vp[5];
-        o->pos[0] = x + pix_bias;
-        o->pos[1] = y + pix_bias;
-        o->pos[2] = z;
-        o->pos[3] = (vte & (1u << 10)) ? w : 1.0f;
-    }
-
-    /* ---- Primitive assembly into a triangle list ---- */
-    size_t idx_need = (size_t)nverts * 6 + 6;
-    if (idx_need > s->draw_idx_cap) {
-        s->draw_idx = g_renew(uint32_t, s->draw_idx, idx_need);
-        s->draw_idx_cap = idx_need;
-    }
-    uint32_t *idx = s->draw_idx;
-    uint32_t ni = 0, prim_class = 0;
-    switch (prim) {
-    case 4:                                     /* TRIANGLES */
-        for (uint32_t i = 0; i + 2 < nverts; i += 3) {
-            idx[ni++] = i; idx[ni++] = i + 1; idx[ni++] = i + 2;
-        }
-        break;
-    case 5:                                     /* TRIANGLE_FAN */
-    case 15:                                    /* POLYGON */
-        for (uint32_t i = 1; i + 1 < nverts; i++) {
-            idx[ni++] = 0; idx[ni++] = i; idx[ni++] = i + 1;
-        }
-        break;
-    case 6:                                     /* TRIANGLE_STRIP */
-        for (uint32_t i = 0; i + 2 < nverts; i++) {
-            idx[ni++] = i; idx[ni++] = i + 1; idx[ni++] = i + 2;
-        }
-        break;
-    case 13:                                    /* QUADS */
-        for (uint32_t i = 0; i + 3 < nverts; i += 4) {
-            idx[ni++] = i; idx[ni++] = i + 1; idx[ni++] = i + 2;
-            idx[ni++] = i; idx[ni++] = i + 2; idx[ni++] = i + 3;
-        }
-        break;
-    case 14:                                    /* QUAD_STRIP */
-        for (uint32_t i = 0; i + 3 < nverts; i += 2) {
-            idx[ni++] = i; idx[ni++] = i + 1; idx[ni++] = i + 3;
-            idx[ni++] = i; idx[ni++] = i + 3; idx[ni++] = i + 2;
-        }
-        break;
-    case 8: {                                   /* RECT_LIST: 3 corners each */
-        /*
-         * Three corners of an axis-aligned rectangle; the fourth completes
-         * it opposite the right-angle corner c (the vertex sharing x with
-         * one of the others and y with the other): v3 = va + vb - vc.
-         * Drivers differ in which corner comes first (X.org: TL,BL,BR;
-         * Apple: TL,BL,TR), so find c rather than assume it.
-         */
-        uint32_t nrect = nverts / 3;
-        verts = r200_draw_verts(s, nverts + nrect);
-        for (uint32_t r = 0; r < nrect; r++) {
-            R200Vertex *v = &verts[r * 3];
-            int c = 1;
-            for (int k = 0; k < 3; k++) {
-                const R200Vertex *p = &v[k], *a = &v[(k + 1) % 3], *b = &v[(k + 2) % 3];
-                if ((p->pos[0] == a->pos[0] && p->pos[1] == b->pos[1]) ||
-                    (p->pos[0] == b->pos[0] && p->pos[1] == a->pos[1])) {
-                    c = k;
-                    break;
-                }
-            }
-            int ia = (c + 1) % 3, ib = (c + 2) % 3;
-            R200Vertex *v3 = &verts[nverts + r];
-            *v3 = v[ia];
-            for (int k = 0; k < 2; k++) {
-                v3->pos[k] = v[ia].pos[k] + v[ib].pos[k] - v[c].pos[k];
-            }
-            for (int t = 0; t < R200_MAX_TEX; t++) {
-                for (int k = 0; k < 4; k++) {
-                    v3->tex[t][k] = v[ia].tex[t][k] + v[ib].tex[t][k] - v[c].tex[t][k];
-                }
-            }
-            idx[ni++] = r * 3 + c;  idx[ni++] = r * 3 + ia; idx[ni++] = r * 3 + ib;
-            idx[ni++] = r * 3 + ia; idx[ni++] = nverts + r; idx[ni++] = r * 3 + ib;
-        }
-        nverts += nrect;
-        break;
-    }
-    case 1:                                     /* POINTS */
-        for (uint32_t i = 0; i < nverts; i++) {
-            idx[ni++] = i;
-        }
-        prim_class = 2;
-        break;
-    case 2:                                     /* LINES */
-        for (uint32_t i = 0; i + 1 < nverts; i += 2) {
-            idx[ni++] = i; idx[ni++] = i + 1;
-        }
-        prim_class = 1;
-        break;
-    case 3:                                     /* LINE_STRIP */
-    case 12:                                    /* LINE_LOOP */
-        for (uint32_t i = 0; i + 1 < nverts; i++) {
-            idx[ni++] = i; idx[ni++] = i + 1;
-        }
-        if (prim == 12 && nverts > 2) {
-            idx[ni++] = nverts - 1; idx[ni++] = 0;
-        }
-        prim_class = 1;
-        break;
-    default:
-        r200_warn_once(&r200_warned, 512, "primitive type %u not supported",
-                       prim);
-        break;
-    }
-    if (ni == 0) {
-        return true;
-    }
-
-    /* ---- Render target, scissor, pixel state ---- */
-    R200DrawPacket pkt = { 0 };
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t tl = R3D(0x26C0), br = R3D(0x1C44);  /* RE_TOP_LEFT, RE_WIDTH_HEIGHT */
-    pkt.rt_offset = (R3D(0x1C40) & ~0xFu) - fb_base;
-    pkt.rt_pitch = R3D(0x1C48) & 0x7FF;
-    pkt.rb3d_cntl = R3D(0x1C3C);
-    pkt.rt_format = (pkt.rb3d_cntl >> 10) & 0xF;
-    pkt.scissor[0] = tl & 0x7FF;
-    pkt.scissor[1] = (tl >> 16) & 0x7FF;
-    pkt.scissor[2] = (br & 0x7FF) + 1;
-    pkt.scissor[3] = ((br >> 16) & 0x7FF) + 1;
-    /* Auxiliary scissors (RE_AUX_SCISSOR_CNTL): an enabled inclusive rect
-     * clips like the main scissor; an exclusive one masks its inside. */
-    uint32_t aux = R3D(0x26F0);
-    for (int k = 0; k < 3; k++) {
-        if (!(aux & (0x10000000u << k))) {
-            continue;
-        }
-        uint32_t atl = R3D(0x1CD8 + 8 * k), abr = R3D(0x1CDC + 8 * k);
-        uint32_t r[4] = { atl & 0x7FF, (atl >> 16) & 0x7FF,
-                          (abr & 0x7FF) + 1, ((abr >> 16) & 0x7FF) + 1 };
-        if (aux & (0x01000000u << k)) {
-            memcpy(pkt.excl[pkt.num_excl++], r, sizeof(r));
-        } else {
-            pkt.scissor[0] = MAX(pkt.scissor[0], r[0]);
-            pkt.scissor[1] = MAX(pkt.scissor[1], r[1]);
-            pkt.scissor[2] = MIN(pkt.scissor[2], r[2]);
-            pkt.scissor[3] = MIN(pkt.scissor[3], r[3]);
-        }
-    }
-    pkt.rt_width = pkt.rt_pitch;
-    pkt.rt_height = ((br >> 16) & 0x7FF) + 1;  /* stable across aux clips */
-    pkt.pp_cntl = R3D(0x1C38);
-    pkt.pp_misc = R3D(0x1C14);
-    pkt.depth_enable = (pkt.rb3d_cntl >> 8) & 1;
-    pkt.stencil_enable = (pkt.rb3d_cntl >> 7) & 1;
-    if (pkt.depth_enable || pkt.stencil_enable) {
-        uint32_t zfmt;
-        pkt.zstencil = R3D(0x1C2C);
-        pkt.stencil_refmask = R3D(0x1D7C);
-        pkt.depth_offset = (R3D(0x1C24) & ~0xFu) - fb_base;
-        pkt.depth_pitch = R3D(0x1C28) & 0x1FF8;
-        zfmt = pkt.zstencil & 0xF;
-        pkt.depth_bpp = zfmt == 0 ? 2 : 4;
-        if (zfmt != 0 && zfmt != 2 && zfmt != 4) {
-            r200_warn_once(&r200_warned, 2048, "depth format %u treated as "
-                           "integer Z", zfmt);
-        }
-    }
-    pkt.plane_mask = (pkt.rb3d_cntl & (1u << 1)) ? R3D(0x1D84) : 0xFFFFFFFFu;
-    pkt.fog_color = R3D(0x1C18);
-    pkt.prim_class = prim_class;
-    pkt.cblend = R3D(0x3220);
-    pkt.ablend = R3D(0x321C);
-    pkt.blend_color = R3D(0x3218);
-    for (int i = 0; i < R200_MAX_STAGES; i++) {
-        pkt.txcblend[i]  = R3D(0x2F00 + i * 0x10);
-        pkt.txcblend2[i] = R3D(0x2F04 + i * 0x10);
-        pkt.txablend[i]  = R3D(0x2F08 + i * 0x10);
-        pkt.txablend2[i] = R3D(0x2F0C + i * 0x10);
-    }
-    static const uint16_t tf_reg[8] = { 0x1C68, 0x1C80, 0x1C98, 0x2EEC,
-                                        0x2EF0, 0x2EF4, 0x2EF8, 0x2EFC };
-    for (int i = 0; i < 8; i++) {
-        pkt.tfactor[i] = R3D(tf_reg[i]);
-    }
-    for (int t = 0; t < R200_MAX_TEX; t++) {
-        if (pkt.pp_cntl & (0x10u << t)) {
-            r200_decode_tex_unit(s, t, &pkt.tex[t]);
-            /* SE_VTE_CNTL VTX_ST_DENORMALIZED: s,t arrive in texels.  The
-             * driver's AGP->VRAM texture copies (Warcraft III's glyph cache)
-             * use it on power-of-two textures. */
-            if (R3D(0x20B0) & (1u << 12)) {
-                pkt.tex[t].denorm = 1;
-            }
-        }
-    }
-    pkt.verts = verts;
-    pkt.num_verts = nverts;
-    pkt.indices = idx;
-    pkt.num_indices = ni;
-
-    {
-        const R200Vertex *v0 = &verts[idx[0]], *v2 = &verts[idx[MIN(2u, ni - 1)]];
-        seq_log("3D   rt=%06x/%u sc=(%u,%u)-(%u,%u) tex0=%06x/%u %ux%u f%u "
-                "blend=%u cb=%08x txc=%08x txa=%08x nv=%u "
-                "v0=(%.1f,%.1f) v2=(%.1f,%.1f) t0=(%.1f,%.1f) t2=(%.1f,%.1f) "
-                "col=(%.2f,%.2f,%.2f,%.2f)",
-                pkt.rt_offset, pkt.rt_pitch, pkt.scissor[0], pkt.scissor[1],
-                pkt.scissor[2], pkt.scissor[3], pkt.tex[0].offset,
-                pkt.tex[0].pitch, pkt.tex[0].width, pkt.tex[0].height,
-                pkt.tex[0].format, pkt.rb3d_cntl & 1, pkt.cblend,
-                pkt.txcblend[0], pkt.txablend[0], nverts,
-                v0->pos[0], v0->pos[1], v2->pos[0], v2->pos[1],
-                v0->tex[0][0], v0->tex[0][1], v2->tex[0][0], v2->tex[0][1],
-                v0->color[0], v0->color[1], v0->color[2], v0->color[3]);
-    }
-
-    static int texlog = -1;
-    if (texlog < 0) {
-        texlog = getenv("PPCGPU_TEXLOG") != NULL;
-    }
-    if (texlog) {
-        /* Debug: log each texture unit whose parameters or leading texels
-         * changed since it was last seen at that offset. */
-        static struct { uint32_t off, key, crc; } tl[256];
-        static int ntl;
-        static uint64_t ndraw;
-        ndraw++;
-        uint8_t *vr = memory_region_get_ram_ptr(&s->vram);
-        for (int t = 0; t < R200_MAX_TEX; t++) {
-            const R200TexUnit *u = &pkt.tex[t];
-            if (!u->enabled) {
-                continue;
-            }
-            uint32_t key = u->format | u->width << 5 | u->height << 18 |
-                           (u->host_data ? 1u << 31 : 0);
-            uint32_t crc = 0;
-            const uint8_t *src = u->host_data ? u->host_data : vr + u->offset;
-            uint64_t len = MIN((uint64_t)u->pitch * u->height, 65536);
-            if (u->host_data || u->offset + len <= s->vram_size) {
-                for (uint64_t i = 0; i < len; i += 4) {
-                    crc = (crc ^ ldl_he_p(src + i)) * 16777619u;
-                }
-            }
-            int j;
-            for (j = 0; j < ntl && tl[j].off != u->offset; j++) {
-            }
-            if (j == ntl || tl[j].key != key || tl[j].crc != crc) {
-                if (j == ntl && ntl < 256) {
-                    ntl++;
-                }
-                if (j < 256) {
-                    tl[j].off = u->offset; tl[j].key = key; tl[j].crc = crc;
-                }
-                static int ndump;
-                if (getenv("PPCGPU_TEXDUMP") && ndump < 600 &&
-                    (u->format != 6 || u->host_data) &&
-                    u->pitch * u->height <= 4 * 1024 * 1024 &&
-                    (u->host_data || u->offset + (uint64_t)u->pitch * u->height
-                                     <= s->vram_size)) {
-                    char fn[128];
-                    g_mkdir_with_parents("/tmp/texdump", 0755);
-                    snprintf(fn, sizeof(fn), "/tmp/texdump/%03d_u%d_%s%08x_f%u_%ux%u_p%u_tc%08x_ta%08x.bin",
-                             ndump++, t, u->host_data ? "agp" : "vram",
-                             u->host_data ? R3D(0x1C5C + t * 0x18) : u->offset,
-                             u->format, u->width, u->height, u->pitch,
-                             pkt.txcblend[0], pkt.txablend[0]);
-                    g_file_set_contents(fn, (const char *)src,
-                                        (gssize)u->pitch * u->height, NULL);
-                }
-                qemu_log("r200 tex d=%llu u%d off=%08x fmt=%u %ux%u p=%u "
-                         "filt=%08x agp=%d crc=%08x first=%08x cb=%08x\n",
-                         (unsigned long long)ndraw, t, u->offset, u->format,
-                         u->width, u->height, u->pitch, u->filter,
-                         u->host_data != NULL, crc,
-                         (u->host_data || u->offset + 4 <= s->vram_size)
-                         ? ldl_be_p(src) : 0, pkt.txcblend[0]);
-            }
-        }
-    }
-
-    {
-        /* PPCGPU_TRACETEX=<hex offset>: full state of draws sampling it. */
-        static int tf = -2, tw, th, tagp;  /* "fmt:w:h[:agp]" */
-        static int traced;
-        if (tf == -2) {
-            const char *e = getenv("PPCGPU_TRACETEX");
-            tf = -1;
-            if (e && sscanf(e, "%d:%d:%d", &tf, &tw, &th) != 3) {
-                tf = -1;
-            }
-            tagp = e && strstr(e, ":agp") != NULL;
-        }
-        if (tf >= 0 && traced < 6 && pkt.tex[0].enabled &&
-            (!tagp || pkt.tex[0].host_data) &&
-            pkt.tex[0].format == (uint32_t)tf && pkt.tex[0].width == (uint32_t)tw &&
-            pkt.tex[0].height == (uint32_t)th) {
-            traced++;
-            const R200Vertex *v0 = &verts[idx[0]];
-            qemu_log("r200 tracetex: prim=%u n=%u pp=%08x rb3d=%08x cb=%08x ab=%08x "
-                     "misc=%08x z=%08x txc0=%08x/%08x txa0=%08x/%08x tf0=%08x "
-                     "fmt=%08x/%08x vte=%08x vap=%08x light=%08x tex0filt=%08x "
-                     "v0 pos=(%.1f,%.1f,%.3f,%.3f) col=(%.2f,%.2f,%.2f,%.2f) "
-                     "spec=(%.2f,%.2f,%.2f,%.2f) t0=(%.3f,%.3f,%.3f,%.3f) rt=%x\n",
-                     prim, nverts, pkt.pp_cntl, pkt.rb3d_cntl, pkt.cblend,
-                     pkt.ablend, pkt.pp_misc, pkt.zstencil, pkt.txcblend[0],
-                     pkt.txcblend2[0], pkt.txablend[0], pkt.txablend2[0],
-                     pkt.tfactor[0], fmt0, fmt1, R3D(0x20B0), R3D(0x2080),
-                     R3D(0x2268), pkt.tex[0].filter,
-                     v0->pos[0], v0->pos[1], v0->pos[2], v0->pos[3],
-                     v0->color[0], v0->color[1], v0->color[2], v0->color[3],
-                     v0->spec[0], v0->spec[1], v0->spec[2], v0->spec[3],
-                     v0->tex[0][0], v0->tex[0][1], v0->tex[0][2], v0->tex[0][3],
-                     pkt.rt_offset);
-            for (uint32_t k = 0; k < nverts && k < 8; k++) {
-                const R200Vertex *vk = &verts[k];
-                qemu_log("r200 tracetex  v%u pos=(%.2f,%.2f,%.3f,%.3f) t0=(%.4f,%.4f) "
-                         "col=(%.2f,%.2f,%.2f,%.2f)\n", k, vk->pos[0], vk->pos[1],
-                         vk->pos[2], vk->pos[3], vk->tex[0][0], vk->tex[0][1],
-                         vk->color[0], vk->color[1], vk->color[2], vk->color[3]);
-            }
-            qemu_log("r200 tracetex  ni=%u idx:", ni);
-            for (uint32_t k = 0; k < ni && k < 12; k++) {
-                qemu_log(" %u", idx[k]);
-            }
-            qemu_log(" sc=(%u,%u)-(%u,%u) rtpitch=%u rth=%u\n", pkt.scissor[0],
-                     pkt.scissor[1], pkt.scissor[2], pkt.scissor[3], pkt.rt_pitch,
-                     pkt.rt_height);
-            qemu_log("r200 tracetex fog: 22c0=%08x fogcol=%08x vec5d=(%g,%g,%g,%g) "
-                     "mv=%u mvrow2=(%g,%g,%g,%g) mvp=%u vtx_raw_pos?\n",
-                     R3D(0x22C0), R3D(0x1C18),
-                     r200_vf(s, 0x5D, 0), r200_vf(s, 0x5D, 1), r200_vf(s, 0x5D, 2),
-                     r200_vf(s, 0x5D, 3), R3D(0x2230) & 0x1F,
-                     r200_vf(s, 0x80 + 4 * (R3D(0x2230) & 0x1F) + 2, 0),
-                     r200_vf(s, 0x80 + 4 * (R3D(0x2230) & 0x1F) + 2, 1),
-                     r200_vf(s, 0x80 + 4 * (R3D(0x2230) & 0x1F) + 2, 2),
-                     r200_vf(s, 0x80 + 4 * (R3D(0x2230) & 0x1F) + 2, 3),
-                     R3D(0x2238) & 0x1F);
-        }
-    }
-
-    if (gpu_diag_on()) {
-        /* Log each new combination of pipeline state once: a cheap map of
-         * which R200 features an application actually exercises. */
-        static uint64_t seen[512];
-        static int nseen;
-        uint32_t k[] = {
-            prim | (src << 8), R3D(0x2080), fmt0, fmt1, R3D(0x20B0),
-            pkt.pp_cntl, pkt.rb3d_cntl, pkt.zstencil, pkt.cblend, pkt.ablend,
-            R3D(0x2268), R3D(0x22B0), R3D(0x22B4), pkt.pp_misc,
-            pkt.tex[0].format | pkt.tex[1].format << 8 | pkt.tex[2].format << 16,
-            pkt.txcblend[0], pkt.txablend[0], pkt.txcblend[1], pkt.txablend[1],
-        };
-        uint64_t h = 1469598103934665603ull;
-        for (size_t i = 0; i < ARRAY_SIZE(k); i++) {
-            h = (h ^ k[i]) * 1099511628211ull;
-        }
-        bool found = false;
-        for (int i = 0; i < nseen; i++) {
-            found |= seen[i] == h;
-        }
-        if (!found && nseen < (int)ARRAY_SIZE(seen)) {
-            seen[nseen++] = h;
-            qemu_log("r200 combo #%d: prim=%u src=%d vap=%08x fmt=%08x/%08x "
-                     "vte=%08x pp=%08x rb3d=%08x z=%08x cb=%08x ab=%08x "
-                     "light=%08x texproc=%08x/%08x misc=%08x txfmt=%u/%u/%u "
-                     "txc0=%08x txa0=%08x txc1=%08x txa1=%08x rt=%u depth@%x "
-                     "vport=%.1f,%.1f,%.1f,%.1f re_tl=%08x re_wh=%08x\n",
-                     nseen, prim, src, R3D(0x2080), fmt0, fmt1, R3D(0x20B0),
-                     pkt.pp_cntl, pkt.rb3d_cntl, pkt.zstencil, pkt.cblend,
-                     pkt.ablend, R3D(0x2268), R3D(0x22B0), R3D(0x22B4),
-                     pkt.pp_misc, pkt.tex[0].format, pkt.tex[1].format,
-                     pkt.tex[2].format, pkt.txcblend[0], pkt.txablend[0],
-                     pkt.txcblend[1], pkt.txablend[1], pkt.rt_pitch,
-                     pkt.depth_offset, vp[0], vp[1], vp[2], vp[3],
-                     R3D(0x26C0), R3D(0x1C44));
-        }
-    }
-
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    uint32_t rt_cfmt = (pkt.rb3d_cntl >> 10) & 0xF;
-    uint32_t rt_bpp = (rt_cfmt == 3 || rt_cfmt == 4 || rt_cfmt == 15) ? 2 : 4;
-    if (pkt.rt_pitch == 0 ||
-        (uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp >
-        s->vram_size) {
-        r200_warn_once(&r200_warned, 1024,
-                       "render target 0x%x pitch %u height %u outside VRAM",
-                       pkt.rt_offset, pkt.rt_pitch, pkt.rt_height);
-    } else if (r200_rate.draws++,
-               r200_render_draw(s, vram, &pkt) == 0) {
-        memory_region_set_dirty(&s->vram, pkt.rt_offset,
-                                (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
-        r200_perf.draws++;
-        r200_traffic.draws++;
-        r200_perf.drew = true;
-        r200_perf_high((uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
-        if (pkt.depth_enable && pkt.depth_pitch) {
-            r200_perf_high((uint64_t)pkt.depth_offset +
-                           (uint64_t)pkt.rt_height * pkt.depth_pitch * pkt.depth_bpp);
-        }
-        for (int t = 0; t < R200_MAX_TEX; t++) {
-            if (!pkt.tex[t].enabled) {
-                continue;
-            }
-            uint64_t bytes = (uint64_t)pkt.tex[t].pitch * pkt.tex[t].height;
-            if (pkt.tex[t].host_data) {
-                r200_perf.tex_agp++;
-                r200_perf.agp_bytes += bytes;
-            } else {
-                r200_perf.tex_vram++;
-                r200_perf_high((uint64_t)pkt.tex[t].offset + bytes);
-            }
-        }
-    }
-    for (int t = 0; t < R200_MAX_TEX; t++) {
-        g_free((void *)pkt.tex[t].host_data);
-    }
-    return true;
-}
-
-/*
- * Hand the draw to a worker when asynchronous drawing is on, and otherwise
- * run it here. Returning the same value either way is deliberate: a queued
- * draw has not failed, and its result cannot be known yet.
- */
-static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
-                                  uint32_t body_dw, int src)
-{
-    if (r200_async_submit(s, d, body_dw, src)) {
-        return true;
-    }
-    return ppc_mac_gpu_r200_draw_now(s, d, body_dw, src);
-}
-
-static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
-                                          const PPCMacGPU3DDrawCmd *cmd)
-{
-    /* Phase A — pre-dispatch VRAM check for draws 77-78 */
-    {
-        static int dispatch_count = 0;
-        static bool track_vram_clr = false;
-        if (dispatch_count == 77) {
-            track_vram_clr = true;
-            fprintf(stderr, "[DISPATCH_CHECK] Starting VRAM 0x353000 tracking "
-                    "after dispatch 77\n");
-        }
-        if (dispatch_count == 77 || dispatch_count == 78) {
-            uint8_t *vp = memory_region_get_ram_ptr(&s->vram);
-            uint32_t v = 0;
-            if (0x353000 + 4 <= s->vram_size) {
-                v = *(uint32_t *)(vp + 0x353000);
-            }
-            fprintf(stderr, "[DISPATCH_CHECK] dispatch=%d PRE-DISPATCH "
-                    "vram[0x353000]=0x%08x\n", dispatch_count, v);
-        }
-        if (dispatch_count == 79) track_vram_clr = false;
-        dispatch_count++;
-        /* Export tracking flag for PM4 processor */
-        s->vram_watch_active = track_vram_clr;
-    }
-
-    /* Post-probe audit: increment global draw counter */
-    g_post_probe_draw_count++;
-
-    PPCMacGPU3DState state;
-    ppc_mac_gpu_snapshot_3d_state(s, &state);
-
-    /* Phase 1: Log every 3D draw for compositor analysis */
-    if (gpu_diag_on()) {
-        ppc_mac_gpu_log_3d_draw(&state, cmd);
-    }
-
-    /*
-     * Phase 3 — Next-gate detection.
-     *
-     * Track blend mode and texture state across ALL draws.
-     * If we see 1000+ draws and never get a non-NOP blend or
-     * real texture (offset != 0, size != 1×1), emit [NEXT_GATE].
-     */
-    {
-        static int gate_draw_count = 0;
-        static int nop_count = 0;
-        static int real_blend_count = 0;
-        static int real_tex_count = 0;
-        static int gate_logged = 0;
-        static uint64_t first_real_blend_at = 0;
-        static uint64_t first_real_tex_at = 0;
-        static int unique_targets = 0;
-        static uint32_t seen_targets[32];
-        static int seen_target_count = 0;
-
-        gate_draw_count++;
-
-        uint32_t blend = state.rb3d_blendcntl;
-        uint32_t src_b = blend & 0x1F;
-        uint32_t dst_b = (blend >> 16) & 0x1F;
-        bool is_nop = (src_b == 0 && dst_b == 1);
-
-        uint32_t tex_off = state.pp_txoffset_0;
-        uint32_t tex_w = (state.pp_txsize_0 & 0x7FF) + 1;
-        uint32_t tex_h = ((state.pp_txsize_0 >> 16) & 0x7FF) + 1;
-        bool real_tex = (tex_off != 0 || tex_w > 1 || tex_h > 1);
-        bool tex_en = (state.pp_cntl >> 4) & 1;
-
-        if (is_nop) {
-            nop_count++;
-        } else {
-            real_blend_count++;
-            if (real_blend_count == 1) {
-                first_real_blend_at = gate_draw_count;
-                qemu_log("[NEXT_GATE] event=first_real_blend "
-                         "draw_id=%d blend=0x%08x src=0x%x dst=0x%x "
-                         "tex_off=0x%x tex_size=%ux%u tex_en=%d "
-                         "color_off=0x%x\n",
-                         gate_draw_count, blend, src_b, dst_b,
-                         tex_off, tex_w, tex_h, tex_en,
-                         state.rb3d_coloroffset);
-            }
-        }
-        if (real_tex && tex_en) {
-            real_tex_count++;
-            if (real_tex_count == 1) {
-                first_real_tex_at = gate_draw_count;
-                qemu_log("[NEXT_GATE] event=first_real_texture "
-                         "draw_id=%d tex_off=0x%x tex_size=%ux%u "
-                         "tex_fmt=0x%x blend=0x%08x\n",
-                         gate_draw_count, tex_off, tex_w, tex_h,
-                         state.pp_txformat_0, blend);
-            }
-        }
-
-        /* Track unique render targets */
-        {
-            uint32_t co = state.rb3d_coloroffset;
-            bool found = false;
-            for (int t = 0; t < seen_target_count; t++) {
-                if (seen_targets[t] == co) { found = true; break; }
-            }
-            if (!found && seen_target_count < 32) {
-                seen_targets[seen_target_count++] = co;
-            }
-        }
-
-        /* Emit summary at milestones */
-        if (!gate_logged &&
-            (gate_draw_count == 200 || gate_draw_count == 500 ||
-             gate_draw_count == 1000 || gate_draw_count == 2000)) {
-            qemu_log("[NEXT_GATE] event=draw_milestone "
-                     "sequence_id=%d total_draws=%d "
-                     "nop_draws=%d real_blend_draws=%d "
-                     "real_tex_draws=%d unique_targets=%d "
-                     "first_real_blend_at=%llu first_real_tex_at=%llu "
-                     "reason=%s confidence=%s\n",
-                     gate_draw_count, gate_draw_count,
-                     nop_count, real_blend_count,
-                     real_tex_count, seen_target_count,
-                     (unsigned long long)first_real_blend_at,
-                     (unsigned long long)first_real_tex_at,
-                     (real_blend_count == 0 && real_tex_count == 0)
-                         ? "all_draws_nop_blend_dummy_texture_QE_not_compositing"
-                         : (real_blend_count > 0 && real_tex_count > 0)
-                             ? "QE_compositing_active"
-                             : "partial_QE_activity",
-                     (gate_draw_count >= 1000)
-                         ? "high" : "medium");
-
-            /* At 1000 draws, if still all NOP, emit definitive gate */
-            if (gate_draw_count >= 1000 && real_blend_count == 0) {
-                gate_logged = 1;
-                qemu_log("[NEXT_GATE] event=definitive_gate "
-                         "sequence_id=%d "
-                         "reg_or_addr=PP_TXOFFSET_0/RB3D_BLENDCNTL "
-                         "value=never_written_with_real_values "
-                         "reason=QE_compositor_never_sends_real_textured_draws_"
-                         "all_%d_draws_are_NOP_blend_with_1x1_dummy_texture_"
-                         "WindowServer_has_not_activated_Quartz_Extreme "
-                         "confidence=high\n",
-                         gate_draw_count, gate_draw_count);
-            }
-        }
-    }
-
-    if (!s->renderer || !s->renderer->draw_3d) {
-        return;
-    }
-
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    PPCMacGPU3DDrawCmd resolved_cmd = *cmd;
-    uint32_t *gart_vb_data = NULL;
-
-    /*
-     * If DRAW_VBUF and vertex buffer is outside VRAM (i.e. in GART space),
-     * read vertex data from system RAM via GART translation and convert
-     * to DRAW_IMMD with inline vertex data.
-     */
-    if (cmd->opcode == R200_3D_DRAW_VBUF && cmd->vb_addr >= s->vram_size &&
-        cmd->vb_stride > 0 && cmd->num_vertices > 0 &&
-        cmd->num_vertices <= 65536) {
-        uint32_t total_bytes = cmd->num_vertices * cmd->vb_stride;
-        uint32_t total_dw = (total_bytes + 3) / 4;
-        gart_vb_data = g_malloc(total_dw * 4);
-
-        bool ok = true;
-        uint32_t bytes_read = 0;
-        uint32_t gpu_addr = cmd->vb_addr;
-
-        while (bytes_read < total_bytes) {
-            hwaddr phys;
-            /* Try AGP (MC_AGP_LOCATION) first, then AIC GART */
-            if (!ppc_mac_gpu_agp_translate(s, gpu_addr, &phys) &&
-                !ppc_mac_gpu_gart_translate(s, gpu_addr, &phys)) {
-                gpu_debug_log("3D_DRAW: AGP/GART translate failed at 0x%x",
-                              gpu_addr);
-                ok = false;
-                break;
-            }
-            /* Read one page at a time (handle page boundaries) */
-            uint32_t page_off = gpu_addr & 0xFFF;
-            uint32_t chunk = 0x1000 - page_off;
-            if (chunk > total_bytes - bytes_read) {
-                chunk = total_bytes - bytes_read;
-            }
-            MemTxResult r = address_space_read(
-                &address_space_memory, phys,
-                MEMTXATTRS_UNSPECIFIED,
-                ((uint8_t *)gart_vb_data) + bytes_read, chunk);
-            if (r != MEMTX_OK) {
-                gpu_debug_log("3D_DRAW: GART read failed at phys 0x%"PRIx64,
-                              (uint64_t)phys);
-                ok = false;
-                break;
-            }
-            bytes_read += chunk;
-            gpu_addr += chunk;
-        }
-
-        if (ok) {
-            /*
-             * Byte-swap vertex data: PPC guest writes BE to system RAM,
-             * but GPU (and our renderer) expects LE floats.
-             * The AGP bridge normally does this swap in hardware.
-             */
-            for (uint32_t dw = 0; dw < total_dw && s->swap; dw++) {
-                gart_vb_data[dw] = bswap32(gart_vb_data[dw]);
-            }
-
-            resolved_cmd.opcode = R200_3D_DRAW_IMMD;
-            resolved_cmd.vertex_data = gart_vb_data;
-            resolved_cmd.vertex_data_dwords = total_dw;
-            /* vb_stride stays set so Metal knows bytes-per-vertex */
-
-            /* Log vertex data for first 10 draws to understand format */
-            static int vb_dump_count = 0;
-            if (vb_dump_count < 10) {
-                uint32_t stride_dw = cmd->vb_stride / 4;
-                gpu_debug_log("3D_VB_DATA draw#%d: %u verts stride=%u "
-                              "aos_desc0=0x%08x",
-                              vb_dump_count, cmd->num_vertices, cmd->vb_stride,
-                              s->regs.regs_3d[R200_3D_IDX(R200_AOS_DESC_0)]);
-                for (uint32_t v = 0; v < cmd->num_vertices && v < 8; v++) {
-                    const uint32_t *vd = gart_vb_data + v * stride_dw;
-                    float f[4];
-                    for (int k = 0; k < 4 && k < (int)stride_dw; k++) {
-                        memcpy(&f[k], &vd[k], 4);
-                    }
-                    gpu_debug_log("  v[%u]: (%.3f, %.3f, %.3f, %.3f)",
-                                  v, f[0], f[1], f[2], f[3]);
-                }
-                /* Also dump raw 48-byte region (3 arrays worth) for vertex 0 */
-                if (total_dw >= 12) {
-                    gpu_debug_log("  raw 48B for v0:");
-                    for (int row = 0; row < 3; row++) {
-                        float rf[4];
-                        for (int k = 0; k < 4; k++) {
-                            memcpy(&rf[k], &gart_vb_data[row * 4 + k], 4);
-                        }
-                        gpu_debug_log("    [%d]: (%.3f, %.3f, %.3f, %.3f)",
-                                      row, rf[0], rf[1], rf[2], rf[3]);
-                    }
-                }
-                vb_dump_count++;
-            }
-        } else {
-            g_free(gart_vb_data);
-            gart_vb_data = NULL;
-            return;
-        }
-    }
-
-    {
-        static int disp3d = 0;
-        if (disp3d < 5) {
-            gpu_debug_log("3D_DISPATCH_TO_SW: renderer=%p draw_3d=%p opaque=%p cmd_op=0x%x",
-                          (void*)s->renderer, (void*)s->renderer->draw_3d,
-                          (void*)s->renderer_opaque, resolved_cmd.opcode);
-            disp3d++;
-        }
-    }
-    int ret = s->renderer->draw_3d(s->renderer_opaque,
-                                    vram, s->vram_size,
-                                    &state, &resolved_cmd);
-    g_free(gart_vb_data);
-
-    if (ret == 0) {
-        /* 3D draw succeeded — mark the color buffer region dirty */
-        uint32_t color_offset = state.rb3d_coloroffset;
-        uint64_t dirty_len = (uint64_t)state.screen_height *
-                             (uint64_t)state.screen_width * 4;
-        if (color_offset + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, color_offset, dirty_len);
-        }
-        s->display_invalid = true;
-
-        /* Phase D: Record this RT offset for present BLT source tracking */
-        bool found = false;
-        for (int t = 0; t < s->metal_rt_count; t++) {
-            if (s->metal_rt_offsets[t] == color_offset) {
-                found = true;
-                break;
-            }
-        }
-        if (!found && s->metal_rt_count < 16) {
-            s->metal_rt_offsets[s->metal_rt_count++] = color_offset;
-        }
-    }
 }
 
 /*
@@ -8166,6 +5871,125 @@ static FILE *r300_ringdump(void)
     }
     (void)bytes;
     return f;
+}
+
+/*
+ * The PM4 2D packets, as operations for the shared engine.  Packet
+ * coordinates are X_Y and WIDTH_HEIGHT (x and width in the high half), the
+ * opposite of the registers.  Returns true when the packet was handled.
+ *
+ *   BITBLT_MULTI (0x9b): GMC, [SRC_PITCH_OFFSET], [DST_PITCH_OFFSET], clip
+ *       words, then (src X_Y, dst X_Y, size) triplets.  A clear pitch-offset
+ *       bit selects DEFAULT_PITCH_OFFSET.  *bbm_hdr keeps the header for the
+ *       header-less continuation, opcode 0x1b.
+ *   PAINT_MULTI (0x9a): GMC, [DST_PITCH_OFFSET], clip words, [solid colour],
+ *       then (dst X_Y, size) pairs.
+ *   HOSTDATA_BLT (0x94), mono only: ppc_mac_gpu_hostdata_mono.
+ */
+static bool ppc_mac_gpu_pm4_2d(PPCMacGPUState *s, uint32_t opcode,
+                               const uint32_t *d, uint32_t n,
+                               uint32_t *bbm_hdr, uint32_t *bbm_hdr_n)
+{
+    Gpu2DOp op = {
+        .frgd = s->regs.dp_brush_frgd_clr, .bkgd = s->regs.dp_brush_bkgd_clr,
+        .brush_yx = s->regs.brush_y_x, .brush_data = s->regs.brush_data,
+    };
+
+    if (opcode == 0x94 && n >= 9) {
+        return ppc_mac_gpu_hostdata_mono(s, d, n);
+    }
+    if (opcode == 0x9b && n >= 4) {
+        uint32_t gmc = d[0], hdr = 1, spo, dpo;
+
+        spo = (gmc & R200_GMC_SRC_PITCH_OFFSET_CNTL) ? d[hdr++]
+                                                     : s->regs.default_pitch_offset;
+        dpo = (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) ? d[hdr++]
+                                                     : s->regs.default_pitch_offset;
+        if (gmc & R200_GMC_SRC_CLIPPING) {
+            hdr++;                              /* SRC_SC_BOTTOM_RIGHT */
+        }
+        if (gmc & R200_GMC_DST_CLIPPING) {
+            op.clip = true;
+            op.clip_x0 = d[hdr] & 0x3FFF;
+            op.clip_y0 = (d[hdr] >> 16) & 0x3FFF;
+            op.clip_x1 = d[hdr + 1] & 0x3FFF;
+            op.clip_y1 = (d[hdr + 1] >> 16) & 0x3FFF;
+            hdr += 2;
+        }
+        if (hdr <= 6) {
+            memcpy(bbm_hdr, d, hdr * 4);
+            *bbm_hdr_n = hdr;
+        }
+        if (n < hdr + 3) {
+            return true;
+        }
+        op.gmc = (gmc & ~(7u << 24)) | (2u << 24);      /* source: screen memory */
+        op.dst_off = gpu_po_offset(s, dpo);
+        op.dst_pitch = (dpo & 0x3FC00000) >> 16;
+        op.src_off = gpu_po_offset(s, spo);
+        op.src_pitch = (spo & 0x3FC00000) >> 16;
+        op.auto_dir = true;
+        op.xl2r = true;
+        op.yt2b = true;
+        if (!op.dst_pitch || !op.src_pitch) {
+            return true;
+        }
+        for (uint32_t i = hdr; i + 3 <= n; i += 3) {
+            op.sx = (d[i] >> 16) & 0xFFFF;
+            op.sy = d[i] & 0xFFFF;
+            op.dx = (d[i + 1] >> 16) & 0xFFFF;
+            op.dy = d[i + 1] & 0xFFFF;
+            op.w = (d[i + 2] >> 16) & 0x3FFF;
+            op.h = d[i + 2] & 0x3FFF;
+            ppc_mac_gpu_2d_op(s, &op);
+        }
+        return true;
+    }
+    if (opcode == 0x9a && n >= 3) {
+        uint32_t gmc = d[0], idx = 1, dpo = s->regs.default_pitch_offset;
+        uint32_t brush = (gmc >> 4) & 0xF, rop = (gmc >> 16) & 0xFF;
+        uint32_t bpp = gpu_gmc_bpp(gmc), color;
+
+        if (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) {
+            dpo = d[idx++];
+        }
+        if (gmc & R200_GMC_SRC_CLIPPING) {
+            idx++;
+        }
+        if ((gmc & R200_GMC_DST_CLIPPING) && idx + 2 <= n) {
+            op.clip = true;
+            op.clip_x0 = d[idx] & 0x3FFF;
+            op.clip_y0 = (d[idx] >> 16) & 0x3FFF;
+            op.clip_x1 = d[idx + 1] & 0x3FFF;
+            op.clip_y1 = (d[idx + 1] >> 16) & 0x3FFF;
+            idx += 2;
+        }
+        color = brush == 0xD ? d[idx++] : s->regs.dp_brush_frgd_clr;
+        op.frgd = color;
+        op.dst_off = gpu_po_offset(s, dpo);
+        op.dst_pitch = (dpo & 0x3FC00000) >> 16;
+        op.xl2r = true;
+        op.yt2b = true;
+        /* A paint with SRCCOPY (which the PowerMac driver sends) fills with the
+         * brush colour: the source is the colour, not screen memory. */
+        op.gmc = (rop == 0xCC && brush == 0xD) ? (gmc & ~(0xFFu << 16)) | (0xF0u << 16) : gmc;
+        if (!op.dst_pitch) {
+            return true;
+        }
+        for (uint32_t i = idx; i + 2 <= n; i += 2) {
+            op.dx = (d[i] >> 16) & 0xFFFF;
+            op.dy = d[i] & 0xFFFF;
+            op.w = (d[i + 1] >> 16) & 0x3FFF;
+            op.h = d[i + 1] & 0x3FFF;
+            ppc_mac_gpu_2d_op(s, &op);
+            if (brush == 0xD && (rop == 0xF0 || rop == 0xCC)) {
+                r200_fill_notify(s, op.dst_off, op.dst_pitch, op.dx, op.dy,
+                                 op.w, op.h, bpp, color);
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
@@ -8238,26 +6062,6 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
             if (s->r3 && ppc_mac_gpu_r300_packet3(s, opcode, d, body_dw)) {
                 opcode = 0x10;      /* consumed: let the common path see a NOP */
             }
-            if (opcode == 0x29) {
-                static int immd1_dumps;
-                if (immd1_dumps++ < 4) {
-                    GString *g = g_string_new(NULL);
-                    for (uint32_t k = 0; k < body_dw && k < 48; k++) {
-                        g_string_append_printf(g, " %08x", d[k]);
-                    }
-                    qemu_log("r200 DRAW_IMMD(0x29) n=%u fmt0=%08x fmt1=%08x vte=%08x "
-                             "vap=%08x pp=%08x rt=%08x/%u tex0=%08x raw:%s\n", body_dw,
-                             s->regs.regs_3d[R200_3D_IDX(0x2088)],
-                             s->regs.regs_3d[R200_3D_IDX(0x208C)],
-                             s->regs.regs_3d[R200_3D_IDX(0x20B0)],
-                             s->regs.regs_3d[R200_3D_IDX(0x2080)],
-                             s->regs.regs_3d[R200_3D_IDX(0x1C38)],
-                             s->regs.regs_3d[R200_3D_IDX(0x1C40)],
-                             s->regs.regs_3d[R200_3D_IDX(0x1C48)] & 0x7ff,
-                             s->regs.regs_3d[R200_3D_IDX(0x1C5C)], g->str);
-                    g_string_free(g, TRUE);
-                }
-            }
             if (opcode != 0x34 && opcode != 0x35 && opcode != 0x36) {
                 seq_log("T3   op=%02x n=%u d0=%08x d1=%08x d2=%08x", opcode, body_dw,
                         body_dw > 0 ? d[0] : 0, body_dw > 1 ? d[1] : 0,
@@ -8290,7 +6094,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 body_dw += bbm_hdr_n;
                 opcode = 0x9b;
             }
-            if (opcode == 0x9b && body_dw >= 4) {
+            if (gpu_unified_2d() &&
+                ppc_mac_gpu_pm4_2d(s, opcode, d, body_dw, bbm_hdr, &bbm_hdr_n)) {
+                /* drawn by the shared 2D engine */
+            } else if (opcode == 0x9b && body_dw >= 4) {
                 /*
                  * CNTL_BITBLT_MULTI — screen-to-screen blt
                  *
@@ -8568,10 +6375,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         }
                     }
 
-                    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y,
-                                                  blit_h), true, 3);
-                    r200_vram_access(s, R200_ROWS(src_offset, src_pitch, src_y,
-                                                  blit_h), false, 3);
+                    gpu_vram_access(s, GPU_ROWS(dst_offset, dst_pitch, dst_y,
+                                                  blit_h), true);
+                    gpu_vram_access(s, GPU_ROWS(src_offset, src_pitch, src_y,
+                                                  blit_h), false);
                     seq_log("BBM  rop=%02x src=%06x/%u (%u,%u) "
                             "dst=%06x/%u (%u,%u) %ux%u",
                             rop3, src_offset, src_pitch, src_x, src_y,
@@ -8600,33 +6407,6 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                          * 3D writes go to the shadow (keeping VRAM clean for
                          * texture reads) and the 2D BLIT engine picks up
                          * composited content from the shadow. */
-                        if (!r200_direct_enabled() && s->renderer && s->renderer->blit_2d) {
-                            PPCMacGPUBlit blit_desc = {
-                                .src_x = src_x, .src_y = src_y,
-                                .src_offset = src_offset,
-                                .src_pitch = src_pitch,
-                                .dst_x = dst_x, .dst_y = dst_y,
-                                .dst_offset = dst_offset,
-                                .dst_pitch = dst_pitch,
-                                .width = blit_w, .height = blit_h,
-                                .rop3 = rop3,
-                                .bpp = bpp * 8,
-                            };
-                            int blit_ret = s->renderer->blit_2d(
-                                s->renderer_opaque, vram, &blit_desc);
-                            if (blit_ret == 0) {
-                                /* Shadow RT handled the BLIT */
-                                handled_by_renderer = true;
-                                if (dst_offset <= 0x10000) {
-                                    fb_write_watch("bbm_srt_present", "srt",
-                                                   src_offset, dst_offset,
-                                                   dst_x, dst_y,
-                                                   blit_w, blit_h,
-                                                   true, true);
-                                }
-                                goto blit_mark_dirty;
-                            }
-                        }
 
                         /* Log non-SRT BBM writes to framebuffer */
                         if (dst_offset <= 0x10000 && blit_w >= 4 && blit_h >= 4) {
@@ -8747,14 +6527,6 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         }
 
                         /* SRT write-through for BBM path */
-                        if (!r200_direct_enabled() && s->renderer && s->renderer->srt_write_through &&
-                            dst_offset != s->regs.crtc_offset) {
-                            s->renderer->srt_write_through(
-                                s->renderer_opaque, vram,
-                                dst_offset, dst_pitch,
-                                dst_x, dst_y, blit_w, blit_h,
-                                bpp * 8);
-                        }
                         if (!handled_by_renderer) {
                             if (dst_offset == s->regs.crtc_offset) {
                                 frame_tracker_record_2d_event(
@@ -8839,7 +6611,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                         so_log++;
                                     }
                                 }
-                                r200_set_present_pitch(s, dst_pitch);
+                                gpu_set_present_pitch(s, dst_pitch);
                             }
                         }
                     }
@@ -8995,8 +6767,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         continue;
                     }
 
-                    r200_vram_access(s, R200_ROWS(offset, pitch, dst_y, blit_h),
-                                     true, 4);
+                    gpu_vram_access(s, GPU_ROWS(offset, pitch, dst_y, blit_h), true);
                     seq_log("FILL rop=%02x dst=%06x/%u (%u,%u) %ux%u "
                             "color=%08x",
                             rop3, offset, pitch, dst_x, dst_y,
@@ -9033,10 +6804,14 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                          blit_w, blit_h, bpp, color);
                     }
                 }
-            } else if (opcode == 0x94 && !s->swap && body_dw >= 9 &&
+#if PPC_MAC_GPU_BE
+            } else if (opcode == 0x9c && body_dw >= 4) {
+#else
+            } else if (opcode == 0x94 && body_dw >= 9 &&
                        ppc_mac_gpu_hostdata_mono(s, d, body_dw)) {
                 /* mono HOSTDATA_BLT from a little-endian guest: drawn */
             } else if (opcode == 0x9c && body_dw >= 4) {
+#endif
                 /*
                  * CNTL_HOSTDATA_BLT — CPU-to-VRAM blit via PM4
                  * d[0] = DP_GUI_MASTER_CNTL (with src_type=3 for HOST)
@@ -9065,8 +6840,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 {   /* geometry order is ambiguous here: cover both */
                     uint32_t ymax = MAX(dst_yx & 0xFFFF, (dst_yx >> 16) & 0xFFFF);
                     uint32_t hmax = MAX(dwh & 0x3FFF, (dwh >> 16) & 0x3FFF);
-                    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, 0,
-                                                  ymax + hmax), true, 5);
+                    gpu_vram_access(s, GPU_ROWS(dst_offset, dst_pitch, 0,
+                                                  ymax + hmax), true);
                 }
                 seq_log("HOST dst=%06x/%u raw_yx=%08x raw_wh=%08x "
                         "asYX_HW=(%u,%u) %ux%u  asXY_WH=(%u,%u) %ux%u "
@@ -9162,292 +6937,6 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         s->display_invalid = true;
                     }
                 }
-            } else if (opcode == R200_3D_LOAD_VBPNTR && body_dw >= 1) {
-                /*
-                 * 3D_LOAD_VBPNTR — Load vertex buffer pointers
-                 * d[0] = number of vertex arrays
-                 * Then pairs: (size_dword, address_dword) for each array
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t num_arrays = d[0];
-                if (num_arrays > 4) num_arrays = 4;
-                s->vb_count = num_arrays;
-                gpu_debug_log("3D_LOAD_VBPNTR: %u arrays", num_arrays);
-                for (uint32_t a = 0; a < num_arrays && (1 + a * 2 + 1) < body_dw; a++) {
-                    s->vb_stride[a] = d[1 + a * 2] & 0xFF;
-                    s->vb_addr[a] = d[1 + a * 2 + 1];
-                    gpu_debug_log("  VB[%u]: stride=%u addr=0x%08x",
-                                  a, s->vb_stride[a], s->vb_addr[a]);
-                }
-
-            } else if (opcode == R200_3D_DRAW_VBUF && body_dw >= 1) {
-                /*
-                 * 3D_DRAW_VBUF — Draw from vertex buffer
-                 * d[0]: bits[3:0]=prim_type, bits[15:4]=num_verts
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t prim_type = d[0] & 0xF;
-                uint32_t num_verts = (d[0] >> 4) & 0xFFF;
-                gpu_debug_log("3D_DRAW_VBUF: prim=%u verts=%u",
-                              prim_type, num_verts);
-
-                PPCMacGPU3DDrawCmd cmd = {
-                    .opcode = R200_3D_DRAW_VBUF,
-                    .prim_type = prim_type,
-                    .num_vertices = num_verts,
-                    .vb_addr = (s->vb_count > 0) ? s->vb_addr[0] : 0,
-                    .vb_stride = (s->vb_count > 0) ? s->vb_stride[0] : 0,
-                };
-                ppc_mac_gpu_dispatch_3d_draw(s, &cmd);
-
-            } else if (opcode == R200_3D_DRAW_IMMD && body_dw >= 1) {
-                /*
-                 * 3D_DRAW_IMMD — Draw with inline vertex data
-                 * d[0]: bits[3:0]=prim_type, bits[15:4]=num_verts
-                 * d[1..N]: inline vertex data
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t prim_type = d[0] & 0xF;
-                uint32_t num_verts = (d[0] >> 4) & 0xFFF;
-                gpu_debug_log("3D_DRAW_IMMD: prim=%u verts=%u data_dw=%u",
-                              prim_type, num_verts, body_dw - 1);
-
-                PPCMacGPU3DDrawCmd cmd = {
-                    .opcode = R200_3D_DRAW_IMMD,
-                    .prim_type = prim_type,
-                    .num_vertices = num_verts,
-                    .vertex_data = (body_dw > 1) ? &d[1] : NULL,
-                    .vertex_data_dwords = (body_dw > 1) ? body_dw - 1 : 0,
-                };
-                ppc_mac_gpu_dispatch_3d_draw(s, &cmd);
-
-            } else if (opcode == R200_3D_DRAW_INDX && body_dw >= 1) {
-                /*
-                 * 3D_DRAW_INDX — Draw with index buffer
-                 * d[0]: bits[3:0]=prim_type, bits[15:4]=num_indices
-                 * d[1..N]: index data (packed u16 pairs)
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t prim_type = d[0] & 0xF;
-                uint32_t num_idx = (d[0] >> 4) & 0xFFF;
-                gpu_debug_log("3D_DRAW_INDX: prim=%u indices=%u",
-                              prim_type, num_idx);
-
-                PPCMacGPU3DDrawCmd cmd = {
-                    .opcode = R200_3D_DRAW_INDX,
-                    .prim_type = prim_type,
-                    .num_vertices = num_idx,
-                    .num_indices = num_idx,
-                    .index_data = (body_dw > 1) ? (const uint16_t *)&d[1] : NULL,
-                };
-                ppc_mac_gpu_dispatch_3d_draw(s, &cmd);
-
-            } else if (opcode == R200_3D_DRAW_VBUF_2_ALT && body_dw >= 1 &&
-                       ppc_mac_gpu_r200_draw(s, d, body_dw, R200_SRC_VBUF)) {
-                /* Rendered by the direct R200 path. */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-            } else if (opcode == 0x29 && body_dw >= 2 &&
-                       ppc_mac_gpu_r200_draw(s, d + 1, body_dw - 1,
-                                             R200_SRC_IMMD)) {
-                /*
-                 * 3D_DRAW_IMMD (R100-style): d[0] is a vertex format word the
-                 * R200 ignores (layout comes from SE_VTX_FMT_0/1), d[1] is
-                 * VF_CNTL, vertices follow.  Apple's GL driver uses it for
-                 * the buffer swap: a RECT_LIST that resolves the 2x-tall
-                 * supersampled back buffer into the window surface.
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-            } else if ((opcode == 0x35 || opcode == 0x36) && body_dw >= 1 &&
-                       ppc_mac_gpu_r200_draw(s, d, body_dw, opcode == 0x35 ?
-                                             R200_SRC_IMMD : R200_SRC_INDX)) {
-                /* 3D_DRAW_IMMD_2 / 3D_DRAW_INDX_2, direct R200 path. */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-            } else if (opcode == R200_3D_DRAW_VBUF_2_ALT && body_dw >= 1) {
-                /*
-                 * R200 3D_DRAW_VBUF_2 (opcode 0x34)
-                 * Body dword = SE_VF_CNTL value:
-                 *   bits[3:0]   = VF_PRIM_TYPE
-                 *   bits[5:4]   = VF_PRIM_WALK (2=list for VBUF)
-                 *   bits[15:6]  = flags (EN_MAOS, etc.)
-                 *   bits[31:16] = NUM_VERTICES
-                 *
-                 * Vertex buffer addresses come from AOS registers
-                 * (0x20C4-0x20D8), not from LOAD_VBPNTR.
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t vf_cntl = d[0];
-                uint32_t prim_type = vf_cntl & R200_VF_PRIM_TYPE_MASK;
-                uint32_t prim_walk = (vf_cntl & R200_VF_PRIM_WALK_MASK)
-                                     >> R200_VF_PRIM_WALK_SHIFT;
-                uint32_t num_verts = (vf_cntl & R200_VF_NUM_VERTICES_MASK)
-                                     >> R200_VF_NUM_VERTICES_SHIFT;
-
-                /* Read AOS vertex buffer from 3D register shadow */
-                uint32_t aos_desc0 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_DESC_0)];
-                uint32_t aos_addr0 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_ADDR_0)];
-                /* AOS descriptor: comp[7:0] | interleaved_stride[15:8] */
-                uint32_t aos_stride0 = (aos_desc0 >> 8) & 0xFF;  /* in dwords */
-
-                /* Read all AOS addresses */
-                uint32_t aos_addr1 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_ADDR_1)];
-                uint32_t aos_desc1 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_DESC_1)];
-                uint32_t a0_size = aos_desc0 & 0xFF;
-                uint32_t a1_size = (aos_desc0 >> 16) & 0xFF;
-                uint32_t a1_stride = (aos_desc0 >> 24) & 0xFF;
-
-                gpu_debug_log("3D_DRAW_VBUF_2: vf_cntl=0x%08x prim=%u walk=%u "
-                              "verts=%u aos_addr0=0x%08x aos_addr1=0x%08x "
-                              "aos_stride=%u a0_size=%u a1_size=%u",
-                              vf_cntl, prim_type, prim_walk,
-                              num_verts, aos_addr0, aos_addr1,
-                              aos_stride0, a0_size, a1_size);
-
-                /* Dump AOS layout for first few draws */
-                {
-                    static int aos_dump_count = 0;
-                    if (aos_dump_count < 5) {
-                        fprintf(stderr, "[AOS_DUMP] draw vf=0x%08x "
-                                "desc0=0x%08x desc1=0x%08x "
-                                "arr0: addr=0x%08x size=%u stride=%u "
-                                "arr1: addr=0x%08x size=%u stride=%u "
-                                "vtx_fmt0=0x%08x vtx_fmt1=0x%08x\n",
-                                vf_cntl, aos_desc0, aos_desc1,
-                                aos_addr0, a0_size, aos_stride0,
-                                aos_addr1, a1_size, a1_stride,
-                                s->regs.regs_3d[R200_3D_IDX(R200_SE_VTX_FMT_0)],
-                                s->regs.regs_3d[R200_3D_IDX(R200_SE_VTX_FMT_1)]);
-                        aos_dump_count++;
-                    }
-                }
-
-                PPCMacGPU3DDrawCmd cmd = {
-                    .opcode = R200_3D_DRAW_VBUF,  /* treat as DRAW_VBUF */
-                    .prim_type = prim_type,
-                    .num_vertices = num_verts,
-                    .vb_addr = aos_addr0,
-                    .vb_stride = aos_stride0 * 4,  /* convert dwords to bytes */
-                };
-                ppc_mac_gpu_dispatch_3d_draw(s, &cmd);
-
-            } else if (opcode == R200_3D_DRAW_VBUF_2 && body_dw >= 1) {
-                /*
-                 * R200 3D_DRAW_VBUF_2 (opcode 0x23) — same VF_CNTL format
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t vf_cntl = d[0];
-                uint32_t prim_type = vf_cntl & R200_VF_PRIM_TYPE_MASK;
-                uint32_t num_verts = (vf_cntl & R200_VF_NUM_VERTICES_MASK)
-                                     >> R200_VF_NUM_VERTICES_SHIFT;
-
-                uint32_t aos_desc0 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_DESC_0)];
-                uint32_t aos_addr0 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_ADDR_0)];
-                uint32_t aos_addr1 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_ADDR_1)];
-                uint32_t aos_desc1 = s->regs.regs_3d[R200_3D_IDX(R200_AOS_DESC_1)];
-                uint32_t aos_stride0 = (aos_desc0 >> 8) & 0xFF;  /* interleaved stride in dwords */
-
-                /* Dump AOS layout for first few draws */
-                {
-                    static int aos_dump_count = 0;
-                    if (aos_dump_count < 5) {
-                        uint32_t a0_size = aos_desc0 & 0xFF;
-                        uint32_t a0_stride = (aos_desc0 >> 8) & 0xFF;
-                        uint32_t a1_size = (aos_desc0 >> 16) & 0xFF;
-                        uint32_t a1_stride = (aos_desc0 >> 24) & 0xFF;
-                        fprintf(stderr, "[AOS_DUMP] draw vf=0x%08x "
-                                "desc0=0x%08x desc1=0x%08x "
-                                "arr0: addr=0x%08x size=%u stride=%u "
-                                "arr1: addr=0x%08x size=%u stride=%u "
-                                "vtx_fmt0=0x%08x vtx_fmt1=0x%08x\n",
-                                vf_cntl, aos_desc0, aos_desc1,
-                                aos_addr0, a0_size, a0_stride,
-                                aos_addr1, a1_size, a1_stride,
-                                s->regs.regs_3d[R200_3D_IDX(R200_SE_VTX_FMT_0)],
-                                s->regs.regs_3d[R200_3D_IDX(R200_SE_VTX_FMT_1)]);
-                        aos_dump_count++;
-                    }
-                }
-
-                PPCMacGPU3DDrawCmd cmd = {
-                    .opcode = R200_3D_DRAW_VBUF,
-                    .prim_type = prim_type,
-                    .num_vertices = num_verts,
-                    .vb_addr = aos_addr0,
-                    .vb_stride = aos_stride0 * 4,
-                };
-                ppc_mac_gpu_dispatch_3d_draw(s, &cmd);
-
-            } else if (opcode == R200_3D_DRAW_IMMD_2 && body_dw >= 1) {
-                /*
-                 * R200 3D_DRAW_IMMD_2 (opcode 0x24)
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t prim_type = d[0] & 0xF;
-                uint32_t num_verts = (d[0] >> 4) & 0xFFF;
-                gpu_debug_log("3D_DRAW_IMMD_2: prim=%u verts=%u data_dw=%u",
-                              prim_type, num_verts, body_dw - 1);
-
-                PPCMacGPU3DDrawCmd cmd = {
-                    .opcode = R200_3D_DRAW_IMMD,
-                    .prim_type = prim_type,
-                    .num_vertices = num_verts,
-                    .vertex_data = (body_dw > 1) ? &d[1] : NULL,
-                    .vertex_data_dwords = (body_dw > 1) ? body_dw - 1 : 0,
-                };
-                ppc_mac_gpu_dispatch_3d_draw(s, &cmd);
-
-            } else if (opcode == R200_3D_DRAW_INDX_2 && body_dw >= 1) {
-                /*
-                 * R200 3D_DRAW_INDX_2 (opcode 0x25)
-                 */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-                uint32_t prim_type = d[0] & 0xF;
-                uint32_t num_idx = (d[0] >> 4) & 0xFFF;
-                gpu_debug_log("3D_DRAW_INDX_2: prim=%u indices=%u",
-                              prim_type, num_idx);
-
-                PPCMacGPU3DDrawCmd cmd = {
-                    .opcode = R200_3D_DRAW_INDX,
-                    .prim_type = prim_type,
-                    .num_vertices = num_idx,
-                    .num_indices = num_idx,
-                    .index_data = (body_dw > 1) ? (const uint16_t *)&d[1] : NULL,
-                };
-                ppc_mac_gpu_dispatch_3d_draw(s, &cmd);
-
-            } else if (opcode == R200_WAIT_FOR_IDLE) {
-                /* Wait for idle — we are always idle */
-                trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
-
-            } else if (opcode == 0x32) {
-                /*
-                 * 3D_CLEAR_ZMASK (d[0] first tile, d[1] tile count, d[2]
-                 * mask value).  With Z compression on (ZSTENCILCNTL bits
-                 * 28/31, as Warcraft III runs) a depth clear only resets the
-                 * tile-status "Z mask"; cleared tiles then read back as
-                 * RB3D_DEPTHCLEARVALUE.  Compression is not modelled, so
-                 * store the clear value into the depth buffer itself.  This
-                 * opcode used to be run as an indirect buffer at GPU address
-                 * d[0] - i.e. the front buffer's pixels executed as PM4.
-                 */
-                r200_clear_depth_buffer(s);
-
-            } else if (opcode == 0x37) {
-                /* 3D_CLEAR_HIZ: no hierarchical Z is modelled. */
-
-            } else if (opcode == 0x33) {
-                /*
-                 * INDIRECT_BUFFER / INDIRECT_BUFFER_PFD
-                 * d[0] = IB base address (GPU/AGP address)
-                 * d[1] = IB size in dwords
-                 */
-                if (body_dw >= 2) {
-                    uint32_t sub_ib_base = d[0];
-                    uint32_t sub_ib_size = d[1] & 0xFFFFF;
-                    gpu_debug_log("PM4_IB_DISPATCH base=0x%x size=%u dw",
-                                  sub_ib_base, sub_ib_size);
-                    ppc_mac_gpu_execute_ib(s, sub_ib_base, sub_ib_size);
-                }
-
             } else {
                 /* Log other Type 3 opcodes for analysis */
                 trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
@@ -9729,6 +7218,102 @@ static bool is_r300_register(uint32_t addr)
     return false;
 }
 
+/*
+ * Registers a driver reads and writes whose function this model does not
+ * otherwise implement: memory-controller timing and pads, GPIO pads, DAC,
+ * TV DAC, flat-panel stretch, second CRTC and cursor, display debug.  They
+ * are plain storage (the R300 shadow array), reset to what the card's BIOS
+ * leaves behind after POST.  The values are the BIOS's own register tables,
+ * read from the ATI 9700 PRO ROM (the two tables the init routine walks: a
+ * list of "register <= value" and "register = (r & and) | or" entries, applied
+ * from a zero reset); registers the tables leave alone reset to zero.
+ * Without this they read as zero and a read-modify-write lost its other bits.
+ */
+static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_gpu_post_regs[] = {
+    { 0x0038, 0x00000000, "MEM_VGA_WP_SEL" },       /* VGA aperture bank: writes (VBE 4F05) */
+    { 0x003c, 0x00000000, "MEM_VGA_RP_SEL" },       /* ... and reads */
+    { 0x0118, 0x0008bbbb, "FW_CNTL" },
+    { 0x0140, 0x00000022, "MEM_CNTL" },
+    { 0x0144, 0x1a3a5523, "MEM_TIMING_CNTL" },
+    { 0x0154, 0x20000000, "MC_INIT_GFX_LAT_TIMER" },
+    { 0x0158, 0x31420042, "MEM_SDRAM_MODE_REG" },
+    { 0x0168, 0x00000000, "PAD_CTLR_STRENGTH" },
+    { 0x0178, 0x00009025, "MEM_IO_CNTL_A0" },
+    { 0x017c, 0x0ba30ba3, "MC_READ_CNTL_AB" },
+    { 0x0180, 0x0f000000, "MC_INIT_MISC_LAT_TIMER" },
+    { 0x0184, 0x01e3c78f, "MC_IOPAD_CNTL" },
+    { 0x0188, 0x00923def, "MC_DEBUG" },
+    { 0x018c, 0x2f302f30, "MC_CHIP_IO_OE_CNTL_AB" },
+    { 0x0198, 0x00000001, "GPIOPAD_MASK" },
+    { 0x019c, 0x00000001, "GPIOPAD_A" },
+    { 0x01a0, 0x00000001, "GPIOPAD_EN" },
+    { 0x01a8, 0x00000000, "ZV_LCDPAD_MASK" },
+    { 0x01ac, 0x00000000, "ZV_LCDPAD_A" },
+    { 0x01b0, 0x00000000, "ZV_LCDPAD_EN" },
+    { 0x0280, 0x00000000, "DAC_EXT_CNTL" },
+    { 0x028c, 0x00000000, "FP_HORZ_STRETCH" },
+    { 0x0290, 0x00000000, "FP_VERT_STRETCH" },
+    { 0x02a4, 0x10000040, "TMDS_TRANSMITTER_CNTL" },
+    { 0x02a8, 0x000b01d7, "TMDS_?_02A8" },
+    { 0x02f0, 0x20204f4f, "GRPH_BUFFER_CNTL" },
+    { 0x0360, 0x00000000, "CUR2_OFFSET" },
+    { 0x03e8, 0x000f5474, "?_03E8" },
+    { 0x03f0, 0x20204f4f, "GRPH2_BUFFER_CNTL" },
+    { 0x03f8, 0x00000000, "CRTC2_GEN_CNTL" },
+    { 0x04dc, 0x00000100, "OV0_FLAG_CNTRL" },
+    { 0x0800, 0x40000000, "TV_MASTER_CNTL" },
+    { 0x088c, 0x00680000, "TV_DAC_CNTL" },
+    { 0x0910, 0x00000004, "FCP_CNTL" },
+    { 0x0aa0, 0x6000037d, "PAD_CTLR_MISC" },
+    { 0x0d00, 0x5b000000, "DISP_MISC_CNTL" },
+    { 0x0d04, 0x00000808, "DAC_MACRO_CNTL" },
+    { 0x0d10, 0x10000000, "DISP_TEST_DEBUG_CNTL" },
+    { 0x0d64, 0x1000000a, "DISP_OUTPUT_CNTL" },
+};
+
+static int ppc_mac_gpu_post_reg(uint32_t addr)
+{
+    for (int i = 0; i < ARRAY_SIZE(ppc_mac_gpu_post_regs); i++) {
+        if (ppc_mac_gpu_post_regs[i].reg == (addr & ~3u)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static const char *ppc_mac_gpu_post_reg_name(uint32_t addr)
+{
+    int i = ppc_mac_gpu_post_reg(addr);
+
+    if ((addr & ~3u) == 0x01A4) {
+        return "GPIOPAD_Y";
+    }
+
+    return i < 0 ? NULL : ppc_mac_gpu_post_regs[i].name;
+}
+
+/* The BIOS's indirect memory-controller writes (index | 0x100, then data). */
+static const struct { uint8_t idx; uint32_t val; } ppc_mac_gpu_mc_ind_post[] = {
+    { 0x18, 0x04f460d6 }, { 0x19, 0x99995555 }, { 0x1a, 0x141557ff },
+    { 0x1b, 0x99995555 }, { 0x1c, 0x141557ff }, { 0x1d, 0x99995555 },
+    { 0x1e, 0x141557ff }, { 0x1f, 0x99995555 }, { 0x20, 0x141557ff },
+    { 0x21, 0x00009249 }, { 0x22, 0x0000554f }, { 0x23, 0x2f302f30 },
+    { 0x24, 0x0ba30ba3 }, { 0x25, 0x2222ffff }, { 0x26, 0x40001303 },
+    { 0x2f, 0x00b6db6d },
+};
+
+static void ppc_mac_gpu_post_regs_reset(PPCMacGPUState *s)
+{
+    memset(s->mc_ind, 0, sizeof(s->mc_ind));
+    s->mc_ind_index = 0;
+    for (int i = 0; i < ARRAY_SIZE(ppc_mac_gpu_mc_ind_post); i++) {
+        s->mc_ind[ppc_mac_gpu_mc_ind_post[i].idx] = ppc_mac_gpu_mc_ind_post[i].val;
+    }
+    for (int i = 0; i < ARRAY_SIZE(ppc_mac_gpu_post_regs); i++) {
+        s->r300_shadow[ppc_mac_gpu_post_regs[i].reg / 4] = ppc_mac_gpu_post_regs[i].post;
+    }
+}
+
 /* ========================================================================
  * MMIO read handler
  * ======================================================================== */
@@ -9747,20 +7332,29 @@ static bool is_r300_register(uint32_t addr)
 #define PPC_MAC_GPU_HWC_MAGIC 0x48574331
 
 /*
- * The CRTC1 hardware cursor as a Linux driver programs it: a 64x64 ARGB image
- * in VRAM at CUR_OFFSET, enabled by CRTC_GEN_CNTL bit 16, positioned by
- * CUR_HORZ_VERT_POSN (x<<16 | y, bit 31 = lock) minus the hot-spot shift in
- * CUR_HORZ_VERT_OFF.  Handed to the display as a QEMU cursor.
+ * The CRTC1 hardware cursor as a driver programs it: a 64x64 ARGB image in VRAM at CUR_OFFSET, enabled by
+ * CRTC_GEN_CNTL bit 16.  The chip draws it over the scanout with the image's top-left at
+ * CUR_HORZ_VERT_POSN (x<<16 | y, bit 31 = lock) minus CUR_HORZ_VERT_OFF (the part of the image that is clipped
+ * off the screen edge or skipped); nothing in the registers says where the hot spot is.  A host cursor built
+ * from the image therefore cannot line up with the guest's pointer (the Linux driver puts the hot spot at the
+ * top-left, the Windows one a fixed 36,12 pixels in), so the cursor is drawn into the frame instead, where the
+ * guest placed it, and the host pointer is hidden with a transparent one.  hwc_x/hwc_y are the image's top-left
+ * on the screen, hwc_pix the image; ppc_mac_gpu_display_update blends it in.
  */
-static void ppc_mac_gpu_cursor_sync(PPCMacGPUState *s)
+static G_GNUC_UNUSED void ppc_mac_gpu_cursor_sync(PPCMacGPUState *s)
 {
     uint32_t fb = (s->regs.mc_fb_location & 0xFFFF) << 16;
     uint32_t off = s->regs.cur_offset & 0x0FFFFFFF;
     bool on = s->regs.crtc_gen_cntl & (1u << 16);
     int x = (int)((s->regs.cur_horz_vert_posn >> 16) & 0x7FFF) -
             (int)((s->regs.cur_horz_vert_off >> 16) & 0x3F);
+    /* Y: the Catalyst driver's CUR_HORZ_VERT_OFF.y is a constant 25 plus the rows it really clips (measured: with
+     * the pointer at P it writes POSN = P - (13,13), OFF = (23,25), and the arrow's tip, 12 rows into the image,
+     * has to land on P); subtracting all of it drew the cursor 25 rows too high.  Linux writes the clip alone
+     * (0 away from the top edge), so for OFF.y < 25 the clip is only dropped when the cursor is cut off at the
+     * top, a few rows' error in that one place.  X needs no such bias. */
     int y = (int)(s->regs.cur_horz_vert_posn & 0x7FFF) -
-            (int)(s->regs.cur_horz_vert_off & 0x3F);
+            MAX((int)(s->regs.cur_horz_vert_off & 0x3F) - 25, 0);
 
     if (!s->con) {
         return;
@@ -9770,35 +7364,27 @@ static void ppc_mac_gpu_cursor_sync(PPCMacGPUState *s)
     }
     if (on && (uint64_t)off + 64 * 64 * 4 <= s->vram_size) {
         const uint8_t *src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + off;
-        uint32_t px[64 * 64];
 
         for (int i = 0; i < 64 * 64; i++) {
-            px[i] = ldl_le_p(src + 4 * i);
+            s->hwc_pix[i] = ldl_le_p(src + 4 * i);
         }
-        if (!s->hwc_w || memcmp(px, s->hwc_pix, sizeof(px))) {
-            QEMUCursor *c = cursor_alloc(64, 64);
+        if (!s->hwc_w) {
+            /* hide the host pointer: the cursor is part of the frame */
+            QEMUCursor *c = cursor_alloc(1, 1);
 
-            c->hot_x = 0;
-            c->hot_y = 0;
-            memcpy(c->data, px, sizeof(px));
-            memcpy(s->hwc_pix, px, sizeof(px));
-            s->hwc_w = s->hwc_h = 64;
             dpy_cursor_define(s->con, c);
             cursor_unref(c);
+            s->hwc_w = s->hwc_h = 64;
         }
     }
     s->hwc_x = x;
     s->hwc_y = y;
     s->hwc_visible = on && s->hwc_w;
     if (getenv("PPCGPU_CURSOR_LOG")) {
-        static int n;
-        if (n++ < 400) {
-            fprintf(stderr, "CURSOR posn %08x off %08x gen %08x -> (%d,%d) visible %d off %08x\n",
-                    s->regs.cur_horz_vert_posn, s->regs.cur_horz_vert_off, s->regs.crtc_gen_cntl,
-                    x, y, s->hwc_visible, s->regs.cur_offset);
-        }
+        fprintf(stderr, "CURSOR posn %08x off %08x gen %08x -> top-left (%d,%d) on %d\n",
+                s->regs.cur_horz_vert_posn, s->regs.cur_horz_vert_off, s->regs.crtc_gen_cntl, x, y, on);
     }
-    dpy_mouse_set(s->con, x, y, s->hwc_visible);
+    dpy_mouse_set(s->con, 0, 0, false);
 }
 
 static void ppc_mac_gpu_hwc_write(PPCMacGPUState *s, uint32_t reg, uint32_t val)
@@ -9861,7 +7447,904 @@ static uint32_t ppc_mac_gpu_hwc_read(PPCMacGPUState *s, uint32_t reg)
     return 0;
 }
 
-static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
+static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr, unsigned int size);
+
+/* MM_INDEX bit 31 selects the video memory aperture: MM_DATA then reads and writes
+ * the VRAM bytes at (MM_INDEX & 0x7fffffff) plus the byte lane, not a register.  The
+ * Catalyst driver (ati2mtag.sys, FUN_003727fe) sizes memory through it with the
+ * patterns 0xaaaaaaaa / ~0xaaaaaaaa at offsets 0 and 4; no public document lists the
+ * bit, so this follows what the driver does. */
+#define MM_INDEX_APER 0x80000000u
+
+static uint64_t ppc_mac_gpu_mm_aper_read(PPCMacGPUState *s, uint64_t off, unsigned int size)
+{
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint64_t v = 0;
+
+    for (unsigned i = 0; i < size; i++) {
+        if (off + i < s->vram_size) {
+            v |= (uint64_t)vram[off + i] << (8 * i);
+        }
+    }
+    return v;
+}
+
+static void ppc_mac_gpu_mm_aper_write(PPCMacGPUState *s, uint64_t off, uint64_t val,
+                                      unsigned int size)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    for (unsigned i = 0; i < size; i++) {
+        if (off + i < s->vram_size) {
+            vram[off + i] = val >> (8 * i);
+            memory_region_set_dirty(&s->vram, off + i, 1);
+        }
+    }
+}
+
+/* CRTC_STATUS derived from the virtual clock: bit 0 is set while the frame is in vertical blank, bit 1
+ * latches at every vblank start until bit 2 is written.  A real chip reports this whatever the interrupt
+ * enables are; the vblank timer (and the toggle it does on crtc_status) only runs when GEN_INT_CNTL enables
+ * the vblank interrupt, so a guest that polls the status without it (the Catalyst XP video BIOS wait) would
+ * spin forever.  The vblank length is a guess (last 1/20 of the 60 Hz frame).  While the timer is armed the
+ * old toggle is kept, so the PowerMac behaviour does not change. */
+static uint32_t ppc_mac_gpu_crtc_status(PPCMacGPUState *s)
+{
+    int64_t now, frame, start;
+    uint32_t v;
+
+    if (timer_pending(&s->vblank_timer)) {
+        return s->regs.crtc_status;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    frame = NANOSECONDS_PER_SECOND / 60;
+    start = frame - frame / 20;
+    v = s->regs.crtc_status & ~(R200_CRTC_VBLANK_CUR | R200_CRTC_VBLANK_SAVE);
+    if (now % frame >= start) {
+        v |= R200_CRTC_VBLANK_CUR;
+    }
+    if (now >= start && (now - start) / frame * frame + start > s->regs.crtc_vblank_clear_ns) {
+        v |= R200_CRTC_VBLANK_SAVE;
+    }
+    return v;
+}
+
+/* The register an MM_INDEX value selects, or 0 for none.  Index 0 means no redirect
+ * and an index that lands on MM_DATA itself is ignored (it would redirect forever). */
+static uint32_t ppc_mac_gpu_mm_reg_index(const PPCMacGPUState *s)
+{
+    uint32_t idx = s->regs.mm_index & 0xFFFF;
+
+    return (idx >= R200_MM_DATA && idx < R200_MM_DATA + 4) ? 0 : idx;
+}
+static uint64_t ppc_mac_gpu_mmio_read_impl(void *opaque, hwaddr addr, unsigned int size);
+
+/*
+ * A DDC line pair as the GPIO register shows it.  Y (bits 8-9) is the level on
+ * the lines: pulled up when nothing drives them, so a bus nobody has driven
+ * yet reads high, not low.  (A slave pulling SDA low is kept in the stored
+ * value by the I2C model, which leaves SCL high, so it is never both low.)
+ */
+static uint32_t ppc_mac_gpu_gpio_ddc(uint32_t reg)
+{
+    if (!(reg & 0x30000) && !(reg & 0x300)) {
+        reg |= 0x300;
+    }
+    return reg;
+}
+
+static bool ppc_mac_gpu_mmio_read_cfg(PPCMacGPUState *s, hwaddr addr, unsigned int size,
+                                      uint64_t *valp)
+{
+    uint64_t val = 0;
+
+    switch (addr) {
+    case R200_MM_INDEX:
+        val = s->regs.mm_index;
+        break;
+
+    /* BIOS scratch registers */
+    case R200_BIOS_0_SCRATCH ... R200_BIOS_7_SCRATCH:
+        /* plain storage a BIOS uses a byte at a time: pick the byte lane */
+        val = s->regs.bios_scratch[(addr - R200_BIOS_0_SCRATCH) / 4] >> ((addr & 3) * 8);
+        break;
+
+    /* Interrupt */
+    case R200_GEN_INT_CNTL:
+        val = s->regs.gen_int_cntl;
+        break;
+    case R200_GEN_INT_STATUS:
+        val = s->regs.gen_int_status;
+        break;
+
+    /* Config / Memory controller */
+    case R200_CONFIG_MEMSIZE:
+        val = s->regs.config_memsize;
+        break;
+    case R200_CONFIG_APER_0_BASE:
+        val = pci_default_read_config(&s->pci,
+                                      PCI_BASE_ADDRESS_0, 4) & ~0xFU;
+        break;
+    case R200_CONFIG_APER_1_BASE:
+            val = (pci_default_read_config(&s->pci, PCI_BASE_ADDRESS_0, 4) &
+                   ~0xFU) + (uint32_t)s->vram_size;
+            break;
+        val = pci_default_read_config(&s->pci,
+                                      PCI_BASE_ADDRESS_1, 4) & ~0x3U;
+        break;
+    case R200_CONFIG_APER_SIZE:
+        val = (uint32_t)s->vram_size;
+        break;
+    case R200_CONFIG_REG_1_BASE:
+        val = pci_default_read_config(&s->pci,
+                                      PCI_BASE_ADDRESS_2, 4) & ~0xFU;
+        break;
+    case R200_CONFIG_REG_APER_SIZE:
+        val = PPC_MAC_GPU_MMIO_SIZE;
+        break;
+    case R200_CONFIG_CNTL:
+        val = s->regs.config_cntl;
+        break;
+    case R200_MC_FB_LOCATION:
+        val = s->regs.mc_fb_location;
+        break;
+    case R200_MC_AGP_LOCATION:
+        val = s->regs.mc_agp_location;
+        break;
+    case R200_MC_STATUS:
+        /* Report memory controller idle */
+        /*
+         * R300's idle bit is bit 4, not the older chips' bit 2; both read as
+         * set.  Linux's radeon (r300_mc_wait_for_idle) and the X radeon DDX
+         * (the wait in RADEONRestoreMemMapRegisters, up to a million
+         * usleep(10)s) poll for it.
+         */
+        /* bits 0 and 1: memory power-up complete on both channels (the BIOS's
+         * init polls them, (status & 3) == 3, before it goes on) */
+        /* bits 2 and 3: ati2mtag.sys (Catalyst 10.2, fn 0x371a32, 0x8000 polls of 10us, then it re-toggles
+         * MEM_SDRAM_MODE_REG bit 31 and retries forever) waits for (MC_STATUS & mask) == mask with mask 3, or
+         * 0xF when features 0x7F and 0x71 are both set.  Bit 2 is MC_IDLE (radeon.h), bit 3 the low bit of
+         * IMP_N_VALUE_R_BACK (bits 6:3, impedance read-back).  Reading 0x13 failed the 0xF case. */
+        val = R200_MC_IDLE | (1u << 4) | 0xF;
+        break;
+
+    /* Bus */
+    case R200_BUS_CNTL:
+        val = s->regs.bus_cntl;
+        break;
+    case R200_HOST_PATH_CNTL:
+        val = s->regs.host_path_cntl | (1 << 23); /* HDP_SOFT_RESET capable */
+        break;
+
+    /* RBBM - report idle with 64 free FIFO entries */
+    case R200_RBBM_STATUS:
+        /* bits [6:0] = CMDFIFO_AVAIL (free entries)
+         * bit 31 = GUI_ACTIVE (1=busy, 0=idle)
+         * bits [30:7] = various pipeline busy flags
+         * ATI kext checks GUI_ACTIVE to wait for idle */
+        val = 64; /* 64 free entries, GUI_ACTIVE=0 (idle) */
+        gpu_debug_log("STATUS_RD RBBM_STATUS -> 0x%08x (idle, %u free)", (uint32_t)val, (uint32_t)val & 0x7f);
+        {
+            static int rbbm_read_count = 0;
+            rbbm_read_count++;
+            if (gpu_diag_on() &&
+                (rbbm_read_count <= 20 || rbbm_read_count % 1000 == 0)) {
+                qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
+                         "context=idle_poll sequence_id=%d "
+                         "note=RBBM_STATUS_always_idle\n",
+                         (uint32_t)addr, (uint32_t)val, rbbm_read_count);
+            }
+        }
+        break;
+
+    /* GUI status - report idle */
+    case R200_GUI_STAT:
+        val = 64; /* Free FIFO entries */
+        gpu_debug_log("STATUS_RD GUI_STAT -> 0x%08x", (uint32_t)val);
+        break;
+
+    /*
+     * R300/RV350 register stubs — needed for ATIRadeon9700.kext to init
+     * without crashing.  These registers don't exist on R200/RV280 but
+     * the 9700 kext reads them during startup.  Return safe defaults.
+     */
+    case 0x4018: /* R300_GB_TILE_CONFIG */
+        /* Report 1 pipe, 1 Z pipe — minimum config */
+        val = 0x00000001;
+        break;
+    case 0x4024: /* R300_GB_FIFO_SIZE */
+        /* 32 entries per pipe */
+        val = 0x00000020;
+        break;
+    case 0x4008: /* R300_GB_ENABLE */
+        val = 0;
+        break;
+    case 0x4010: /* R300_GB_MSPOS0 */
+    case 0x4014: /* R300_GB_MSPOS1 */
+        val = 0x66666666; /* standard MS sample positions */
+        break;
+    case 0x401C: /* R300_GB_SELECT */
+    case 0x4020: /* R300_GB_AA_CONFIG */
+        val = 0;
+        break;
+    case 0x2140: /* R300_VAP_CNTL_STATUS */
+        val = 0; /* no errors, not busy */
+        break;
+    case 0x2150: /* R300_VAP_PVS_STATE_FLUSH_REG */
+        val = 0;
+        break;
+    case 0x170C: /* R300_RBBM_SOFT_RESET */
+        val = 0;
+        break;
+    default:
+        return false;
+    }
+    *valp = val;
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_read_display(PPCMacGPUState *s, hwaddr addr, unsigned int size,
+                                          uint64_t *valp)
+{
+    uint64_t val = 0;
+
+    switch (addr) {
+    /* CRTC */
+    case R200_CRTC_GEN_CNTL:
+        val = s->regs.crtc_gen_cntl;
+        break;
+    case R200_CRTC_EXT_CNTL:
+        val = s->regs.crtc_ext_cntl;
+        break;
+    case R200_CRTC_STATUS:
+        val = ppc_mac_gpu_crtc_status(s);
+        break;
+    case R200_CRTC_H_TOTAL_DISP:
+        val = s->regs.crtc_h_total_disp;
+        break;
+    case R200_CRTC_H_SYNC_STRT_WID:
+        val = s->regs.crtc_h_sync_strt_wid;
+        break;
+    case R200_CRTC_V_TOTAL_DISP:
+        val = s->regs.crtc_v_total_disp;
+        break;
+    case R200_CRTC_V_SYNC_STRT_WID:
+        val = s->regs.crtc_v_sync_strt_wid;
+        break;
+    case R200_CRTC_OFFSET:
+        /* bit 30, GUI_TRIG_OFFSET: a new offset is waiting for the next vblank (r100_page_flip waits for it to rise) */
+        {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), frame = NANOSECONDS_PER_SECOND / 60;
+            bool pending = s->regs.crtc_offset_write_ns > 0 && now / frame == s->regs.crtc_offset_write_ns / frame;
+
+            val = s->regs.crtc_offset | (pending ? 1u << 30 : 0);
+        }
+        break;
+    case R200_CRTC_OFFSET_CNTL:
+        val = s->regs.crtc_offset_cntl;
+        break;
+    case R200_CRTC_PITCH:
+        val = s->regs.crtc_pitch;
+        break;
+    case R200_CRTC_GUI_TRIG_VLINE:
+        val = 0;
+        break;
+    case R200_CRTC_VLINE_CRNT_VLINE: {
+        /*
+         * A scanline that walks with time.  The line the beam is on is
+         * reported in bits [26:16]; bits [10:0] are the line the guest
+         * asked to be told about, which it wrote here.  The current line
+         * used to be returned in the low bits, where nothing reads it, so
+         * anything waiting for a scanline saw zero for ever.
+         */
+        uint32_t vtotal = (s->regs.crtc_v_total_disp & 0x7FF) + 1;
+        if (vtotal == 0) vtotal = 628; /* safety */
+        int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        uint64_t frame_ns = NANOSECONDS_PER_SECOND / 60;
+        uint32_t line = (uint32_t)((now_ns % frame_ns) * vtotal / frame_ns);
+        val = (s->regs.crtc_vline & 0x7FF) | ((line & 0x7FF) << 16);
+        break;
+    }
+    case R200_CRTC_CRNT_FRAME:
+        /* Frame counter - increment with time */
+        val = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+                         (NANOSECONDS_PER_SECOND / 60));
+        break;
+
+    /* DAC */
+    case R200_DAC_CNTL:
+        val = s->regs.dac_cntl;
+        if ((val & (1u << 3))) {                  /* DAC_CMP_EN */
+            /* The comparator senses a load on the primary DAC: the monitor on
+             * the VGA connector.  A BIOS finds the CRT this way (it forces
+             * the DAC through DAC_EXT_CNTL and reads DAC_CMP_OUTPUT, bit 7). */
+            val |= 1u << 7;                     /* DAC_CMP_OUTPUT */
+        }
+        break;
+    case R200_DAC_CNTL2:
+        val = s->regs.dac_cntl2;
+        break;
+
+    /* Palette */
+    case R200_PALETTE_INDEX:
+        val = s->regs.palette_index;
+        break;
+    case R200_PALETTE_DATA:
+        if (s->regs.palette_index < 256) {
+            val = gpu_dac_get(s, s->regs.palette_index);
+        }
+        break;
+
+    /* Cursor */
+    case R200_CUR_OFFSET:
+        val = s->regs.cur_offset;
+        break;
+    case R200_CUR_HORZ_VERT_POSN:
+        val = s->regs.cur_horz_vert_posn;
+        break;
+    case R200_CUR_HORZ_VERT_OFF:
+        val = s->regs.cur_horz_vert_off;
+        break;
+    case R200_CUR_CLR0:
+        val = s->regs.cur_clr0;
+        break;
+    case R200_CUR_CLR1:
+        val = s->regs.cur_clr1;
+        break;
+
+    /* Surface */
+    case R200_SURFACE_CNTL:
+        val = s->regs.surface_cntl;
+        break;
+
+    /* Display */
+    case R200_DISP_MISC_CNTL:
+        val = s->regs.disp_misc_cntl;
+        break;
+    case R200_DISP_OUTPUT_CNTL:
+        val = s->regs.disp_output_cntl;
+        break;
+    case R200_DISP_MERGE_CNTL:
+        val = s->regs.disp_merge_cntl;
+        break;
+    case R200_FP_GEN_CNTL:
+        val = s->regs.fp_gen_cntl;
+        break;
+
+    /* AGP - report AGP 2.0, 4x capable */
+    case R200_AGP_STATUS:
+        val = 0x1F000203; /* AGP 2.0, SBA, 4x/2x/1x capable */
+        break;
+    case R200_AGP_COMMAND:
+        val = s->regs.agp_command;
+        break;
+    case R200_AGP_BASE:
+        val = s->regs.agp_base;
+        break;
+    case R200_AGP_CNTL:
+        val = s->regs.agp_cntl;
+        break;
+
+    /* Clock/PLL - stub with fixed values */
+    case R200_CLOCK_CNTL_INDEX:
+        val = s->regs.clock_cntl_index;
+        break;
+    case R200_CLOCK_CNTL_DATA:
+        val = s->regs.pll[s->regs.clock_cntl_index & 0x3F];
+        break;
+
+    default:
+        return false;
+    }
+    *valp = val;
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_read_2d(PPCMacGPUState *s, hwaddr addr, unsigned int size,
+                                     uint64_t *valp)
+{
+    uint64_t val = 0;
+
+    switch (addr) {
+    /* 2D engine - read back state */
+    case R200_DST_OFFSET:
+        val = s->regs.dst_offset;
+        break;
+    case R200_DST_PITCH:
+        val = s->regs.dst_pitch;
+        break;
+    case R200_SRC_OFFSET:
+        val = s->regs.src_offset;
+        break;
+    case R200_SRC_PITCH:
+        val = s->regs.src_pitch;
+        break;
+    case R200_DP_GUI_MASTER_CNTL:
+        val = s->regs.dp_gui_master_cntl;
+        break;
+    case R200_DP_CNTL:
+        val = s->regs.dp_cntl;
+        break;
+    case R200_DP_DATATYPE:
+        val = s->regs.dp_datatype;
+        break;
+    case R200_DP_MIX:
+        val = s->regs.dp_mix;
+        break;
+    case R200_DP_WRITE_MSK:
+        val = s->regs.dp_write_msk;
+        break;
+    case R200_SC_TOP_LEFT:
+        val = s->regs.sc_top_left;
+        break;
+    case R200_SC_BOTTOM_RIGHT:
+        val = s->regs.sc_bottom_right;
+        break;
+    case R200_DEFAULT_SC_BOTTOM_RIGHT:
+        val = s->regs.default_sc_bottom_right;
+        break;
+
+    /* CP (command processor) */
+    case R200_CP_RB_BASE:
+        val = s->regs.cp_rb_base;
+        break;
+    case R200_CP_RB_CNTL:
+        val = s->regs.cp_rb_cntl;
+        break;
+    case R200_CP_RB_RPTR:
+        val = s->regs.cp_rb_rptr;
+        break;
+    case R200_CP_RB_WPTR:
+        val = s->regs.cp_rb_wptr;
+        break;
+    case R200_CP_RB_RPTR_ADDR:
+        /* A card returns what was written (Linux reads it back to place SCRATCH_ADDR). */
+        val = s->regs.cp_rb_rptr_addr;
+        break;
+    case R200_CP_ME_CNTL:
+        val = s->regs.cp_me_cntl;
+        break;
+    case R200_CP_STAT:
+        /* CP status - report idle (all pipeline stages inactive)
+         * bit 31 = CP_BUSY (1=processing commands)
+         * bits [30:0] = various stage busy flags */
+        val = 0;
+        gpu_debug_log("STATUS_RD CP_STAT -> 0x%08x (idle)", (uint32_t)val);
+        break;
+    case R200_CP_IB_BASE:
+        val = s->regs.cp_ib_base;
+        break;
+    case R200_CP_IB_BUFSZ:
+        val = s->regs.cp_ib_bufsz;
+        break;
+    case R200_CP_CSQ_CNTL:
+        /*
+         * Kext writes CSQ mode in bits[31:28] and polls until queue
+         * count fields become non-zero.  bits[7:0]=primary count,
+         * bits[15:8]=indirect count, bits[23:16]=indirect2 count.
+         * When mode enables indirect queues (mode 7 = PRIBM+INDBM),
+         * the kext checks ALL enabled queue counts.
+         */
+        /*
+         * How much is still queued.  Everything the guest submits is
+         * carried out before the write returns, so in truth nothing ever
+         * is -- but reporting zero here stops Mac OS X booting: the
+         * driver's engine bring-up waits for these counts to become
+         * non-zero, and hangs at the grey Apple with no spinner if they
+         * never do.  So the counts stay as they were, and PPCGPU_CSQ_IDLE=1
+         * reports an empty queue for anyone chasing a driver that waits
+         * for the queue to drain instead.
+         */
+        /*
+         * How much is still queued.  Everything submitted is carried out
+         * before the write returns, so the honest answer is "nothing" --
+         * but a driver bringing the engine up wants to see the queue
+         * non-empty at least once, and reporting zero from the start left
+         * Mac OS X hanging at the grey Apple.  So: busy on the first read
+         * after something is submitted, empty on the reads after that.
+         * A driver waiting for the queue to drain now gets its answer,
+         * which is what left Halo waiting for ever.
+         * PPCGPU_CSQ=busy keeps the old always-busy reply, =idle always
+         * reports empty.
+         */
+        {
+            static int mode = -1;
+            if (mode < 0) {
+                const char *e = getenv("PPCGPU_CSQ");
+                mode = (e && !strcmp(e, "busy")) ? 1
+                     : (e && !strcmp(e, "idle")) ? 2 : 0;
+            }
+            /*
+             * Bits [7:0] are the only count this register has, and the
+             * driver reads them as room to submit into: a steady 0x40 says
+             * "space for 64", which is what lets Mac OS X finish bringing
+             * the engine up.  Reporting zero hangs the boot.  Halo's freeze
+             * was never here -- it survived both extremes -- so this stays
+             * steady rather than pretending to drain.
+             */
+            uint32_t top = s->regs.cp_csq_cntl & 0xFF000000;
+            val = (mode == 2) ? top : (top | 0x40);
+        }
+        break;
+    case R200_SCRATCH_UMSK:
+        val = s->regs.scratch_umsk;
+        break;
+    case R200_SCRATCH_ADDR:
+        val = s->regs.scratch_addr;
+        break;
+    case R200_CP_ME_RAM_ADDR:
+        val = s->regs.cp_me_ram_addr;
+        break;
+    case R200_CP_CSQ_STAT:
+        /* CSQ status register (0x07f8).
+         * R200/ATIRadeon8500: bits[7:0]=pri_rptr, [15:8]=pri_wptr,
+         * [23:16]=ind_rptr, [31:24]=ind_wptr.  All equal = idle.
+         * R300/ATIRadeon9700: the kext polls this waiting for the value
+         * to change, but we process commands instantly so it never changes
+         * naturally.  Return 0 so both kexts see "queues empty/idle".
+         * The 9700 kext's 99999-iteration timeout will fire and it will
+         * continue initialization with an error (which is acceptable —
+         * we're reverting to the 8500 kext anyway). */
+        val = 0;
+        break;
+    case R200_CP_CSQ_IND_ADDR:
+        val = 0;
+        break;
+    case R200_CP_CSQ_IND_DATA:
+        val = 0;
+        break;
+
+    default:
+        return false;
+    }
+    *valp = val;
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_read_cp(PPCMacGPUState *s, hwaddr addr, unsigned int size,
+                                     uint64_t *valp)
+{
+    uint64_t val = 0;
+
+    switch (addr) {
+    /* GPIO / I2C / DDC */
+    case R200_GPIO_VGA_DDC ... R200_GPIO_VGA_DDC + 3:
+        val = ppc_mac_gpu_reg_read_offs(ppc_mac_gpu_gpio_ddc(s->regs.gpio_vga_ddc),
+                                         addr - R200_GPIO_VGA_DDC, size);
+        break;
+    case R200_GPIO_DVI_DDC ... R200_GPIO_DVI_DDC + 3:
+        val = ppc_mac_gpu_reg_read_offs(ppc_mac_gpu_gpio_ddc(s->regs.gpio_dvi_ddc),
+                                         addr - R200_GPIO_DVI_DDC, size);
+        break;
+    case R200_GPIO_MONID ... R200_GPIO_MONID + 3:
+        val = ppc_mac_gpu_reg_read_offs(ppc_mac_gpu_gpio_ddc(s->regs.gpio_monid),
+                                         addr - R200_GPIO_MONID, size);
+        break;
+
+    /* Wait/sync */
+    case R200_WAIT_UNTIL:
+        /*
+         * WAIT_UNTIL is write-to-trigger / read-for-completion.
+         *
+         * The kext writes a bitmask of conditions to wait for (e.g.
+         * WAIT_2D_IDLECLEAN, WAIT_HOST_IDLECLEAN, WAIT_DMA_IDLECLEAN),
+         * then polls the register until it reads back 0 (all conditions
+         * satisfied).  On real R200 hardware the GPU clears the bits
+         * once the corresponding pipeline stages become idle.
+         *
+         * In this emulation there is no asynchronous pipeline —
+         * command processing completes synchronously, and RBBM_STATUS
+         * already reports idle.  All wait conditions are therefore
+         * trivially satisfied by the time the guest reads back, so
+         * we always return 0.
+         *
+         * The written value is still latched in s->regs.wait_until
+         * for tracing/debug purposes.
+         */
+        val = 0;
+        break;
+    case R200_ISYNC_CNTL:
+        val = s->regs.isync_cntl;
+        break;
+
+    /* RBBM soft reset */
+    case R200_RBBM_SOFT_RESET:
+        val = 0;
+        break;
+
+    /* DISP_PWR_MAN */
+    case R200_DISP_PWR_MAN:
+        val = 0;
+        break;
+
+    /* Scratch registers — key fence-completion polling path */
+    case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
+        int scratch_idx = (addr - R200_SCRATCH_REG0) / 4;
+        val = s->regs.scratch_reg[scratch_idx];
+        if (getenv("POWEREMU_FENCE_TRACE")) {
+            static uint32_t last[6] = { 0xFFFFFFFF }; static int n;
+            if (val != last[scratch_idx] && n++ < 40) {
+                last[scratch_idx] = val;
+                fprintf(stderr, "ppc-mac-gpu fence: guest reads reg%d = %u\n",
+                        scratch_idx, (uint32_t)val);
+            }
+        }
+        gpu_debug_log("STATUS_RD SCRATCH_REG%d -> 0x%08x",
+                      scratch_idx, (uint32_t)val);
+        /*
+         * Phase 3B: Log scratch register reads for QE gate analysis.
+         * The guest polls scratch registers to check fence completion.
+         * Log the first 50 reads and then periodically.
+         */
+        {
+            static int scratch_read_count = 0;
+            scratch_read_count++;
+            if (gpu_diag_on() &&
+                (scratch_read_count <= 50 || scratch_read_count % 500 == 0)) {
+                qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
+                         "context=scratch_poll sequence_id=%d "
+                         "note=SCRATCH_REG%d_fence_check\n",
+                         (uint32_t)addr, (uint32_t)val, scratch_read_count,
+                         scratch_idx);
+            }
+        }
+        break;
+    }
+
+    /* CRTC2 / misc registers (stubs) */
+    case R200_CRTC2_OFFSET_CNTL:  /* 0x0328 */
+    case R200_CRTC2_PITCH:        /* 0x023C */
+    case R200_FP2_GEN_CNTL:       /* 0x033C */
+    case R200_RBBM_CNTL:          /* 0x1710 */
+        val = 0;
+        break;
+
+    default:
+        return false;
+    }
+    *valp = val;
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_read_stub_3d(PPCMacGPUState *s, hwaddr addr, unsigned int size,
+                                          uint64_t *valp)
+{
+    uint64_t val = 0;
+
+    switch (addr) {
+    /* 3D engine registers — return shadow values for known 3D regs */
+    case R200_RB3D_CNTL:          /* 0x1C3C */
+    case R200_SE_CNTL:            /* 0x1C4C */
+    case R200_RB3D_DSTCACHE_MODE: /* 0x3258 */
+    {
+        uint32_t idx = ((uint32_t)addr - 0x1C00) / 4;
+        if (idx < 2304) {
+            val = s->regs.regs_3d[idx];
+        }
+        break;
+    }
+    case R200_RB3D_DSTCACHE_CTLSTAT: /* 0x325C — cache flush status */
+    {
+        /*
+         * Kext writes bit 0 (DC_FLUSH) or bit 1 (DC_FREE) to request
+         * a destination cache flush, then polls until those bits clear.
+         * We're a software emulator with no cache, so always return 0
+         * (flush complete) and clear the shadow value.
+         */
+        uint32_t idx = ((uint32_t)addr - 0x1C00) / 4;
+        if (idx < 2304) {
+            uint32_t shadow = s->regs.regs_3d[idx];
+            if (shadow & 0x3) {
+                gpu_debug_log("STATUS_RD RB3D_DSTCACHE_CTLSTAT -> 0 "
+                              "(was 0x%08x, flush complete)", shadow);
+            }
+            s->regs.regs_3d[idx] = 0; /* clear flush bits */
+        }
+        val = 0;
+        break;
+    }
+    case R200_AIC_CTRL:           /* 0x01D0 */
+        val = s->regs.aic_ctrl;
+        break;
+    case R200_AIC_PT_BASE:        /* 0x01D8 */
+        val = s->regs.aic_pt_base;
+        break;
+    case R200_AIC_LO_ADDR:        /* 0x01DC */
+        val = s->regs.aic_lo_addr;
+        break;
+    case R200_AIC_HI_ADDR:        /* 0x01E0 */
+        val = s->regs.aic_hi_addr;
+        break;
+
+    default:
+        /*
+         * 3D engine register range (0x1C00-0x3FFF) — return shadow values.
+         * This allows the kext to read back any 3D register it has written.
+         */
+        if (addr >= 0x1C00 && addr < 0x4000) {
+            uint32_t idx = ((uint32_t)addr - 0x1C00) / 4;
+            if (idx < 2304) {
+                val = s->regs.regs_3d[idx];
+            }
+            break;
+        }
+
+        /*
+         * PCI config space mirror at 0x0F00-0x0F3F.
+         * ATI GPUs mirror their PCI config space into MMIO so the driver
+         * can read PCI identity (vendor/device ID) without going through
+         * the host bridge. The kext reads DEVICE_ID at 0x0F02 to verify
+         * the card before doing anything else.
+         */
+        if (addr >= R200_PCI_MIRROR_BASE && addr < R200_PCI_MIRROR_END) {
+            uint32_t pci_off = addr - R200_PCI_MIRROR_BASE;
+            val = pci_default_read_config(&s->pci, pci_off, size);
+            break;
+        }
+
+        /*
+         * VBE DISPI registers (0x500-0x514) - qemu_vga.ndrv compatibility.
+         * The NDRV accesses these as 16-bit reads at (reg << 1) + 0x500.
+         * This provides the Bochs VBE interface for mode query/set.
+         */
+        if (addr >= PPC_MAC_GPU_VBE_OFFSET &&
+            addr < PPC_MAC_GPU_VBE_END) {
+            uint32_t vbe_idx = (addr - PPC_MAC_GPU_VBE_OFFSET) >> 1;
+            if (vbe_idx < VBE_DISPI_INDEX_NB ||
+                vbe_idx == VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
+                val = vbe_idx == VBE_DISPI_INDEX_VIDEO_MEMORY_64K
+                    ? (uint16_t)(s->vram_size >> 16)
+                    : s->regs.vbe_regs[vbe_idx];
+                static const char *vbe_names[] = {
+                    "ID", "XRES", "YRES", "BPP", "ENABLE",
+                    "BANK", "VIRT_WIDTH", "VIRT_HEIGHT",
+                    "X_OFF", "Y_OFF", "VMEM_64K"
+                };
+                const char *name = vbe_idx < 11 ? vbe_names[vbe_idx] : "?";
+                gpu_debug_log("VBE_RD [%u] %s -> 0x%04x",
+                              vbe_idx, name, (uint32_t)val);
+            }
+            break;
+        }
+
+        /*
+         * VGA DAC registers (0x400-0x41F) - qemu_vga.ndrv palette access.
+         * Port mapping: MMIO offset = port + 0x400 - 0x3C0.
+         */
+        if ((addr >= PPC_MAC_GPU_VGA_OFFSET && addr < PPC_MAC_GPU_VGA_END) ||
+            (addr >= 0x3C0 && addr < 0x3E0)) {         /* the ports' own offsets */
+            uint16_t port = addr >= 0x3C0 && addr < 0x3E0
+                            ? addr : (addr - PPC_MAC_GPU_VGA_OFFSET) + 0x3C0;
+            switch (port) {
+            case 0x3C0:  /* AR Index/Data */
+                val = s->regs.vga_ar_index;
+                break;
+            case 0x3C7:  /* DAC State */
+                val = 3;  /* always in read mode state */
+                break;
+            case 0x3C8:  /* DAC Write Address */
+                val = s->regs.vga_dac_write_index;
+                break;
+            case 0x3C9: {  /* DAC Data (read) */
+                uint8_t idx = s->regs.vga_dac_read_index;
+                val = s->regs.vga_dac_palette[idx][s->regs.vga_dac_sub_index];
+                s->regs.vga_dac_sub_index++;
+                if (s->regs.vga_dac_sub_index >= 3) {
+                    s->regs.vga_dac_sub_index = 0;
+                    s->regs.vga_dac_read_index++;
+                }
+                break;
+            }
+            default:
+                val = 0;
+                break;
+            }
+            break;
+        }
+
+        /*
+         * VBE extended registers (0x600-0x61F) - interrupt control.
+         * Accessed as 32-bit at (reg << 2) + 0x600.
+         */
+        if (addr >= PPC_MAC_GPU_EXT_OFFSET &&
+            addr < PPC_MAC_GPU_EXT_END) {
+            uint32_t ext_reg = (addr - PPC_MAC_GPU_EXT_OFFSET) >> 2;
+            if (ext_reg == 2) {
+                /* VBL interrupt status register */
+                val = s->regs.gen_int_status & R200_CRTC_VBLANK_INT;
+            }
+            break;
+        }
+
+        /* R300 register catch-all: any register in R300-specific ranges
+         * that isn't handled by a specific case above gets returned from
+         * shadow storage.  This lets ATIRadeon9700.kext read back any
+         * R300 register it has written. */
+        if (addr < 0x5000 && is_r300_register((uint32_t)addr)) {
+            val = s->r300_shadow[(uint32_t)addr / 4];
+            break;
+        }
+
+        if ((addr & ~3ull) == 0xE4 || (addr & ~3ull) == 0xE8) {
+            /* CONFIG_XSTRAP / CONFIG_BONDS: read-only latches of the board's strap pins and the
+             * chip's bonding options, read by the Windows (Catalyst) driver to tell the board
+             * variant.  No documented values; PPCGPU_XSTRAP / PPCGPU_BONDS override the defaults.
+             * Defaults come from ati2mtag.sys (Catalyst 10.2), the only bits it tests on an R300 (0x4E44):
+             *   XSTRAP (0xE4): bits 27/28 (27 set, 28 clear turns on feature 0x2e) -> 0, no feature.
+             *   BONDS  (0xE8): bit 0 -- clear makes the driver drop feature 0xA9 (fn 0x1782de/0x17af7c) -> 1, so
+             *                  the driver keeps its default feature set.
+             * The BONDS value is inferred (the real board's latch is unknown); marked as a guess. */
+            const bool xstrap = (addr & ~3ull) == 0xE4;
+            const char *e = getenv(xstrap ? "PPCGPU_XSTRAP" : "PPCGPU_BONDS");
+            const uint32_t dflt = xstrap ? 0x0 : 0x1;
+
+            val = (e ? strtoul(e, NULL, 0) : dflt) >> ((addr & 3) * 8);
+            break;
+        }
+        if (addr == 0x01A4) {
+            /* GPIOPAD_Y, the level on each pad: a stub.  Nothing is wired to
+             * the pads and reading them as low is what the BIOS POSTs with;
+             * pulled-up pads make it wait for them to settle. */
+            val = 0;
+            break;
+        }
+        if (ppc_mac_gpu_post_reg(addr) >= 0) {
+            val = s->r300_shadow[(uint32_t)(addr & ~3ull) / 4] >> ((addr & 3) * 8);
+            if (size < 4) {
+                val &= (1u << (size * 8)) - 1;
+            }
+            break;
+        }
+        /* The memory controller's indirect registers (R300: MC_IND_INDEX/DATA). */
+        if (addr == 0x01F8) {
+            val = s->mc_ind_index;
+            break;
+        }
+        if (addr == 0x01FC) {
+            val = s->mc_ind[s->mc_ind_index & 0x7F];
+            break;
+        }
+
+        if (size < 4 || (addr & 3)) {
+            /* a byte or word of a register: the chip's byte enables pick the
+             * lane out of the dword (a PC BIOS reads CRTC_EXT_CNTL+1 and so on) */
+            val = ppc_mac_gpu_mmio_read(s, addr & ~3ull, 4) >> ((addr & 3) * 8);
+            if (size < 4) {
+                val &= (1u << (size * 8)) - 1;
+            }
+            break;
+        }
+
+        trace_ppc_mac_gpu_mmio_read_unimpl(size, addr,
+                                            ppc_mac_gpu_reg_name(addr));
+        /*
+         * Phase 3B: Log unhandled register reads — these are the most
+         * suspicious candidates for QE capability gates returning wrong
+         * values (we return 0 for all of them).
+         */
+        {
+            /* each register once, then at every power-of-ten read */
+            static uint32_t reads[0x4000];
+            uint32_t slot = (uint32_t)addr / 4;
+
+            if (slot < ARRAY_SIZE(reads)) {
+                uint32_t n = ++reads[slot];
+
+                if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000) {
+                    qemu_log("[QE_GATE_READ] reg=0x%04x size=%u read #%u "
+                             "context=unhandled_read note=UNIMPL_%s_returns_zero\n",
+                             (uint32_t)addr, size, n, ppc_mac_gpu_reg_name(addr));
+                }
+            }
+        }
+        val = 0;
+        break;
+    }
+    *valp = val;
+    return true;
+}
+
+static uint64_t ppc_mac_gpu_mmio_read_impl(void *opaque, hwaddr addr,
                                        unsigned int size)
 {
     PPCMacGPUState *s = opaque;
@@ -10014,725 +8497,46 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     if (addr >= 0x780 && addr < 0x7C0) {
         seq_log("DMA  rd reg=%03x", (unsigned)addr);
     }
-    if (unlikely(r200_traffic_on())) {
-        r200_traffic.mmio_reads++;
-    }
     /* Idle/fence status reads precede CPU access to rendered VRAM; FIFO
      * space, scanline and interrupt polls do not. */
     if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
-        r200_direct_enabled() && r200_scratch_read_wait(s, (addr - R200_SCRATCH_REG0) / 4)) {
+        r200_scratch_read_wait(s, (addr - R200_SCRATCH_REG0) / 4)) {
         /* fence poll: answered without flushing later work */
     } else if (addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
         addr != R200_CRTC_VLINE_CRNT_VLINE && addr != 0x0044) {
-        r200_flush_at(s, R200_WHY_REG(addr));
+        gpu_sync_at(s, GPU_WHY_REG(addr));
     }
-    if (unlikely(gpu_debug_enabled())) {
-        gpu_debug_log("MMIO_RD size=%u addr=0x%04"PRIx64" (%s)",
-                      size, (uint64_t)addr, ppc_mac_gpu_reg_name(addr));
-    }
-
     /* EDID compatibility for QEMU VGA NDRV:
      * The NDRV reads EDID data via byte-sized reads at MMIO offsets 0x00-0x7F
      * during initialization (before the first VBE mode set).
      * After EDID reading completes, byte reads return ATI register values.
      * edid_read_done is set when VBE_ENABLE is first written (mode set). */
-    if (size == 1 && addr < 128 && !s->edid_read_done) {
+    if (GUEST_LE == 0 && size == 1 && addr < 128 && !s->edid_read_done) {
+        /* PowerPC build only: a real chip has no EDID at the bottom of its
+         * register space (a PC BIOS reads byte lanes of MM_DATA there); the
+         * monitor answers on the DDC lines. */
         val = s->edid_blob[addr];
         gpu_debug_log("EDID_RD offset=0x%02x -> 0x%02x", (unsigned)addr, (unsigned)val);
         return val;
     }
 
     /* Handle indexed register access via MM_INDEX/MM_DATA */
-    if (addr == R200_MM_DATA && s->regs.mm_index) {
-        /* Recursive call with the indexed address */
-        return ppc_mac_gpu_mmio_read(s, s->regs.mm_index, size);
+    if (addr >= R200_MM_DATA && addr < R200_MM_DATA + 4) {
+        if (s->regs.mm_index & MM_INDEX_APER) {
+            return ppc_mac_gpu_mm_aper_read(s, (s->regs.mm_index & 0x7FFFFFFFu) +
+                                            (addr - R200_MM_DATA), size);
+        }
+        if (ppc_mac_gpu_mm_reg_index(s)) {
+            /* Recursive call with the indexed address (and the byte lane) */
+            return ppc_mac_gpu_mmio_read(s, ppc_mac_gpu_mm_reg_index(s) + (addr - R200_MM_DATA), size);
+        }
     }
 
-    switch (addr) {
-    case R200_MM_INDEX:
-        val = s->regs.mm_index;
-        break;
-
-    /* BIOS scratch registers */
-    case R200_BIOS_0_SCRATCH ... R200_BIOS_7_SCRATCH:
-        val = s->regs.bios_scratch[(addr - R200_BIOS_0_SCRATCH) / 4];
-        break;
-
-    /* Interrupt */
-    case R200_GEN_INT_CNTL:
-        val = s->regs.gen_int_cntl;
-        break;
-    case R200_GEN_INT_STATUS:
-        val = s->regs.gen_int_status;
-        break;
-
-    /* Config / Memory controller */
-    case R200_CONFIG_MEMSIZE:
-        val = s->regs.config_memsize;
-        break;
-    case R200_CONFIG_APER_0_BASE:
-        val = pci_default_read_config(&s->pci,
-                                      PCI_BASE_ADDRESS_0, 4) & ~0xFU;
-        break;
-    case R200_CONFIG_APER_1_BASE:
-        if (s->r300) {
-            val = (pci_default_read_config(&s->pci, PCI_BASE_ADDRESS_0, 4) &
-                   ~0xFU) + (uint32_t)s->vram_size;
-            break;
-        }
-        val = pci_default_read_config(&s->pci,
-                                      PCI_BASE_ADDRESS_1, 4) & ~0x3U;
-        break;
-    case R200_CONFIG_APER_SIZE:
-        val = s->r300 ? (uint32_t)s->vram_size : s->regs.config_memsize;
-        break;
-    case R200_CONFIG_REG_1_BASE:
-        val = pci_default_read_config(&s->pci,
-                                      PCI_BASE_ADDRESS_2, 4) & ~0xFU;
-        break;
-    case R200_CONFIG_REG_APER_SIZE:
-        val = PPC_MAC_GPU_MMIO_SIZE;
-        break;
-    case R200_CONFIG_CNTL:
-        val = s->regs.config_cntl;
-        break;
-    case R200_MC_FB_LOCATION:
-        val = s->regs.mc_fb_location;
-        break;
-    case R200_MC_AGP_LOCATION:
-        val = s->regs.mc_agp_location;
-        break;
-    case R200_MC_STATUS:
-        /* Report memory controller idle */
-        val = R200_MC_IDLE;
-        if (s->r300 && !s->swap) {
-            /*
-             * R300's idle bit is bit 4, not the older chips' bit 2.  Linux's
-             * radeon (r300_mc_wait_for_idle) and the X radeon DDX (the wait in
-             * RADEONRestoreMemMapRegisters, up to a million usleep(10)s) poll
-             * for it; the Apple driver does not.  PowerMac path unchanged.
-             */
-            val |= 1u << 4;
-        }
-        break;
-
-    /* Bus */
-    case R200_BUS_CNTL:
-        val = s->regs.bus_cntl;
-        break;
-    case R200_HOST_PATH_CNTL:
-        val = s->regs.host_path_cntl | (1 << 23); /* HDP_SOFT_RESET capable */
-        break;
-
-    /* RBBM - report idle with 64 free FIFO entries */
-    case R200_RBBM_STATUS:
-        /* bits [6:0] = CMDFIFO_AVAIL (free entries)
-         * bit 31 = GUI_ACTIVE (1=busy, 0=idle)
-         * bits [30:7] = various pipeline busy flags
-         * ATI kext checks GUI_ACTIVE to wait for idle */
-        val = 64; /* 64 free entries, GUI_ACTIVE=0 (idle) */
-        gpu_debug_log("STATUS_RD RBBM_STATUS -> 0x%08x (idle, %u free)", val, val & 0x7f);
-        {
-            static int rbbm_read_count = 0;
-            rbbm_read_count++;
-            if (gpu_diag_on() &&
-                (rbbm_read_count <= 20 || rbbm_read_count % 1000 == 0)) {
-                qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
-                         "context=idle_poll sequence_id=%d "
-                         "note=RBBM_STATUS_always_idle\n",
-                         (uint32_t)addr, val, rbbm_read_count);
-            }
-        }
-        break;
-
-    /* GUI status - report idle */
-    case R200_GUI_STAT:
-        val = 64; /* Free FIFO entries */
-        gpu_debug_log("STATUS_RD GUI_STAT -> 0x%08x", val);
-        break;
-
-    /*
-     * R300/RV350 register stubs — needed for ATIRadeon9700.kext to init
-     * without crashing.  These registers don't exist on R200/RV280 but
-     * the 9700 kext reads them during startup.  Return safe defaults.
-     */
-    case 0x4018: /* R300_GB_TILE_CONFIG */
-        /* Report 1 pipe, 1 Z pipe — minimum config */
-        val = 0x00000001;
-        break;
-    case 0x4024: /* R300_GB_FIFO_SIZE */
-        /* 32 entries per pipe */
-        val = 0x00000020;
-        break;
-    case 0x4008: /* R300_GB_ENABLE */
-        val = 0;
-        break;
-    case 0x4010: /* R300_GB_MSPOS0 */
-    case 0x4014: /* R300_GB_MSPOS1 */
-        val = 0x66666666; /* standard MS sample positions */
-        break;
-    case 0x401C: /* R300_GB_SELECT */
-    case 0x4020: /* R300_GB_AA_CONFIG */
-        val = 0;
-        break;
-    case 0x2140: /* R300_VAP_CNTL_STATUS */
-        val = 0; /* no errors, not busy */
-        break;
-    case 0x2150: /* R300_VAP_PVS_STATE_FLUSH_REG */
-        val = 0;
-        break;
-    case 0x170C: /* R300_RBBM_SOFT_RESET */
-        val = 0;
-        break;
-    /* CRTC */
-    case R200_CRTC_GEN_CNTL:
-        val = s->regs.crtc_gen_cntl;
-        break;
-    case R200_CRTC_EXT_CNTL:
-        val = s->regs.crtc_ext_cntl;
-        break;
-    case R200_CRTC_STATUS:
-        val = s->regs.crtc_status;
-        break;
-    case R200_CRTC_H_TOTAL_DISP:
-        val = s->regs.crtc_h_total_disp;
-        break;
-    case R200_CRTC_H_SYNC_STRT_WID:
-        val = s->regs.crtc_h_sync_strt_wid;
-        break;
-    case R200_CRTC_V_TOTAL_DISP:
-        val = s->regs.crtc_v_total_disp;
-        break;
-    case R200_CRTC_V_SYNC_STRT_WID:
-        val = s->regs.crtc_v_sync_strt_wid;
-        break;
-    case R200_CRTC_OFFSET:
-        /* bit 30, GUI_TRIG_OFFSET: a new offset is waiting for the next vblank (r100_page_flip waits for it to rise) */
-        {
-            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), frame = NANOSECONDS_PER_SECOND / 60;
-            bool pending = s->regs.crtc_offset_write_ns > 0 && now / frame == s->regs.crtc_offset_write_ns / frame;
-
-            val = s->regs.crtc_offset | (pending ? 1u << 30 : 0);
-        }
-        break;
-    case R200_CRTC_OFFSET_CNTL:
-        val = s->regs.crtc_offset_cntl;
-        break;
-    case R200_CRTC_PITCH:
-        val = s->regs.crtc_pitch;
-        break;
-    case R200_CRTC_GUI_TRIG_VLINE:
-        val = 0;
-        break;
-    case R200_CRTC_VLINE_CRNT_VLINE: {
-        /*
-         * A scanline that walks with time.  The line the beam is on is
-         * reported in bits [26:16]; bits [10:0] are the line the guest
-         * asked to be told about, which it wrote here.  The current line
-         * used to be returned in the low bits, where nothing reads it, so
-         * anything waiting for a scanline saw zero for ever.
-         */
-        uint32_t vtotal = (s->regs.crtc_v_total_disp & 0x7FF) + 1;
-        if (vtotal == 0) vtotal = 628; /* safety */
-        int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        uint64_t frame_ns = NANOSECONDS_PER_SECOND / 60;
-        uint32_t line = (uint32_t)((now_ns % frame_ns) * vtotal / frame_ns);
-        val = (s->regs.crtc_vline & 0x7FF) | ((line & 0x7FF) << 16);
-        break;
-    }
-    case R200_CRTC_CRNT_FRAME:
-        /* Frame counter - increment with time */
-        val = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
-                         (NANOSECONDS_PER_SECOND / 60));
-        break;
-
-    /* DAC */
-    case R200_DAC_CNTL:
-        val = s->regs.dac_cntl;
-        break;
-    case R200_DAC_CNTL2:
-        val = s->regs.dac_cntl2;
-        break;
-
-    /* Palette */
-    case R200_PALETTE_INDEX:
-        val = s->regs.palette_index;
-        break;
-    case R200_PALETTE_DATA:
-        if (s->regs.palette_index < 256) {
-            val = s->regs.palette[s->regs.palette_index];
-        }
-        break;
-
-    /* Cursor */
-    case R200_CUR_OFFSET:
-        val = s->regs.cur_offset;
-        break;
-    case R200_CUR_HORZ_VERT_POSN:
-        val = s->regs.cur_horz_vert_posn;
-        break;
-    case R200_CUR_HORZ_VERT_OFF:
-        val = s->regs.cur_horz_vert_off;
-        break;
-    case R200_CUR_CLR0:
-        val = s->regs.cur_clr0;
-        break;
-    case R200_CUR_CLR1:
-        val = s->regs.cur_clr1;
-        break;
-
-    /* Surface */
-    case R200_SURFACE_CNTL:
-        val = s->regs.surface_cntl;
-        break;
-
-    /* Display */
-    case R200_DISP_MISC_CNTL:
-        val = s->regs.disp_misc_cntl;
-        break;
-    case R200_DISP_OUTPUT_CNTL:
-        val = s->regs.disp_output_cntl;
-        break;
-    case R200_DISP_MERGE_CNTL:
-        val = s->regs.disp_merge_cntl;
-        break;
-    case R200_FP_GEN_CNTL:
-        val = s->regs.fp_gen_cntl;
-        break;
-
-    /* AGP - report AGP 2.0, 4x capable */
-    case R200_AGP_STATUS:
-        val = 0x1F000203; /* AGP 2.0, SBA, 4x/2x/1x capable */
-        break;
-    case R200_AGP_COMMAND:
-        val = s->regs.agp_command;
-        break;
-    case R200_AGP_BASE:
-        val = s->regs.agp_base;
-        break;
-    case R200_AGP_CNTL:
-        val = s->regs.agp_cntl;
-        break;
-
-    /* Clock/PLL - stub with fixed values */
-    case R200_CLOCK_CNTL_INDEX:
-        val = s->regs.clock_cntl_index;
-        break;
-    case R200_CLOCK_CNTL_DATA:
-        val = s->swap ? s->regs.clock_cntl_data
-                      : s->regs.pll[s->regs.clock_cntl_index & 0x3F];
-        break;
-
-    /* 2D engine - read back state */
-    case R200_DST_OFFSET:
-        val = s->regs.dst_offset;
-        break;
-    case R200_DST_PITCH:
-        val = s->regs.dst_pitch;
-        break;
-    case R200_SRC_OFFSET:
-        val = s->regs.src_offset;
-        break;
-    case R200_SRC_PITCH:
-        val = s->regs.src_pitch;
-        break;
-    case R200_DP_GUI_MASTER_CNTL:
-        val = s->regs.dp_gui_master_cntl;
-        break;
-    case R200_DP_CNTL:
-        val = s->regs.dp_cntl;
-        break;
-    case R200_DP_DATATYPE:
-        val = s->regs.dp_datatype;
-        break;
-    case R200_DP_MIX:
-        val = s->regs.dp_mix;
-        break;
-    case R200_DP_WRITE_MSK:
-        val = s->regs.dp_write_msk;
-        break;
-    case R200_SC_TOP_LEFT:
-        val = s->regs.sc_top_left;
-        break;
-    case R200_SC_BOTTOM_RIGHT:
-        val = s->regs.sc_bottom_right;
-        break;
-    case R200_DEFAULT_SC_BOTTOM_RIGHT:
-        val = s->regs.default_sc_bottom_right;
-        break;
-
-    /* CP (command processor) */
-    case R200_CP_RB_BASE:
-        val = s->regs.cp_rb_base;
-        break;
-    case R200_CP_RB_CNTL:
-        val = s->regs.cp_rb_cntl;
-        break;
-    case R200_CP_RB_RPTR:
-        val = s->regs.cp_rb_rptr;
-        break;
-    case R200_CP_RB_WPTR:
-        val = s->regs.cp_rb_wptr;
-        break;
-    case R200_CP_RB_RPTR_ADDR:
-        /* Linux reads this back to place SCRATCH_ADDR; a card returns what was written. */
-        val = s->swap ? 0 : s->regs.cp_rb_rptr_addr;
-        break;
-    case R200_CP_ME_CNTL:
-        val = s->regs.cp_me_cntl;
-        break;
-    case R200_CP_STAT:
-        /* CP status - report idle (all pipeline stages inactive)
-         * bit 31 = CP_BUSY (1=processing commands)
-         * bits [30:0] = various stage busy flags */
-        val = 0;
-        gpu_debug_log("STATUS_RD CP_STAT -> 0x%08x (idle)", val);
-        break;
-    case R200_CP_IB_BASE:
-        val = s->regs.cp_ib_base;
-        break;
-    case R200_CP_IB_BUFSZ:
-        val = s->regs.cp_ib_bufsz;
-        break;
-    case R200_CP_CSQ_CNTL:
-        /*
-         * Kext writes CSQ mode in bits[31:28] and polls until queue
-         * count fields become non-zero.  bits[7:0]=primary count,
-         * bits[15:8]=indirect count, bits[23:16]=indirect2 count.
-         * When mode enables indirect queues (mode 7 = PRIBM+INDBM),
-         * the kext checks ALL enabled queue counts.
-         */
-        /*
-         * How much is still queued.  Everything the guest submits is
-         * carried out before the write returns, so in truth nothing ever
-         * is -- but reporting zero here stops Mac OS X booting: the
-         * driver's engine bring-up waits for these counts to become
-         * non-zero, and hangs at the grey Apple with no spinner if they
-         * never do.  So the counts stay as they were, and PPCGPU_CSQ_IDLE=1
-         * reports an empty queue for anyone chasing a driver that waits
-         * for the queue to drain instead.
-         */
-        /*
-         * How much is still queued.  Everything submitted is carried out
-         * before the write returns, so the honest answer is "nothing" --
-         * but a driver bringing the engine up wants to see the queue
-         * non-empty at least once, and reporting zero from the start left
-         * Mac OS X hanging at the grey Apple.  So: busy on the first read
-         * after something is submitted, empty on the reads after that.
-         * A driver waiting for the queue to drain now gets its answer,
-         * which is what left Halo waiting for ever.
-         * PPCGPU_CSQ=busy keeps the old always-busy reply, =idle always
-         * reports empty.
-         */
-        {
-            static int mode = -1;
-            if (mode < 0) {
-                const char *e = getenv("PPCGPU_CSQ");
-                mode = (e && !strcmp(e, "busy")) ? 1
-                     : (e && !strcmp(e, "idle")) ? 2 : 0;
-            }
-            /*
-             * Bits [7:0] are the only count this register has, and the
-             * driver reads them as room to submit into: a steady 0x40 says
-             * "space for 64", which is what lets Mac OS X finish bringing
-             * the engine up.  Reporting zero hangs the boot.  Halo's freeze
-             * was never here -- it survived both extremes -- so this stays
-             * steady rather than pretending to drain.
-             */
-            uint32_t top = s->regs.cp_csq_cntl & 0xFF000000;
-            val = (mode == 2) ? top : (top | 0x40);
-        }
-        break;
-    case R200_SCRATCH_UMSK:
-        val = s->regs.scratch_umsk;
-        break;
-    case R200_SCRATCH_ADDR:
-        val = s->regs.scratch_addr;
-        break;
-    case R200_CP_ME_RAM_ADDR:
-        val = s->regs.cp_me_ram_addr;
-        break;
-    case R200_CP_CSQ_STAT:
-        /* CSQ status register (0x07f8).
-         * R200/ATIRadeon8500: bits[7:0]=pri_rptr, [15:8]=pri_wptr,
-         * [23:16]=ind_rptr, [31:24]=ind_wptr.  All equal = idle.
-         * R300/ATIRadeon9700: the kext polls this waiting for the value
-         * to change, but we process commands instantly so it never changes
-         * naturally.  Return 0 so both kexts see "queues empty/idle".
-         * The 9700 kext's 99999-iteration timeout will fire and it will
-         * continue initialization with an error (which is acceptable —
-         * we're reverting to the 8500 kext anyway). */
-        val = 0;
-        break;
-    case R200_CP_CSQ_IND_ADDR:
-        val = 0;
-        break;
-    case R200_CP_CSQ_IND_DATA:
-        val = 0;
-        break;
-
-    /* GPIO / I2C / DDC */
-    case R200_GPIO_VGA_DDC ... R200_GPIO_VGA_DDC + 3:
-        val = ppc_mac_gpu_reg_read_offs(s->regs.gpio_vga_ddc,
-                                         addr - R200_GPIO_VGA_DDC, size);
-        break;
-    case R200_GPIO_DVI_DDC ... R200_GPIO_DVI_DDC + 3:
-        val = ppc_mac_gpu_reg_read_offs(s->regs.gpio_dvi_ddc,
-                                         addr - R200_GPIO_DVI_DDC, size);
-        break;
-    case R200_GPIO_MONID ... R200_GPIO_MONID + 3:
-        val = ppc_mac_gpu_reg_read_offs(s->regs.gpio_monid,
-                                         addr - R200_GPIO_MONID, size);
-        break;
-
-    /* Wait/sync */
-    case R200_WAIT_UNTIL:
-        /*
-         * WAIT_UNTIL is write-to-trigger / read-for-completion.
-         *
-         * The kext writes a bitmask of conditions to wait for (e.g.
-         * WAIT_2D_IDLECLEAN, WAIT_HOST_IDLECLEAN, WAIT_DMA_IDLECLEAN),
-         * then polls the register until it reads back 0 (all conditions
-         * satisfied).  On real R200 hardware the GPU clears the bits
-         * once the corresponding pipeline stages become idle.
-         *
-         * In this emulation there is no asynchronous pipeline —
-         * command processing completes synchronously, and RBBM_STATUS
-         * already reports idle.  All wait conditions are therefore
-         * trivially satisfied by the time the guest reads back, so
-         * we always return 0.
-         *
-         * The written value is still latched in s->regs.wait_until
-         * for tracing/debug purposes.
-         */
-        val = 0;
-        break;
-    case R200_ISYNC_CNTL:
-        val = s->regs.isync_cntl;
-        break;
-
-    /* RBBM soft reset */
-    case R200_RBBM_SOFT_RESET:
-        val = 0;
-        break;
-
-    /* DISP_PWR_MAN */
-    case R200_DISP_PWR_MAN:
-        val = 0;
-        break;
-
-    /* Scratch registers — key fence-completion polling path */
-    case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
-        int scratch_idx = (addr - R200_SCRATCH_REG0) / 4;
-        val = s->regs.scratch_reg[scratch_idx];
-        if (getenv("POWEREMU_FENCE_TRACE")) {
-            static uint32_t last[6] = { 0xFFFFFFFF }; static int n;
-            if (val != last[scratch_idx] && n++ < 40) {
-                last[scratch_idx] = val;
-                fprintf(stderr, "ppc-mac-gpu fence: guest reads reg%d = %u\n",
-                        scratch_idx, val);
-            }
-        }
-        gpu_debug_log("STATUS_RD SCRATCH_REG%d -> 0x%08x",
-                      scratch_idx, val);
-        /*
-         * Phase 3B: Log scratch register reads for QE gate analysis.
-         * The guest polls scratch registers to check fence completion.
-         * Log the first 50 reads and then periodically.
-         */
-        {
-            static int scratch_read_count = 0;
-            scratch_read_count++;
-            if (gpu_diag_on() &&
-                (scratch_read_count <= 50 || scratch_read_count % 500 == 0)) {
-                qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
-                         "context=scratch_poll sequence_id=%d "
-                         "note=SCRATCH_REG%d_fence_check\n",
-                         (uint32_t)addr, val, scratch_read_count,
-                         scratch_idx);
-            }
-        }
-        break;
-    }
-
-    /* CRTC2 / misc registers (stubs) */
-    case R200_CRTC2_OFFSET_CNTL:  /* 0x0328 */
-    case R200_CRTC2_PITCH:        /* 0x023C */
-    case R200_FP2_GEN_CNTL:       /* 0x033C */
-    case R200_RBBM_CNTL:          /* 0x1710 */
-        val = 0;
-        break;
-
-    /* 3D engine registers — return shadow values for known 3D regs */
-    case R200_RB3D_CNTL:          /* 0x1C3C */
-    case R200_SE_CNTL:            /* 0x1C4C */
-    case R200_RB3D_DSTCACHE_MODE: /* 0x3258 */
-    {
-        uint32_t idx = ((uint32_t)addr - 0x1C00) / 4;
-        if (idx < 2304) {
-            val = s->regs.regs_3d[idx];
-        }
-        break;
-    }
-    case R200_RB3D_DSTCACHE_CTLSTAT: /* 0x325C — cache flush status */
-    {
-        /*
-         * Kext writes bit 0 (DC_FLUSH) or bit 1 (DC_FREE) to request
-         * a destination cache flush, then polls until those bits clear.
-         * We're a software emulator with no cache, so always return 0
-         * (flush complete) and clear the shadow value.
-         */
-        uint32_t idx = ((uint32_t)addr - 0x1C00) / 4;
-        if (idx < 2304) {
-            uint32_t shadow = s->regs.regs_3d[idx];
-            if (shadow & 0x3) {
-                gpu_debug_log("STATUS_RD RB3D_DSTCACHE_CTLSTAT -> 0 "
-                              "(was 0x%08x, flush complete)", shadow);
-            }
-            s->regs.regs_3d[idx] = 0; /* clear flush bits */
-        }
-        val = 0;
-        break;
-    }
-    case R200_AIC_CTRL:           /* 0x01D0 */
-        val = s->regs.aic_ctrl;
-        break;
-    case R200_AIC_PT_BASE:        /* 0x01D8 */
-        val = s->regs.aic_pt_base;
-        break;
-    case R200_AIC_LO_ADDR:        /* 0x01DC */
-        val = s->regs.aic_lo_addr;
-        break;
-    case R200_AIC_HI_ADDR:        /* 0x01E0 */
-        val = s->regs.aic_hi_addr;
-        break;
-
-    default:
-        /*
-         * 3D engine register range (0x1C00-0x3FFF) — return shadow values.
-         * This allows the kext to read back any 3D register it has written.
-         */
-        if (addr >= 0x1C00 && addr < 0x4000) {
-            uint32_t idx = ((uint32_t)addr - 0x1C00) / 4;
-            if (idx < 2304) {
-                val = s->regs.regs_3d[idx];
-            }
-            break;
-        }
-
-        /*
-         * PCI config space mirror at 0x0F00-0x0F3F.
-         * ATI GPUs mirror their PCI config space into MMIO so the driver
-         * can read PCI identity (vendor/device ID) without going through
-         * the host bridge. The kext reads DEVICE_ID at 0x0F02 to verify
-         * the card before doing anything else.
-         */
-        if (addr >= R200_PCI_MIRROR_BASE && addr < R200_PCI_MIRROR_END) {
-            uint32_t pci_off = addr - R200_PCI_MIRROR_BASE;
-            val = pci_default_read_config(&s->pci, pci_off, size);
-            break;
-        }
-
-        /*
-         * VBE DISPI registers (0x500-0x514) - qemu_vga.ndrv compatibility.
-         * The NDRV accesses these as 16-bit reads at (reg << 1) + 0x500.
-         * This provides the Bochs VBE interface for mode query/set.
-         */
-        if (addr >= PPC_MAC_GPU_VBE_OFFSET &&
-            addr < PPC_MAC_GPU_VBE_END) {
-            uint32_t vbe_idx = (addr - PPC_MAC_GPU_VBE_OFFSET) >> 1;
-            if (vbe_idx < VBE_DISPI_INDEX_NB) {
-                val = s->regs.vbe_regs[vbe_idx];
-                static const char *vbe_names[] = {
-                    "ID", "XRES", "YRES", "BPP", "ENABLE",
-                    "BANK", "VIRT_WIDTH", "VIRT_HEIGHT",
-                    "X_OFF", "Y_OFF", "VMEM_64K"
-                };
-                const char *name = vbe_idx < 11 ? vbe_names[vbe_idx] : "?";
-                gpu_debug_log("VBE_RD [%u] %s -> 0x%04x",
-                              vbe_idx, name, (uint32_t)val);
-            }
-            break;
-        }
-
-        /*
-         * VGA DAC registers (0x400-0x41F) - qemu_vga.ndrv palette access.
-         * Port mapping: MMIO offset = port + 0x400 - 0x3C0.
-         */
-        if (addr >= PPC_MAC_GPU_VGA_OFFSET &&
-            addr < PPC_MAC_GPU_VGA_END) {
-            uint16_t port = (addr - PPC_MAC_GPU_VGA_OFFSET) + 0x3C0;
-            switch (port) {
-            case 0x3C0:  /* AR Index/Data */
-                val = s->regs.vga_ar_index;
-                break;
-            case 0x3C7:  /* DAC State */
-                val = 3;  /* always in read mode state */
-                break;
-            case 0x3C8:  /* DAC Write Address */
-                val = s->regs.vga_dac_write_index;
-                break;
-            case 0x3C9: {  /* DAC Data (read) */
-                uint8_t idx = s->regs.vga_dac_read_index;
-                val = s->regs.vga_dac_palette[idx][s->regs.vga_dac_sub_index];
-                s->regs.vga_dac_sub_index++;
-                if (s->regs.vga_dac_sub_index >= 3) {
-                    s->regs.vga_dac_sub_index = 0;
-                    s->regs.vga_dac_read_index++;
-                }
-                break;
-            }
-            default:
-                val = 0;
-                break;
-            }
-            break;
-        }
-
-        /*
-         * VBE extended registers (0x600-0x61F) - interrupt control.
-         * Accessed as 32-bit at (reg << 2) + 0x600.
-         */
-        if (addr >= PPC_MAC_GPU_EXT_OFFSET &&
-            addr < PPC_MAC_GPU_EXT_END) {
-            uint32_t ext_reg = (addr - PPC_MAC_GPU_EXT_OFFSET) >> 2;
-            if (ext_reg == 2) {
-                /* VBL interrupt status register */
-                val = s->regs.gen_int_status & R200_CRTC_VBLANK_INT;
-            }
-            break;
-        }
-
-        /* R300 register catch-all: any register in R300-specific ranges
-         * that isn't handled by a specific case above gets returned from
-         * shadow storage.  This lets ATIRadeon9700.kext read back any
-         * R300 register it has written. */
-        if (addr < 0x5000 && is_r300_register((uint32_t)addr)) {
-            val = s->r300_shadow[(uint32_t)addr / 4];
-            break;
-        }
-
-        trace_ppc_mac_gpu_mmio_read_unimpl(size, addr,
-                                            ppc_mac_gpu_reg_name(addr));
-        /*
-         * Phase 3B: Log unhandled register reads — these are the most
-         * suspicious candidates for QE capability gates returning wrong
-         * values (we return 0 for all of them).
-         */
-        {
-            static int unhandled_read_count = 0;
-            unhandled_read_count++;
-            if (unhandled_read_count <= 100 ||
-                unhandled_read_count % 500 == 0) {
-                qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
-                         "context=unhandled_read sequence_id=%d "
-                         "note=UNIMPL_%s_returns_zero\n",
-                         (uint32_t)addr, 0, unhandled_read_count,
-                         ppc_mac_gpu_reg_name(addr));
-            }
-        }
-        val = 0;
-        break;
+    if (!ppc_mac_gpu_mmio_read_cfg(s, addr, size, &val) &&
+        !ppc_mac_gpu_mmio_read_display(s, addr, size, &val) &&
+        !ppc_mac_gpu_mmio_read_2d(s, addr, size, &val) &&
+        !ppc_mac_gpu_mmio_read_cp(s, addr, size, &val)) {
+        ppc_mac_gpu_mmio_read_stub_3d(s, addr, size, &val);
     }
 
     /*
@@ -10902,6 +8706,54 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     return val;
 }
 
+
+/* Caller probe (x86/KVM): who reads the registers the driver polls after the memory init.  Logs rip, rsp and the
+ * top of the guest stack at the first read and at read #10, so the return addresses map to driver functions. */
+static void gpu_caller_probe(hwaddr addr)
+{
+#if defined(__x86_64__) && !PPC_MAC_GPU_BE
+    static const uint32_t watch[] = { 0x01EC, 0x01F0, 0x0334, 0x07FC, 0x0804, 0x0888, 0x0908, 0x1608 };
+    static unsigned cnt[ARRAY_SIZE(watch)];
+
+    for (unsigned i = 0; i < ARRAY_SIZE(watch); i++) {
+        if (watch[i] != (addr & ~3ull)) {
+            continue;
+        }
+        if ((++cnt[i] == 1 || cnt[i] == 10) && current_cpu) {
+            struct kvm_regs kr;
+            uint32_t stk[24] = {0};
+
+            if (ioctl(current_cpu->kvm_fd, KVM_GET_REGS, &kr) == 0) {
+                cpu_memory_rw_debug(current_cpu, kr.rsp & 0xffffffff, stk, sizeof(stk), 0);
+                gpu_debug_log("CALLER reg=0x%04x read #%u rip=0x%"PRIx64" rsp=0x%"PRIx64" cr: %08x %08x %08x %08x "
+                              "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                              watch[i], cnt[i], (uint64_t)kr.rip, (uint64_t)kr.rsp, stk[0], stk[1], stk[2], stk[3],
+                              stk[4], stk[5], stk[6], stk[7], stk[8], stk[9], stk[10], stk[11], stk[12], stk[13],
+                              stk[14], stk[15]);
+            }
+        }
+        return;
+    }
+#endif
+}
+
+/* Every register read, with the value the emulator answered (PPCGPU_DEBUG_LOG=1). */
+static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    uint64_t val = ppc_mac_gpu_mmio_read_impl(opaque, addr, size);
+
+    if (unlikely(gpu_debug_enabled())) {
+        gpu_track_pass = gpu_tracked_reg(addr);
+        gpu_debug_log("MMIO_RD size=%u addr=0x%04"PRIx64" (%s) = 0x%"PRIx64,
+                      size, (uint64_t)addr, ppc_mac_gpu_reg_name(addr), val);
+        if (gpu_track_pass) {
+            gpu_caller_probe(addr);
+        }
+        gpu_track_pass = false;
+    }
+    return val;
+}
+
 /* ========================================================================
  * MMIO write handler
  * ======================================================================== */
@@ -10924,7 +8776,6 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
     case 0x2204:    /* SE_TCL_VECTOR_DATA_REG */
         s->regs.tcl_vec[s->regs.tcl_vec_addr & 0x7ff][s->regs.tcl_vec_comp] = val;
         if (++s->regs.tcl_vec_comp == 4) {
-            uint32_t a = s->regs.tcl_vec_addr & 0x7ff;
             /* POWEREMU_VP_TRACE: the vertex programs the guest uploads.
              * Instructions sit at 0x080-0x0BF and 0x180-0x1BF, four dwords
              * each; everything else here is constants, matrices or lights. */
@@ -10952,83 +8803,30 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
 }
 
 
-static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
-                                    uint64_t val, unsigned int size)
+static bool ppc_mac_gpu_mmio_write_misc(PPCMacGPUState *s, hwaddr addr,
+                                        uint64_t val, unsigned int size)
 {
-    PPCMacGPUState *s = opaque;
-
-    if (addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END) {
-        if (size == 4) {
-            ppc_mac_gpu_hwc_write(s, addr - PPC_MAC_GPU_HWC_BASE, val);
-        }
-        return;
-    }
-    if (addr >= 0x780 && addr < 0x7C0) {
-        seq_log("DMA  wr reg=%03x val=%08x", (unsigned)addr, (uint32_t)val);
-    }
-    /* No flush here: CPU-side 2D operations check their own VRAM ranges
-     * (r200_vram_access), fences complete asynchronously, and the other
-     * registers do not touch VRAM. */
-    if (unlikely(r200_traffic_on())) {
-        if (r200_in_pm4) {
-            r200_traffic.type0_regs++;
-        } else {
-            r200_traffic.mmio_writes++;
-        }
-        r200_traffic_tick();
-    }
-    /*
-     * Every PM4 type-0 register also lands here -- about a million a second
-     * under a game -- so nothing on this path may cost anything while the
-     * loggers are off.
-     */
-    if (unlikely(gpu_debug_enabled())) {
-        const char *nm = ppc_mac_gpu_reg_name(addr);
-
-        gpu_debug_log("MMIO_WR size=%u addr=0x%04"PRIx64" val=0x%"PRIx64" (%s)",
-                      size, (uint64_t)addr, val, nm);
-        trace_ppc_mac_gpu_mmio_write(size, addr, nm, val);
-    }
-
-    if (s->r3 && r300_state_owns(addr)) {
-        r300_state_write(s->r3, addr, val);
-        if (addr == 0x4F58 || addr == 0x4F5C) {
-            r300_zpass_write(s, addr, val);
-        }
-    }
-    if (s->r300 && addr >= 0x0B00 && addr < 0x0B80) {
-        s->r300_surf[(addr - 0x0B00) / 4] = val;   /* SURFACEn bounds/info */
-        if (addr == 0x0B0C) {
-            r300_surface_changed(s);
-            r300_surfwatch_update(s);
-        }
-    }
-    if (s->r300 && addr == 0x0AB0) {
-        s->r300_aic_pt_base = val & ~0xFFFu;    /* PCI GART table base */
-        r200_agp_tc_flush();
-    }
-    if (unlikely(s->r3_dump && s->r3->draws && s->r3_trace_lines < 40000)) {
-        const char *nm = r300_state_owns(addr) ? r300_reg_name(addr) : NULL;
-        s->r3_trace_lines++;
-        fprintf(s->r3_dump, "W %04x %08x %s%s\n", (unsigned)addr, (uint32_t)val,
-                nm ? nm : ppc_mac_gpu_reg_name(addr), r200_in_pm4 ? "" : " (mmio)");
-    }
-
-    /* Handle indexed register access */
-    if (addr == R200_MM_DATA && s->regs.mm_index) {
-        ppc_mac_gpu_mmio_write(s, s->regs.mm_index, val, size);
-        return;
-    }
-
     switch (addr) {
+    case R200_CRTC_STATUS:
+        if (val & R200_CRTC_VBLANK_SAVE_CLEAR) {
+            s->regs.crtc_vblank_clear_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->regs.crtc_status &= ~R200_CRTC_VBLANK_SAVE;
+        }
+        break;
+
     case R200_MM_INDEX:
-        s->regs.mm_index = val & 0xFFFF;
+        s->regs.mm_index = val & (MM_INDEX_APER | 0xFFFF);   /* bit 31 = VRAM aperture */
         break;
 
     /* BIOS scratch */
-    case R200_BIOS_0_SCRATCH ... R200_BIOS_7_SCRATCH:
-        s->regs.bios_scratch[(addr - R200_BIOS_0_SCRATCH) / 4] = val;
+    case R200_BIOS_0_SCRATCH ... R200_BIOS_7_SCRATCH: {
+        uint32_t sh = (addr & 3) * 8;
+        uint32_t m = size >= 4 ? 0xFFFFFFFFu : ((1u << (size * 8)) - 1) << sh;
+        uint32_t *r = &s->regs.bios_scratch[(addr - R200_BIOS_0_SCRATCH) / 4];
+
+        *r = size >= 4 ? (uint32_t)val : (*r & ~m) | (((uint32_t)val << sh) & m);
         break;
+    }
 
     /* Interrupt */
     case R200_GEN_INT_CNTL:
@@ -11058,9 +8856,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_MC_AGP_LOCATION:
         s->regs.mc_agp_location = val;
-        if (!s->swap) {
-            r200_agp_tc_flush();        /* the aperture moved: translations differ */
-        }
+        r200_agp_tc_flush();        /* the aperture moved: translations differ */
         break;
 
     /* Bus */
@@ -11135,13 +8931,24 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         }
         break;
 
+    default:
+        return false;
+    }
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_write_display(PPCMacGPUState *s, hwaddr addr,
+                                           uint64_t val, unsigned int size)
+{
+    switch (addr) {
     /* CRTC */
     case R200_CRTC_GEN_CNTL:
         s->regs.crtc_gen_cntl = val;
+        ppc_mac_gpu_vga_bank_update(s);
         s->display_invalid = true;
-        if (!s->swap) {
+#if !PPC_MAC_GPU_BE
             ppc_mac_gpu_cursor_sync(s);
-        }
+#endif
         break;
     case R200_CRTC_EXT_CNTL:
         s->regs.crtc_ext_cntl = val;
@@ -11164,25 +8971,25 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_CRTC_OFFSET:
         if (val != s->regs.crtc_offset) {
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
-                          s->regs.crtc_offset, val);
-            r200_rate.flips++;             /* page flip: one frame */
-            r200_perf_present();
+                          s->regs.crtc_offset, (uint32_t)val);
         }
-        s->regs.crtc_offset = val & ~(1u << 30);
+        /* bit 30 is GUI_TRIG_OFFSET (an action, reads back while pending) and bit 31 OFFSET_LOCK (the Catalyst
+         * driver and its video BIOS write 0x80020000); neither is part of the address. */
+        s->regs.crtc_offset = val & ~(3u << 30);
         s->regs.crtc_offset_write_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         s->display_invalid = true;
         break;
     case R200_CRTC_OFFSET_CNTL:
         if (val != s->regs.crtc_offset_cntl) {
             blit_path_log("CRTC", "OFFSET_CNTL changed 0x%x -> 0x%x",
-                          s->regs.crtc_offset_cntl, val);
+                          s->regs.crtc_offset_cntl, (uint32_t)val);
         }
         s->regs.crtc_offset_cntl = val;
         break;
     case R200_CRTC_PITCH:
         if (val != s->regs.crtc_pitch) {
             blit_path_log("CRTC", "PITCH changed 0x%x -> 0x%x",
-                          s->regs.crtc_pitch, val);
+                          s->regs.crtc_pitch, (uint32_t)val);
         }
         s->regs.crtc_pitch = val;
         s->display_invalid = true;
@@ -11194,6 +9001,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* DAC */
     case R200_DAC_CNTL:
         s->regs.dac_cntl = val;
+        if (s->legacy_vga) {
+            s->vga->dac_8bit = (val & 0x100) != 0;      /* DAC_8BIT_EN */
+        }
         break;
     case R200_DAC_CNTL2:
         s->regs.dac_cntl2 = val;
@@ -11205,7 +9015,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_PALETTE_DATA:
         if (s->regs.palette_index < 256) {
-            s->regs.palette[s->regs.palette_index] = val;
+            gpu_dac_set(s, s->regs.palette_index, val);
             s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
         }
         break;
@@ -11213,21 +9023,21 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* Cursor */
     case R200_CUR_OFFSET:
         s->regs.cur_offset = val;
-        if (!s->swap) {
+#if !PPC_MAC_GPU_BE
             ppc_mac_gpu_cursor_sync(s);
-        }
+#endif
         break;
     case R200_CUR_HORZ_VERT_POSN:
         s->regs.cur_horz_vert_posn = val;
-        if (!s->swap) {
+#if !PPC_MAC_GPU_BE
             ppc_mac_gpu_cursor_sync(s);
-        }
+#endif
         break;
     case R200_CUR_HORZ_VERT_OFF:
         s->regs.cur_horz_vert_off = val;
-        if (!s->swap) {
+#if !PPC_MAC_GPU_BE
             ppc_mac_gpu_cursor_sync(s);
-        }
+#endif
         break;
     case R200_CUR_CLR0:
         s->regs.cur_clr0 = val;
@@ -11270,7 +9080,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_CLOCK_CNTL_DATA:
         s->regs.clock_cntl_data = val;
-        if (!s->swap && (s->regs.clock_cntl_index & 0x80)) {   /* PLL_WR_EN */
+        if (s->regs.clock_cntl_index & 0x80) {   /* PLL_WR_EN */
             uint32_t pi = s->regs.clock_cntl_index & 0x3F;
 
             /*
@@ -11282,6 +9092,16 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         }
         break;
 
+    default:
+        return false;
+    }
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_write_2d(PPCMacGPUState *s, hwaddr addr,
+                                      uint64_t val, unsigned int size)
+{
+    switch (addr) {
     /* 2D engine registers - store state */
     case R200_SRC_PITCH_OFFSET:
         s->regs.src_pitch_offset = val;
@@ -11322,30 +9142,38 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_DST_HEIGHT_WIDTH: {
         /* Alternate blit trigger with h|w format */
-        if (!s->swap) {
-            ppc_mac_gpu_2d_le(s, val & 0x3FFF, (val >> 16) & 0x3FFF);
-            break;
+        if (gpu_unified_2d()) {
+            /* the PowerPC build's old engine took this trigger's surfaces from
+             * the separate offset/pitch registers */
+            ppc_mac_gpu_2d(s, val & 0x3FFF, (val >> 16) & 0x3FFF, GUEST_LE == 0);
         }
-        uint32_t h = (val >> 16) & 0x3FFF;
-        uint32_t w = val & 0x3FFF;
-        s->regs.dst_width_height = (w << 16) | h;
-        if (w > 0 && h > 0 && s->regs.dst_pitch > 0) {
-            ppc_mac_gpu_2d_blit_sep(s);
+#if PPC_MAC_GPU_BE
+        else {
+            uint32_t h = (val >> 16) & 0x3FFF;
+            uint32_t w = val & 0x3FFF;
+            s->regs.dst_width_height = (w << 16) | h;
+            if (w > 0 && h > 0 && s->regs.dst_pitch > 0) {
+                ppc_mac_gpu_2d_blit_sep(s);
+            }
         }
+#endif
         break;
     }
     case R200_DST_WIDTH_HEIGHT: {
         /* Blit trigger with w|h format (0x1598) */
         s->regs.dst_width_height = val;
-        if (!s->swap) {
-            ppc_mac_gpu_2d_le(s, (val >> 16) & 0x3FFF, val & 0x3FFF);
-            break;
+        if (gpu_unified_2d()) {
+            ppc_mac_gpu_2d(s, (val >> 16) & 0x3FFF, val & 0x3FFF, false);
         }
-        uint32_t w2 = (val >> 16) & 0x3FFF;
-        uint32_t h2 = val & 0x3FFF;
-        if (w2 > 0 && h2 > 0) {
-            ppc_mac_gpu_2d_blit(s);
+#if PPC_MAC_GPU_BE
+        else {
+            uint32_t w2 = (val >> 16) & 0x3FFF;
+            uint32_t h2 = val & 0x3FFF;
+            if (w2 > 0 && h2 > 0) {
+                ppc_mac_gpu_2d_blit(s);
+            }
         }
+#endif
         break;
     }
     case R200_DST_Y_X:
@@ -11437,10 +9265,20 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.default_pitch_offset = val;
         break;
 
+    default:
+        return false;
+    }
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_write_cp(PPCMacGPUState *s, hwaddr addr,
+                                      uint64_t val, unsigned int size)
+{
+    switch (addr) {
     /* CP - command processor */
     case R200_CP_RB_BASE:
         s->regs.cp_rb_base = val;
-        gpu_debug_log("CP_SETUP RB_BASE=0x%08x", val);
+        gpu_debug_log("CP_SETUP RB_BASE=0x%08x", (uint32_t)val);
         trace_ppc_mac_gpu_cp_ring_setup(val, s->regs.cp_rb_cntl);
         break;
     case R200_CP_RB_RPTR_ADDR:
@@ -11449,18 +9287,18 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_CP_RB_CNTL:
         s->regs.cp_rb_cntl = val;
-        gpu_debug_log("CP_SETUP RB_CNTL=0x%08x (log2size=%u)", val, val & 0x3f);
+        gpu_debug_log("CP_SETUP RB_CNTL=0x%08x (log2size=%u)", (uint32_t)val, (uint32_t)val & 0x3f);
         break;
     case R200_CP_RB_RPTR:
         s->regs.cp_rb_rptr = val;
         ppc_mac_gpu_rptr_writeback(s);
-        gpu_debug_log("CP_RING RPTR <- %u", val);
+        gpu_debug_log("CP_RING RPTR <- %u", (uint32_t)val);
         break;
     case R200_CP_RB_WPTR: {
         uint32_t old_rptr = s->regs.cp_rb_rptr;
         gpu_debug_log("CP_RING WPTR <- %u (prev=%u, delta=%d)",
-                      val, s->regs.cp_rb_wptr,
-                      (int)val - (int)s->regs.cp_rb_wptr);
+                      (uint32_t)val, s->regs.cp_rb_wptr,
+                      (int)(uint32_t)val - (int)s->regs.cp_rb_wptr);
         s->regs.cp_rb_wptr = val;
 
         /*
@@ -11469,8 +9307,6 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
          */
         if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
             s->regs.stall_ring_dwords += (val >= old_rptr) ? (val - old_rptr) : val;
-            r200_traffic.ring_dwords += (val >= old_rptr) ? (val - old_rptr)
-                                                          : val;
             ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
         }
 
@@ -11486,15 +9322,15 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     case R200_CP_ME_CNTL:
         s->regs.cp_me_cntl = val;
-        gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", val, !(val & 0x10000000));
+        gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", (uint32_t)val, !((uint32_t)val & 0x10000000));
         break;
     case R200_CP_IB_BASE:
         s->regs.cp_ib_base = val;
-        gpu_debug_log("CP_IB BASE <- 0x%08x", val);
+        gpu_debug_log("CP_IB BASE <- 0x%08x", (uint32_t)val);
         break;
     case R200_CP_IB_BUFSZ:
         s->regs.cp_ib_bufsz = val;
-        gpu_debug_log("CP_IB BUFSZ <- %u dwords (KICK! base=0x%08x)", val, s->regs.cp_ib_base);
+        gpu_debug_log("CP_IB BUFSZ <- %u dwords (KICK! base=0x%08x)", (uint32_t)val, s->regs.cp_ib_base);
         /* Writing BUFSZ triggers IB execution */
         ppc_mac_gpu_execute_ib(s, s->regs.cp_ib_base, val);
         /*
@@ -11520,7 +9356,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_CP_CSQ_CNTL:
         /* Store value - kext polls until read-back matches */
         s->regs.cp_csq_cntl = val;
-        gpu_debug_log("CP_SETUP CSQ_CNTL=0x%08x (mode=%u)", val, (val >> 28) & 0xf);
+        gpu_debug_log("CP_SETUP CSQ_CNTL=0x%08x (mode=%u)", (uint32_t)val, ((uint32_t)val >> 28) & 0xf);
         break;
     case R200_SCRATCH_UMSK:
         s->regs.scratch_umsk = val;
@@ -11564,14 +9400,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
              addr + size > R200_GPIO_DVI_DDC + 2) ||
             (addr == R200_GPIO_DVI_DDC &&
              (s->regs.gpio_dvi_ddc & 0x30000))) {
-            if (!s->swap) {
+#if !PPC_MAC_GPU_BE
                 /* one monitor, on the VGA connector: nothing answers on this port, so
                  * both lines float high and the driver sees it as unconnected */
                 s->regs.gpio_dvi_ddc |= 0x300;
-            } else {
+#else
                 s->regs.gpio_dvi_ddc = ppc_mac_gpu_i2c(&s->bbi2c,
                                                      s->regs.gpio_dvi_ddc, 0);
-            }
+#endif
         }
         break;
     case R200_GPIO_MONID ... R200_GPIO_MONID + 3:
@@ -11581,14 +9417,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
              addr + size > R200_GPIO_MONID + 2) ||
             (addr == R200_GPIO_MONID &&
              (s->regs.gpio_monid & 0x30000))) {
-            if (!s->swap) {
+#if !PPC_MAC_GPU_BE
                 /* one monitor, on the VGA connector: nothing answers on this port, so
                  * both lines float high and the driver sees it as unconnected */
                 s->regs.gpio_monid |= 0x300;
-            } else {
+#else
                 s->regs.gpio_monid = ppc_mac_gpu_i2c(&s->bbi2c,
                                                      s->regs.gpio_monid, 0);
-            }
+#endif
         }
         break;
 
@@ -11623,34 +9459,36 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         ppc_mac_gpu_host_data_write(s, val);
         break;
 
+    default:
+        return false;
+    }
+    return true;
+}
+
+static bool ppc_mac_gpu_mmio_write_gart_stub_3d(PPCMacGPUState *s, hwaddr addr,
+                                                uint64_t val, unsigned int size)
+{
+    switch (addr) {
     /* GART (AGP Intelligent Controller) registers */
     case R200_AIC_CTRL:           /* 0x01D0 */
         s->regs.aic_ctrl = val;
-        if (!s->swap) {
-            r200_agp_tc_flush();        /* the aperture moved: translations differ */
-        }
-        gpu_debug_log("GART AIC_CTRL=0x%x (enabled=%d)", val, val & 1);
+        r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        gpu_debug_log("GART AIC_CTRL=0x%x (enabled=%d)", (uint32_t)val, (uint32_t)val & 1);
         break;
     case R200_AIC_PT_BASE:        /* 0x01D8 */
         s->regs.aic_pt_base = val;
-        if (!s->swap) {
-            r200_agp_tc_flush();        /* the aperture moved: translations differ */
-        }
-        gpu_debug_log("GART PT_BASE=0x%x", val);
+        r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        gpu_debug_log("GART PT_BASE=0x%x", (uint32_t)val);
         break;
     case R200_AIC_LO_ADDR:        /* 0x01DC */
         s->regs.aic_lo_addr = val;
-        if (!s->swap) {
-            r200_agp_tc_flush();        /* the aperture moved: translations differ */
-        }
-        gpu_debug_log("GART LO_ADDR=0x%x", val);
+        r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        gpu_debug_log("GART LO_ADDR=0x%x", (uint32_t)val);
         break;
     case R200_AIC_HI_ADDR:        /* 0x01E0 */
         s->regs.aic_hi_addr = val;
-        if (!s->swap) {
-            r200_agp_tc_flush();        /* the aperture moved: translations differ */
-        }
-        gpu_debug_log("GART HI_ADDR=0x%x", val);
+        r200_agp_tc_flush();        /* the aperture moved: translations differ */
+        gpu_debug_log("GART HI_ADDR=0x%x", (uint32_t)val);
         break;
 
     /* CRTC2 / misc stubs - accept writes silently */
@@ -11694,7 +9532,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                 trace_ppc_mac_gpu_3d_reg_write(addr, val);
             }
             gpu_debug_log("3D_MMIO 0x%04x <- 0x%08x%s",
-                          (uint32_t)addr, val,
+                          (uint32_t)addr, (uint32_t)val,
                           addr == 0x1C3C ? " (RB3D_CNTL)" :
                           addr == 0x1C4C ? " (SE_CNTL)" : "");
         }
@@ -11729,7 +9567,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                     case 0x20BC: name = "RE_STIPPLE_ADDR"; break;
                     }
                     gpu_debug_log("3D_MMIO 0x%04x <- 0x%08x (%s)",
-                                  (uint32_t)addr, val, name);
+                                  (uint32_t)addr, (uint32_t)val, name);
                 }
             }
             break;
@@ -11767,7 +9605,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                     s->regs.crtc_offset = val * w * ((bpp + 7) / 8);
                     s->display_invalid = true;
                     gpu_debug_log("VBE Y_OFFSET=%u -> crtc_offset=0x%x",
-                                  val, s->regs.crtc_offset);
+                                  (uint32_t)val, s->regs.crtc_offset);
                 }
 
                 if (vbe_idx == VBE_DISPI_INDEX_ENABLE &&
@@ -11813,9 +9651,10 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         /*
          * VGA DAC registers (0x400-0x41F) - qemu_vga.ndrv palette writes.
          */
-        if (addr >= PPC_MAC_GPU_VGA_OFFSET &&
-            addr < PPC_MAC_GPU_VGA_END) {
-            uint16_t port = (addr - PPC_MAC_GPU_VGA_OFFSET) + 0x3C0;
+        if ((addr >= PPC_MAC_GPU_VGA_OFFSET && addr < PPC_MAC_GPU_VGA_END) ||
+            (addr >= 0x3C0 && addr < 0x3E0)) {         /* the ports' own offsets */
+            uint16_t port = addr >= 0x3C0 && addr < 0x3E0
+                            ? addr : (addr - PPC_MAC_GPU_VGA_OFFSET) + 0x3C0;
             switch (port) {
             case 0x3C0:  /* AR Index/Data */
                 if (s->regs.vga_ar_flip_flop == 0) {
@@ -11899,9 +9738,138 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             break;
         }
 
+        if (ppc_mac_gpu_post_reg(addr) >= 0) {
+            uint32_t sh = (addr & 3) * 8;
+            uint32_t m = size >= 4 ? 0xFFFFFFFFu : ((1u << (size * 8)) - 1) << sh;
+            uint32_t *r = &s->r300_shadow[(uint32_t)(addr & ~3ull) / 4];
+
+            *r = size >= 4 ? (uint32_t)val : (*r & ~m) | (((uint32_t)val << sh) & m);
+            break;
+        }
+        if (addr == 0x01F8) {
+            s->mc_ind_index = val;
+            break;
+        }
+        if (addr == 0x01FC) {
+            if (s->mc_ind_index & 0x100) {          /* R300_MC_IND_WR_EN */
+                s->mc_ind[s->mc_ind_index & 0x7F] = val;
+            }
+            break;
+        }
+
+        if (size < 4 || (addr & 3)) {
+            /* byte enables: merge the lane into the dword */
+            uint32_t sh = (addr & 3) * 8;
+            uint32_t m = (size >= 4 ? 0xFFFFFFFFu : (1u << (size * 8)) - 1) << sh;
+            uint32_t cur = ppc_mac_gpu_mmio_read(s, addr & ~3ull, 4);
+
+            ppc_mac_gpu_mmio_write(s, addr & ~3ull, (cur & ~m) | (((uint32_t)val << sh) & m), 4);
+            break;
+        }
+
         trace_ppc_mac_gpu_mmio_write_unimpl(size, addr,
                                              ppc_mac_gpu_reg_name(addr), val);
         break;
+    }
+    return true;
+}
+
+static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
+                                    uint64_t val, unsigned int size)
+{
+    PPCMacGPUState *s = opaque;
+
+    if (addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END) {
+        if (size == 4) {
+            ppc_mac_gpu_hwc_write(s, addr - PPC_MAC_GPU_HWC_BASE, val);
+        }
+        return;
+    }
+    if (addr >= 0x780 && addr < 0x7C0) {
+        seq_log("DMA  wr reg=%03x val=%08x", (unsigned)addr, (uint32_t)val);
+    }
+    /* No flush here: CPU-side 2D operations check their own VRAM ranges
+     * (gpu_vram_access), fences complete asynchronously, and the other
+     * registers do not touch VRAM. */
+    /*
+     * Every PM4 type-0 register also lands here -- about a million a second
+     * under a game -- so nothing on this path may cost anything while the
+     * loggers are off.
+     */
+    if (unlikely(gpu_debug_enabled())) {
+        const char *nm = ppc_mac_gpu_reg_name(addr);
+
+        gpu_track_pass = gpu_tracked_reg(addr);
+        gpu_debug_log("MMIO_WR size=%u addr=0x%04"PRIx64" val=0x%"PRIx64" (%s)",
+                      size, (uint64_t)addr, val, nm);
+        gpu_track_pass = false;
+        trace_ppc_mac_gpu_mmio_write(size, addr, nm, val);
+    }
+
+    if (s->r3 && r300_state_owns(addr)) {
+        r300_state_write(s->r3, addr, val);
+        if (addr == 0x4F58 || addr == 0x4F5C) {
+            r300_zpass_write(s, addr, val);
+        }
+    }
+    if (addr >= 0x0B00 && addr < 0x0B80) {
+        s->r300_surf[(addr - 0x0B00) / 4] = val;   /* SURFACEn bounds/info */
+        if (addr == 0x0B0C) {
+            r300_surface_changed(s);
+            r300_surfwatch_update(s);
+        }
+    }
+    if (addr == 0x0AB0) {
+        s->r300_aic_pt_base = val & ~0xFFFu;    /* PCI GART table base */
+        r200_agp_tc_flush();
+    }
+    if (unlikely(s->r3_dump && s->r3->draws && s->r3_trace_lines < 40000)) {
+        const char *nm = r300_state_owns(addr) ? r300_reg_name(addr) : NULL;
+        s->r3_trace_lines++;
+        fprintf(s->r3_dump, "W %04x %08x %s%s\n", (unsigned)addr, (uint32_t)val,
+                nm ? nm : ppc_mac_gpu_reg_name(addr), " (mmio)");
+    }
+
+    if (size < 4 && (addr & 3) == 0 &&
+        (addr == R200_CRTC_GEN_CNTL || addr == R200_CRTC_EXT_CNTL ||
+         addr == R200_DAC_CNTL || addr == R200_DAC_CNTL2)) {
+        /* a byte or word of a control register: the other bytes stay as they were */
+        uint32_t m = (1u << (size * 8)) - 1;
+        uint32_t cur = addr == R200_CRTC_GEN_CNTL ? s->regs.crtc_gen_cntl :
+                       addr == R200_CRTC_EXT_CNTL ? s->regs.crtc_ext_cntl :
+                       addr == R200_DAC_CNTL ? s->regs.dac_cntl : s->regs.dac_cntl2;
+
+        val = (cur & ~m) | (val & m);
+        size = 4;
+    }
+
+    /* Handle indexed register access */
+    if (addr >= R200_MM_DATA && addr < R200_MM_DATA + 4) {
+        if (s->regs.mm_index & MM_INDEX_APER) {
+            ppc_mac_gpu_mm_aper_write(s, (s->regs.mm_index & 0x7FFFFFFFu) +
+                                      (addr - R200_MM_DATA), val, size);
+            return;
+        }
+        if (ppc_mac_gpu_mm_reg_index(s)) {
+            ppc_mac_gpu_mmio_write(s, ppc_mac_gpu_mm_reg_index(s) + (addr - R200_MM_DATA), val, size);
+            return;
+        }
+    }
+
+    if (ppc_mac_gpu_mmio_write_misc(s, addr, val, size)) {
+        return;
+    }
+    if (ppc_mac_gpu_mmio_write_display(s, addr, val, size)) {
+        return;
+    }
+    if (ppc_mac_gpu_mmio_write_2d(s, addr, val, size)) {
+        return;
+    }
+    if (ppc_mac_gpu_mmio_write_cp(s, addr, val, size)) {
+        return;
+    }
+    if (ppc_mac_gpu_mmio_write_gart_stub_3d(s, addr, val, size)) {
+        return;
     }
 }
 
@@ -11919,39 +9887,7 @@ static const MemoryRegionOps ppc_mac_gpu_mmio_ops = {
     },
 };
 
-/* ========================================================================
- * ROM BAR - traced expansion ROM access
- * ======================================================================== */
-
-static uint64_t ppc_mac_gpu_rom_read(void *opaque, hwaddr addr, unsigned size)
-{
-    PPCMacGPUState *s = opaque;
-    uint64_t val = 0;
-
-    if (addr + size <= s->rom_size) {
-        memcpy(&val, s->rom_data + addr, size);
-    }
-    gpu_debug_log("ROM_RD offset=0x%04"HWADDR_PRIx" size=%u val=0x%"PRIx64,
-                  addr, size, val);
-    return val;
-}
-
-static void ppc_mac_gpu_rom_write(void *opaque, hwaddr addr,
-                                   uint64_t val, unsigned size)
-{
-    /* ROM is read-only, ignore writes */
-}
-
-static const MemoryRegionOps ppc_mac_gpu_rom_ops = {
-    .read = ppc_mac_gpu_rom_read,
-    .write = ppc_mac_gpu_rom_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-    },
-};
-
+#if PPC_MAC_GPU_BE
 /* ========================================================================
  * Byte-swapped VRAM aperture (upper half of BAR0)
  *
@@ -12023,96 +9959,7 @@ static void ppc_mac_gpu_vram_bswap_write(void *opaque, hwaddr addr,
     }
     memory_region_set_dirty(&s->vram, addr, size);
 }
-
-/*
- * R300 aperture 1.  A Radeon's frame-buffer BAR holds two apertures onto
- * the same VRAM, each with its own CPU byte swap: SURFACE_CNTL.NONSURF_APn_SWP,
- * or SURFACEn_INFO.SURF_APn_SWP inside a surface's bounds.  VRAM here holds
- * what the CPU sees through aperture 0 with its 32-bit swap (mode 2), so an
- * aperture 1 access is converted from that view.  Apple's GL driver reads
- * the depth buffer back (glReadPixels, e.g. Chess's mouse picking) through
- * aperture 1 with a surface that sets its swap.
- */
-static unsigned r300_ap_swap(PPCMacGPUState *s, uint32_t off, int ap)
-{
-    for (int n = 0; n < 8; n++) {
-        uint32_t info = s->r300_surf[3 + 4 * n];
-        uint32_t lo = s->r300_surf[1 + 4 * n], hi = s->r300_surf[2 + 4 * n];
-        if ((lo || hi) && off >= lo && off <= hi) {
-            return (info >> (20 + 2 * ap)) & 3;
-        }
-    }
-    return (s->regs.surface_cntl >> (20 + 2 * ap)) & 3;
-}
-
-static void r300_permute(uint8_t b[4], unsigned mode)
-{
-    uint8_t t;
-    switch (mode & 3) {
-    case 1: t = b[0]; b[0] = b[1]; b[1] = t; t = b[2]; b[2] = b[3]; b[3] = t; break;
-    case 2: t = b[0]; b[0] = b[3]; b[3] = t; t = b[1]; b[1] = b[2]; b[2] = t; break;
-    case 3: t = b[0]; b[0] = b[2]; b[2] = t; t = b[1]; b[1] = b[3]; b[3] = t; break;
-    default: break;
-    }
-}
-
-static void r300_ap1_note(PPCMacGPUState *s, hwaddr off, bool wr, unsigned m)
-{
-    static int n;
-    if (n++ < 8) {
-        qemu_log("ppc-mac-gpu r300: aperture 1 %s at 0x%" HWADDR_PRIx " (swap %u)\n",
-                 wr ? "write" : "read", off, m);
-    }
-}
-
-static uint64_t r300_ap1_read(void *opaque, hwaddr addr, unsigned size)
-{
-    PPCMacGPUState *s = opaque;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    hwaddr base = addr & ~3ull;
-    uint8_t b[4];
-    uint64_t v = 0;
-
-    if (base + 4 > s->vram_size) {
-        return 0;
-    }
-    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
-    unsigned m = r300_ap_swap(s, base, 1);
-    memcpy(b, vram + base, 4);
-    r300_permute(b, 2);                 /* aperture 0 view -> card's bytes */
-    r300_permute(b, m);                 /* -> aperture 1 view */
-    for (unsigned i = 0; i < size && (addr & 3) + i < 4; i++) {
-        v = (v << 8) | b[(addr & 3) + i];
-    }
-    r300_ap1_note(s, addr, false, m);
-    return v;
-}
-
-static void r300_ap1_write(void *opaque, hwaddr addr, uint64_t val,
-                           unsigned size)
-{
-    PPCMacGPUState *s = opaque;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    hwaddr base = addr & ~3ull;
-    uint8_t b[4];
-
-    if (base + 4 > s->vram_size) {
-        return;
-    }
-    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
-    unsigned m = r300_ap_swap(s, base, 1);
-    memcpy(b, vram + base, 4);
-    r300_permute(b, 2);
-    r300_permute(b, m);
-    for (unsigned i = 0; i < size && (addr & 3) + i < 4; i++) {
-        b[(addr & 3) + i] = val >> (8 * (size - 1 - i));
-    }
-    r300_permute(b, m);
-    r300_permute(b, 2);
-    memcpy(vram + base, b, 4);
-    memory_region_set_dirty(&s->vram, base, 4);
-    r300_ap1_note(s, addr, true, m);
-}
+#endif
 
 /* $R300_SURFWATCH: while SURFACE0 covers a range, trap aperture 0 over it
  * and log what the CPU reads and writes (e.g. glReadPixels readbacks). */
@@ -12123,7 +9970,7 @@ static uint64_t r300_watch_read(void *opaque, hwaddr addr, unsigned size)
                  s->r300_watch_base + addr;
     uint64_t v = 0;
 
-    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    gpu_sync_at(s, GPU_WHY_TAG(GPU_WHY_DISPLAY));
     for (unsigned i = 0; i < size; i++) {
         v = (v << 8) | p[i];
     }
@@ -12181,7 +10028,7 @@ static void r300_zconv(PPCMacGPUState *s, bool to_card)
     if (!rows || s->r3_zconv_off + card > s->vram_size) {
         return;
     }
-    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    gpu_sync_at(s, GPU_WHY_TAG(GPU_WHY_DISPLAY));
     tmp = g_malloc(card);
     if (s->r3_zconv_rows_ns) {
         for (uint32_t y = 0; y < rows; y++) {
@@ -12276,7 +10123,7 @@ static void r300_surfwatch_update(PPCMacGPUState *s)
     if (enabled < 0) {
         enabled = getenv("R300_SURFWATCH") != NULL;
     }
-    if (!enabled || !s->r300) {
+    if (!enabled) {
         return;
     }
     if (s->r300_watch_on) {
@@ -12295,14 +10142,7 @@ static void r300_surfwatch_update(PPCMacGPUState *s)
     }
 }
 
-static const MemoryRegionOps r300_ap1_ops = {
-    .read = r300_ap1_read,
-    .write = r300_ap1_write,
-    .endianness = DEVICE_BIG_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
-
+#if PPC_MAC_GPU_BE
 static const MemoryRegionOps ppc_mac_gpu_vram_bswap_ops = {
     .read = ppc_mac_gpu_vram_bswap_read,
     .write = ppc_mac_gpu_vram_bswap_write,
@@ -12316,6 +10156,7 @@ static const MemoryRegionOps ppc_mac_gpu_vram_bswap_ops = {
         .max_access_size = 4,
     },
 };
+#endif
 
 /* ========================================================================
  * Device lifecycle
@@ -12390,22 +10231,20 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
         s->regs.vbe_regs[VBE_DISPI_INDEX_VIRT_HEIGHT] = boot_h;
         s->regs.vbe_regs[VBE_DISPI_INDEX_X_OFFSET] = 0;
         s->regs.vbe_regs[VBE_DISPI_INDEX_Y_OFFSET] = 0;
-        s->regs.vbe_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] =
-            (uint16_t)(s->vram_size >> 16);
     }
 
-    if (!s->swap) {
         /*
          * PLL defaults.  The Linux radeon driver, finding no ATI BIOS clock table, reads the
          * engine and memory clock back from these (radeon_legacy_get_engine_clock/memory_clock:
          * 27 MHz reference * 2 * fb_div / ref_div) and divides by them in r100_bandwidth_update,
          * so zero oopses it.  A 9700 PRO runs its core at 325 MHz and memory at 310 MHz.
          */
+        ppc_mac_gpu_post_regs_reset(s);
         s->regs.pll[0x0A] = 12 | (69 << 8) | (72 << 16);    /* M_SPLL_REF_FB_DIV */
         s->regs.pll[0x03] = 12;                              /* PPLL_REF_DIV */
-    }
     if (s->legacy_vga) {
         s->regs.crtc_gen_cntl = 0;      /* VGA mode until a driver sets one */
+        ppc_mac_gpu_vga_bank_update(s);
         s->vga_shown = false;
         vga_common_reset(s->vga);
     }
@@ -12467,12 +10306,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
     Object *obj = OBJECT(dev);
 
-    s->swap = s->byte_swap_prop == ON_OFF_AUTO_ON ||
-              (s->byte_swap_prop == ON_OFF_AUTO_AUTO && target_words_bigendian());
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
-    s->r300 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9700) != NULL;
     s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
-    if (s->r300) {
         const char *dump = getenv("R300_DUMP");
 
         s->r3 = g_new0(R300State, 1);
@@ -12480,7 +10315,6 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         if (s->r3_dump) {
             setvbuf(s->r3_dump, NULL, _IOLBF, 0);
         }
-    }
 
     /* Compute VRAM size from MB property */
     s->vram_size = (uint64_t)s->vram_size_mb * MiB;
@@ -12510,11 +10344,17 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         vga_init(s->vga, OBJECT(s), pci_address_space(dev),
                  pci_address_space_io(dev), true);
         s->vga->con = s->con;
+        memory_region_init_io(&s->vga_bank, obj, &ppc_mac_gpu_vga_bank_ops, s,
+                              "ppc-mac-gpu-vga-bank", 0x10000);
+        /* above the VGA core's chain-4 alias (priority 2) so the bank window wins in an extended mode */
+        memory_region_add_subregion_overlap(pci_address_space(dev), 0xA0000,
+                                            &s->vga_bank, 3);
+        memory_region_set_enabled(&s->vga_bank, false);
     }
 
     /*
-     * The renderer ("renderer" property).  Unset means Metal on macOS,
-     * falling back to software; naming one makes it required.
+     * The renderer ("renderer" property).  Unset means Metal on macOS;
+     * elsewhere renderer=vulkan is required.
      */
     const char *rname = s->renderer_name && *s->renderer_name &&
                         strcmp(s->renderer_name, "auto") ? s->renderer_name : NULL;
@@ -12531,11 +10371,6 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         return;
     }
 #endif
-    if (want_vulkan && !s->r300) {
-        error_setg(errp, "%s: renderer=vulkan needs the R300 card (ati-radeon-9700)",
-                   object_get_typename(obj));
-        return;
-    }
 #ifndef CONFIG_PPC_MAC_GPU_VULKAN
     if (want_vulkan) {
         error_setg(errp, "%s: renderer=vulkan: this QEMU was built without "
@@ -12592,20 +10427,21 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         memory_region_init_ram(&s->vram, obj, "ppc-mac-gpu-vram",
                                s->vram_size, &error_fatal);
     }
-    if (s->r300) {
-        /* Two apertures onto VRAM, as on a real Radeon (see r300_ap1_ops). */
+        /*
+         * One VRAM aperture on BAR0 (aperture 0).  The PowerPC build maps it
+         * through the byte-swapping handler, the x86 build maps VRAM directly.
+         */
         memory_region_init(&s->vram_bar, obj, "ppc-mac-gpu-vram-bar",
-                           2 * s->vram_size);
+                           s->vram_size);
+#if PPC_MAC_GPU_BE
+        memory_region_init_io(&s->vram_swap, obj, &ppc_mac_gpu_vram_bswap_ops, s,
+                              "ppc-mac-gpu-vram-swap", s->vram_size);
+        memory_region_add_subregion(&s->vram_bar, 0, &s->vram_swap);
+#else
         memory_region_add_subregion(&s->vram_bar, 0, &s->vram);
-        memory_region_init_io(&s->vram_ap1, obj, &r300_ap1_ops, s,
-                              "ppc-mac-gpu-vram-ap1", s->vram_size);
-        memory_region_add_subregion(&s->vram_bar, s->vram_size, &s->vram_ap1);
+#endif
         pci_register_bar(dev, PPC_MAC_GPU_VRAM_BAR,
                          PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram_bar);
-    } else {
-        pci_register_bar(dev, PPC_MAC_GPU_VRAM_BAR,
-                         PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
-    }
 
     /* BAR2: MMIO register space */
     memory_region_init_io(&s->mmio, obj, &ppc_mac_gpu_mmio_ops, s,
@@ -12655,7 +10491,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                 gpu_debug_log("BIOS ROM load failed: %s", path);
             }
             g_free(resolved);
-        } else if (dev->romfile && dev->romfile[0] && s->swap) {
+#if PPC_MAC_GPU_BE
+        } else if (dev->romfile && dev->romfile[0]) {
             /* Fallback: copy romfile to VRAM if no separate biosrom (PowerMac
              * only: an x86 guest would see the ROM as pixels at the top of the
              * screen) */
@@ -12676,6 +10513,9 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
             }
             g_free(rom_path);
         }
+#else
+        }
+#endif
         /* Leave dev->romfile intact so QEMU's PCI framework creates
          * the standard RAM-backed ROM BAR via pci_add_option_rom(). */
     }
@@ -12750,7 +10590,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
          * R300 card does not offer 800x600 (832 vs 800 pixels: windows
          * scramble while they are dragged).
          */
-        e[35] = s->r300 ? 0x20 : 0x21; /* 640x480@60 (+ 800x600@60) */
+        e[35] = 0x20; /* 640x480@60 (+ 800x600@60) */
         e[36] = 0x09; /* 1024x768@60 + 1280x1024@75 */
         e[37] = 0x80; /* 1152x870@75 */
 
@@ -12853,8 +10693,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                  e[127]);
     }
 
-    /* Initialize renderer — try Metal first for hardware-accelerated QE compositing,
-     * fall back to software renderer if Metal is unavailable. */
+    /* Initialize renderer: Vulkan when renderer=vulkan, otherwise Metal (macOS).
+     * There is no software fallback: a device without a renderer fails to start. */
     {
         uint8_t *vram_ptr = memory_region_get_ram_ptr(&s->vram);
 #ifdef CONFIG_PPC_MAC_GPU_VULKAN
@@ -12868,28 +10708,29 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
             }
             qemu_log("ppc-mac-gpu: using Vulkan renderer for 3D\n");
         }
+#else
+        if (want_vulkan) {
+            error_setg(errp, "%s: renderer=vulkan: not built into this QEMU",
+                       object_get_typename(obj));
+            return;
+        }
 #endif
 #ifdef CONFIG_DARWIN
         /* Try Metal renderer first for hardware-accelerated 3D */
         if (!want_vulkan && (s->renderer = ppc_mac_gpu_renderer_metal())) {
             s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
-            if (s->renderer_opaque) {
-                qemu_log("ppc-mac-gpu: using Metal renderer for 3D\n");
-            } else if (rname) {
+            if (!s->renderer_opaque) {
                 error_setg(errp, "%s: renderer=metal: Metal init failed",
                            object_get_typename(obj));
                 return;
-            } else {
-                qemu_log("ppc-mac-gpu: Metal init failed, falling back to SW\n");
-                s->renderer = NULL;
             }
+            qemu_log("ppc-mac-gpu: using Metal renderer for 3D\n");
         }
 #endif
-        if (!s->renderer)
-        {
-            s->renderer = ppc_mac_gpu_renderer_sw();
-            s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
-            qemu_log("ppc-mac-gpu: using software renderer (3D textured quad)\n");
+        if (!s->renderer) {
+            error_setg(errp, "%s: no 3D renderer available: set renderer=vulkan "
+                       "(or renderer=metal on macOS)", object_get_typename(obj));
+            return;
         }
     }
 
@@ -12899,7 +10740,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
 
     /* Set PCI config space fields */
     pci_set_byte(&dev->config[PCI_REVISION_ID],
-                 s->r300 ? 0x00 : PPC_MAC_GPU_PCI_REVISION);
+                 0x00);
 
     /* Interrupt pin A - required for kext IRQ handler registration */
     dev->config[PCI_INTERRUPT_PIN] = 1;  /* INTA# */
@@ -12908,8 +10749,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID,
                  PPC_MAC_GPU_PCI_VENDOR_ID);
     pci_set_word(dev->config + PCI_SUBSYSTEM_ID,
-                 s->r300 ? PPC_MAC_GPU_R300_DEVICE_ID
-                         : PPC_MAC_GPU_PCI_DEVICE_ID);
+                 PPC_MAC_GPU_R300_DEVICE_ID);
 
     /*
      * AGP capability at offset 0x58 (where real RV280 has it).
@@ -12981,12 +10821,6 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
     timer_del(&s->vblank_timer);
     g_free(s->shadow_buf);
     s->shadow_buf = NULL;
-    g_free(s->draw_verts);
-    s->draw_verts = NULL;
-    s->draw_verts_cap = 0;
-    g_free(s->draw_idx);
-    s->draw_idx = NULL;
-    s->draw_idx_cap = 0;
     graphic_console_close(s->con);
 }
 
@@ -12998,12 +10832,10 @@ static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
     DEFINE_PROP_BOOL("legacy-vga", PPCMacGPUState, legacy_vga, false),
-    DEFINE_PROP_ON_OFF_AUTO("byte-swap", PPCMacGPUState, byte_swap_prop, ON_OFF_AUTO_AUTO),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
     DEFINE_PROP_STRING("renderer", PPCMacGPUState, renderer_name),
 };
 
-/* Read-only "perf": the running totals behind PowerEmu's overlay. */
 /*
  * Turning a trace on while the machine is running.
  *
@@ -13066,17 +10898,6 @@ static char *ppc_mac_gpu_get_trace(Object *obj, Error **errp)
     return g_string_free(out, false);
 }
 
-static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
-{
-    PPCMacGPUState *s = PPC_MAC_GPU(obj);
-    return g_strdup_printf("frames=%" PRIu64 " draws=%" PRIu64 " tex_vram=%" PRIu64
-                           " tex_agp=%" PRIu64 " agp_bytes=%" PRIu64
-                           " vram_high=%" PRIu64 " vram_usable=%u",
-                           r200_perf.frames, r200_perf.draws, r200_perf.tex_vram,
-                           r200_perf.tex_agp, r200_perf.agp_bytes, r200_perf.vram_high,
-                           s->regs.config_memsize);
-}
-
 /* ========================================================================
  * Saving the card with the machine
  *
@@ -13129,7 +10950,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = ppc_mac_gpu_post_load,
     .fields = (const VMStateField[]) {
@@ -13182,6 +11003,8 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
         /* Registers the 9700 kext writes and reads back later. */
         VMSTATE_BUFFER_UNSAFE(r300_shadow, PPCMacGPUState, 1,
                               sizeof(((PPCMacGPUState *)0)->r300_shadow)),
+        VMSTATE_UINT32_V(mc_ind_index, PPCMacGPUState, 2),
+        VMSTATE_UINT32_ARRAY_V(mc_ind, PPCMacGPUState, 128, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -13192,7 +11015,7 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     k->vendor_id = PPC_MAC_GPU_PCI_VENDOR_ID;
-    k->device_id = PPC_MAC_GPU_PCI_DEVICE_ID;
+    k->device_id = PPC_MAC_GPU_R300_DEVICE_ID;
     k->class_id  = PPC_MAC_GPU_PCI_CLASS;
     k->realize      = ppc_mac_gpu_realize;
     k->exit         = ppc_mac_gpu_exit;
@@ -13204,14 +11027,13 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
     device_class_set_props(dc, ppc_mac_gpu_properties);
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
-    object_class_property_add_str(klass, "perf", ppc_mac_gpu_get_perf, NULL);
     object_class_property_add_str(klass, "trace", ppc_mac_gpu_get_trace,
                                   ppc_mac_gpu_set_trace);
 }
 
 /*
- * ATI Radeon 9700 PRO (R300).  Same register model as the RV280 device; the
- * PCI identity is what makes Tiger's ATIRadeon9700.kext (IOPCIMatch
+ * ATI Radeon 9700 PRO (R300).  The PCI identity is what makes Tiger's
+ * ATIRadeon9700.kext (IOPCIMatch
  * 0x4E441002) and its GL driver take the card.
  */
 static void ati_radeon_9700_class_init(ObjectClass *klass, void *data)
@@ -13233,7 +11055,7 @@ static const TypeInfo ppc_mac_gpu_type_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PPCMacGPUState),
     .class_init    = ppc_mac_gpu_class_init,
-    .interfaces    = (const InterfaceInfo[]) {
+    .interfaces    = (InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },

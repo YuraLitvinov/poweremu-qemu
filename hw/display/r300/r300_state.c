@@ -31,7 +31,8 @@ void r300_state_write(R300State *st, uint32_t addr, uint32_t val)
         /* Vector index; data writes then fill 4 dwords per vector. */
         st->pvs_upload_dw = (val & 0x7FF) * 4;
         break;
-    case R300_VAP_PVS_UPLOAD_DATA:
+    case R300_VAP_PVS_VECTOR_DATA_REG:         /* the 32-bit data port (the Radeon DDX) */
+    case R300_VAP_PVS_UPLOAD_DATA:             /* the 128-bit data port (Mesa) */
         if (st->pvs_upload_dw < R300_PVS_MEM_VECS * 4) {
             st->pvs_mem[st->pvs_upload_dw] = val;
         }

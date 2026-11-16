@@ -2461,6 +2461,12 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
 
     gtk_container_add(GTK_CONTAINER(s->window), s->vbox);
 
+    /* Before the window is shown, so it starts iconified rather than being
+     * minimized after it has already been mapped. */
+    if (opts->u.gtk.has_minimized && opts->u.gtk.minimized) {
+        gtk_window_iconify(GTK_WINDOW(s->window));
+    }
+
     gtk_widget_show_all(s->window);
 
     for (idx = 0;; idx++) {

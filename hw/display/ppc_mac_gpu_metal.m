@@ -6241,7 +6241,7 @@ static uint32_t r200_metal_warned;
  * Depth/stencil buffers.  Metal cannot alias a depth texture onto the VRAM
  * buffer, so each guest depth buffer (VRAM offset + pitch) gets a private
  * Depth32Float_Stencil8 texture.  Guest writes to depth memory arrive only
- * as 3D draws (rendered here) or 2D fills (mirrored by fill_notify_r200).
+ * as 3D draws (rendered here) or 2D fills (mirrored by fill_notify).
  */
 #define R200_MAX_DEPTH 4
 static struct {
@@ -6372,7 +6372,7 @@ static void r200_metal_warn(uint32_t bit, const char *msg, uint32_t a, uint32_t 
 /*
  * Batching: draws are encoded into one open command buffer, and consecutive
  * draws to the same render target share one render pass.  Nothing waits on
- * the GPU until flush_r200(), which the device calls before anything reads
+ * the GPU until flush_sync(), which the device calls before anything reads
  * VRAM on the CPU side (2D engine ops, register reads, scanout).
  */
 typedef struct R200TexKey {
@@ -6571,7 +6571,7 @@ static void r200_note_read(uint64_t lo, uint64_t hi)
     g_r200_read[g_r200_nread++].hi = hi;
 }
 
-static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
+static bool metal_range_busy_sync(void *opaque, uint64_t lo, uint64_t hi,
                                   bool write_access)
 {
     if (!g_r200_cb && !g_r200_inflight) {
@@ -6684,13 +6684,13 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
     return seq;
 }
 
-static uint32_t metal_submit_r200(void *opaque,
+static uint32_t metal_submit_fence(void *opaque,
                                   void (*done)(void *, uint32_t), void *arg)
 {
     return r200_commit(done, arg);
 }
 
-static bool metal_flush_r200(void *opaque)
+static bool metal_flush_sync(void *opaque)
 {
     if (!g_r200_cb && !g_r200_inflight) {
         return false;
@@ -6712,7 +6712,7 @@ static bool metal_flush_r200(void *opaque)
 }
 
 /* A 2D fill that lands on a guest depth buffer clears our private copy. */
-static void metal_fill_notify_r200(void *opaque, uint32_t offset, uint32_t pitch,
+static void metal_fill_notify(void *opaque, uint32_t offset, uint32_t pitch,
                                    uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                    uint32_t bpp, uint32_t value)
 {
@@ -7124,7 +7124,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             }
         }
         if (full) {
-            metal_flush_r200(st);                  /* forget everything written */
+            metal_flush_sync(st);                  /* forget everything written */
         } else if (conflict) {
             g_r200_stat_conflicts++;
             if (r200_split_enabled()) {
@@ -7135,7 +7135,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 g_r200_epoch++;
                 g_r200_stat_splits++;
             } else {
-                metal_flush_r200(st);
+                metal_flush_sync(st);
             }
         }
         if (!g_r200_cb) {
@@ -7285,7 +7285,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 uint64_t a = (uint64_t)pkt->depth_offset +
                              (uint64_t)py * pkt->depth_pitch * 4 + px * 4;
                 const R200Vertex *v0 = &pkt->verts[pkt->indices[0]];
-                metal_flush_r200(st);
+                metal_flush_sync(st);
                 qemu_log("r200 zcheck: fl=%x z=%08x at (%u,%u) depthword=%02x%02x%02x%02x "
                          "v0=(%.1f,%.1f,%.3f,%.1f) sc=(%u,%u)-(%u,%u)\n",
                          u.zinfo[0], pkt->zstencil, px, py,
@@ -7326,7 +7326,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
  * r300/r300_spirv.c), which also does
  * alpha test, blending and packing into the colour buffer's byte order.
  * Draws share the R200 path's batch, views and hazard tracking, so the
- * device's flush_r200() covers them too.
+ * device's flush_sync() covers them too.
  * ======================================================================== */
 
 static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_r300_pipes;
@@ -7463,7 +7463,7 @@ static uint32_t metal_zpass_r300(void *opaque, bool reset, uint32_t value)
     if (!st || !st->vramBuffer) {
         return 0;
     }
-    metal_flush_r200(st);
+    metal_flush_sync(st);
     uint32_t *c = r300_zpass_buf(st->vramBuffer.device).contents;
     v = c[0];
     if (reset) {
@@ -7622,7 +7622,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     }
     /* The CPU reads the texels: finish pending draws that write them. */
     if (!td->host_data && r200_batch_conflict(lo, hi, NULL)) {
-        metal_flush_r200(st);
+        metal_flush_sync(st);
     }
 
     R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
@@ -7709,7 +7709,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
     }
     if (!td->host_data && r200_batch_conflict(td->gpu_addr, (uint64_t)td->gpu_addr +
                                               td->size_bytes, NULL)) {
-        metal_flush_r200(st);
+        metal_flush_sync(st);
     }
     const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
     uint32_t n = (td->size_bytes + eb - 1) / eb;        /* elements */
@@ -7939,7 +7939,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
         if (conflict) {
             g_r200_stat_conflicts++;
-            metal_flush_r200(st);
+            metal_flush_sync(st);
         }
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
@@ -8103,10 +8103,10 @@ static PPCMacGPURenderer metal_renderer = {
     .draw_r200         = metal_draw_r200,
     .draw_r300         = metal_draw_r300,
     .zpass_r300        = metal_zpass_r300,
-    .flush_r200        = metal_flush_r200,
-    .submit_r200       = metal_submit_r200,
-    .fill_notify_r200  = metal_fill_notify_r200,
-    .range_busy_r200   = metal_range_busy_r200,
+    .flush_sync        = metal_flush_sync,
+    .submit_fence       = metal_submit_fence,
+    .fill_notify  = metal_fill_notify,
+    .range_busy_sync   = metal_range_busy_sync,
     .get_caps          = metal_get_caps,
     .get_drag_state    = metal_get_drag_state,
     .get_drag_snap     = NULL,

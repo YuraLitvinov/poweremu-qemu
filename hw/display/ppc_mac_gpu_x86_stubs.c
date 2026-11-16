@@ -9,7 +9,7 @@
  * which is what a Linux guest programs.
  *
  * The generation never changes here: for a little-endian guest the model does
- * not cache GART translations at all (see r200_agp_page).
+ * not cache GART translations at all (see gpu_agp_page).
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  */

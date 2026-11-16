@@ -34,7 +34,7 @@ static inline void r300_sb_free(R300Sb *sb)
     sb->len = sb->cap = 0;
 }
 
-static inline void r300_sb_vprintf(R300Sb *sb, const char *fmt, va_list ap)
+static inline __attribute__((format(printf, 2, 0))) void r300_sb_vprintf(R300Sb *sb, const char *fmt, va_list ap)
 {
     for (;;) {
         va_list aq;

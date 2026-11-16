@@ -83,16 +83,29 @@ if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
   endif
 endif
 
-system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
+# Guest byte order is a property of the build: the PowerPC build is
+# big-endian, the x86 build little-endian.  ppc_mac_gpu_byteorder.h turns
+# this into PPC_MAC_GPU_BE for the preprocessor.
+if target_dirs.contains('ppc-softmmu')
+  ppc_mac_gpu_byteorder = declare_dependency(compile_args: ['-DPPC_MAC_GPU_BE=1'])
+else
+  ppc_mac_gpu_byteorder = declare_dependency(compile_args: ['-DPPC_MAC_GPU_BE=0'])
+endif
+
+system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [ppc_mac_gpu_byteorder, files(
   'ppc_mac_gpu.c',
   'ppc_mac_gpu_x86_stubs.c',
+  'ppc_mac_gpu_scanout_le.c',
+  'ppc_mac_gpu_scanout_be.c',
   'r300/r300_state.c',
   'r300/r300_pvs.c',
   'r300/r300_pvs_glsl.c',
   'r300/r300_us.c',
   'r300/r300_spirv.c',
   'r300/r300_draw.c',
-  'ppc_mac_gpu_renderer_sw.c',
+  'r300/r300_texel.c',
+  'r300/r300_texel_le.c',
+  'r300/r300_texel_be.c',
   'ppc_mac_gpu_vp.c',
 ), pixman] + r300_shader_deps)
 
@@ -127,7 +140,6 @@ if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
   endif
 endif
 
-system_ss.add(when: 'CONFIG_POWEREMU_GPU', if_true: [files('poweremu-gpu.c'), pixman])
 
 if host_os == 'darwin'
   metal_fw = dependency('appleframeworks', modules: ['Metal', 'QuartzCore'], required: false)

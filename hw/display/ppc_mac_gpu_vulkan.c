@@ -23,7 +23,7 @@
  *    any image holding newer contents of that range is written back.
  *  - What a batch renders is written back to VRAM at the end of the
  *    batch, so completed work is in VRAM as the device expects (fences,
- *    scanout, CPU reads after flush_r200).  Only the rectangles draws
+ *    scanout, CPU reads after flush_sync).  Only the rectangles draws
  *    touched (their scissors) go back: the CPU may write other parts of
  *    the same buffer meanwhile (2D blits while a window is dragged, text
  *    into a surface), and a whole-image write-back would undo that.
@@ -1375,12 +1375,12 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     return b->seq;
 }
 
-static uint32_t vk_submit_r200(void *opaque, void (*done)(void *, uint32_t), void *arg)
+static uint32_t vk_submit_fence(void *opaque, void (*done)(void *, uint32_t), void *arg)
 {
     return vk_commit(done, arg);
 }
 
-static bool vk_flush_r200(void *opaque)
+static bool vk_flush_sync(void *opaque)
 {
     VkBatch *newest = NULL;
 
@@ -1402,7 +1402,7 @@ static bool vk_flush_r200(void *opaque)
     return true;
 }
 
-static bool vk_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi, bool write_access)
+static bool vk_range_busy_sync(void *opaque, uint64_t lo, uint64_t hi, bool write_access)
 {
     if (!V.vram || hi <= lo) {
         return false;
@@ -1429,7 +1429,7 @@ static uint32_t vk_zpass_r300(void *opaque, bool reset, uint32_t value)
     if (!V.zpass) {
         return 0;
     }
-    vk_flush_r200(opaque);
+    vk_flush_sync(opaque);
     v = V.zpass[0];
     if (reset) {
         V.zpass[0] = value;
@@ -1961,7 +1961,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
     }
     if (need_flush) {
-        vk_flush_r200(opaque);
+        vk_flush_sync(opaque);
     }
     if (!vk_dummies()) {
         return -1;
@@ -2327,7 +2327,7 @@ static void *vk_init(uint8_t *vram_ptr, uint64_t vram_size)
 
 static void vk_fini(void *opaque)
 {
-    vk_flush_r200(opaque);
+    vk_flush_sync(opaque);
 }
 
 static uint32_t vk_get_caps(void *opaque)
@@ -2342,9 +2342,9 @@ static PPCMacGPURenderer vulkan_renderer = {
     .fini             = vk_fini,
     .draw_r300        = vk_draw_r300,
     .zpass_r300       = vk_zpass_r300,
-    .flush_r200       = vk_flush_r200,
-    .submit_r200      = vk_submit_r200,
-    .range_busy_r200  = vk_range_busy_r200,
+    .flush_sync       = vk_flush_sync,
+    .submit_fence      = vk_submit_fence,
+    .range_busy_sync  = vk_range_busy_sync,
     .set_dirty_source = vk_set_dirty_source,
     .get_caps         = vk_get_caps,
 };

@@ -267,7 +267,7 @@ static void us_texu_args(char *buf, size_t len, const R300State *st,
      * (see work fix_piglit_texture_upload_copy_formats), so real 32F textures stay wrong for now.
      */
     snprintf(buf, len, "0x%xu, %uu, %uu, 0x%xu, %s", fmt, r300_tex_raw_bpp(fmt),
-             st->le_guest ? 2u : r300_reg(st, TX_OFFSET_0 + 4 * unit) & 3, filt,
+             GUEST_LE ? 2u : r300_reg(st, TX_OFFSET_0 + 4 * unit) & 3, filt,
              (f1 >> 22) & 1 ? "true" : "false");
 }
 
@@ -1557,6 +1557,12 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         if (desc->route[k] >= 0) {
             r300_sb_printf(&sb, "    t[%u] = vin[%d];\n", k, desc->route[k]);
         }
+    }
+    /* FACE emulation (gl_FrontFacing): Mesa 22.3.6 negates the hardware FACE input (1 back, 0 front) in the first
+     * hardware input register after the colours.  Nothing routes that register on R300, so feed it from the
+     * rasterised facing here: the first input register is FACE when no colour is routed to it. */
+    if (desc->route[0] < 0) {
+        r300_sb_printf(&sb, "    t[0] = vec4(gl_FrontFacing ? 0.0 : 1.0, 0.0, 0.0, 0.0);\n");
     }
     r300_sb_printf(&sb,
         "    vec4 oc[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0),\n"

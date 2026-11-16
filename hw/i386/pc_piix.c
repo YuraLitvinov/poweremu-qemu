@@ -103,6 +103,13 @@ static void piix_intx_routing_notifier_xen(PCIDevice *dev)
 /* PC hardware initialisation */
 static void pc_init1(MachineState *machine, const char *pci_type)
 {
+    /* HACK: QEMU_PC_NORTHBRIDGE=440bx swaps the i440FX host bridge for the
+     * 440BX (AGP target) model; no machine option plumbed yet. */
+    if (pci_type && getenv("QEMU_PC_NORTHBRIDGE") &&
+        !strcmp(getenv("QEMU_PC_NORTHBRIDGE"), "440bx")) {
+        pci_type = "i440BX";
+    }
+
     PCMachineState *pcms = PC_MACHINE(machine);
     PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
     X86MachineState *x86ms = X86_MACHINE(machine);

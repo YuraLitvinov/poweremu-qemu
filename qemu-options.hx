@@ -2098,7 +2098,7 @@ DEF("display", HAS_ARG, QEMU_OPTION_display,
 #if defined(CONFIG_GTK)
     "-display gtk[,full-screen=on|off][,gl=on|off][,grab-on-hover=on|off]\n"
     "            [,show-tabs=on|off][,show-cursor=on|off][,window-close=on|off]\n"
-    "            [,show-menubar=on|off][,zoom-to-fit=on|off]\n"
+    "            [,show-menubar=on|off][,zoom-to-fit=on|off][,minimized=on|off]\n"
 #endif
 #if defined(CONFIG_VNC)
     "-display vnc=<display>[,<optargs>]\n"
@@ -2191,6 +2191,9 @@ SRST
         ``window-close=on|off`` : Allow to quit qemu with window close button
 
         ``show-menubar=on|off`` : Display the main window menubar, defaults to "on"
+
+        ``minimized=on|off`` : Start the main window minimized (iconified),
+                               defaults to "off"
 
         ``zoom-to-fit=on|off`` : Expand video output to the window size,
                                  defaults to "off"

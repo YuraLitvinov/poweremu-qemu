@@ -14,6 +14,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "../ppc_mac_gpu_byteorder.h"
+
 /* 3D register window mirrored here (VAP 0x2000.. through ZB 0x4Fxx). */
 #define R300_REG_BASE           0x1C00
 #define R300_REG_END            0x5000
@@ -26,6 +28,7 @@
 #define R300_PVS_UCP_START      1024
 
 #define R300_VAP_PVS_VECTOR_INDX_REG    0x2200
+#define R300_VAP_PVS_VECTOR_DATA_REG    0x2204
 #define R300_VAP_PVS_UPLOAD_DATA        0x2208
 
 typedef struct R300State {
@@ -37,7 +40,6 @@ typedef struct R300State {
     uint32_t le_screen_h;   /* little-endian (Linux) guest: the screen height, else 0.  Linux clips with
                              * the SC_CLIPRECT registers and leaves the scissor open, and the colour buffer
                              * is screen-sized */
-    bool le_guest;          /* little-endian (Linux) guest, whether or not the screen size is known yet */
     uint32_t glsl_flags;    /* r300_us_to_glsl() flags the renderer wants (not a
                                register; the device sets it before each draw) */
 } R300State;

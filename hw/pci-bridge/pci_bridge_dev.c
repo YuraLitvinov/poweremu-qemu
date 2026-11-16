@@ -296,10 +296,40 @@ static const TypeInfo pci_bridge_dev_seat_info = {
     .class_init        = pci_bridge_dev_seat_class_init,
 };
 
+/*
+ * Intel 82443BX AGP PCI-to-PCI bridge (8086:7191): the bridge the AGP card
+ * sits behind on a 440BX board.  Same as the standard bridge otherwise.
+ */
+static void i440bx_agp_instance_init(Object *obj)
+{
+    object_property_set_bool(obj, "shpc", false, &error_abort);
+    object_property_set_str(obj, "msi", "off", &error_abort);
+}
+
+static void i440bx_agp_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->vendor_id = PCI_VENDOR_ID_INTEL;
+    k->device_id = 0x7191;
+    k->revision = 0x03;
+    dc->desc = "Intel 82443BX AGP bridge";
+}
+
+static const TypeInfo i440bx_agp_info = {
+    .name          = "i440bx-agp",
+    .parent        = TYPE_PCI_BRIDGE_DEV,
+    .instance_size = sizeof(PCIBridgeDev),
+    .instance_init = i440bx_agp_instance_init,
+    .class_init    = i440bx_agp_class_init,
+};
+
 static void pci_bridge_dev_register(void)
 {
     type_register_static(&pci_bridge_dev_info);
     type_register_static(&pci_bridge_dev_seat_info);
+    type_register_static(&i440bx_agp_info);
 }
 
 type_init(pci_bridge_dev_register);

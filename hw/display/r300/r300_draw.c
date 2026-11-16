@@ -609,8 +609,8 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
              * -> 64, so rows are aligned to 16 bytes. */
             /* The micro tile is 8 pixels wide for 8bpp (8 bytes) and 16 bytes wide for 16..64bpp. */
             uint32_t mt = bpp == 1 ? 7u : 15u;
-            bool square = td->le && (td->tile & 0x10);     /* TX_OFFSET micro tile 2: 4x4 pixels (16bpp) */
-            pitch = (td->le && (td->tile & 0x8)) ? (w * bpp + mt) & ~mt
+            bool square = GUEST_LE && (td->tile & 0x10);   /* TX_OFFSET micro tile 2: 4x4 pixels (16bpp) */
+            pitch = (GUEST_LE && (td->tile & 0x8)) ? (w * bpp + mt) & ~mt
                                                  : (w * bpp + 31) & ~31u;
             if (square) {
                 pitch = (w * bpp + 4 * bpp - 1) & ~(4 * bpp - 1);
@@ -618,7 +618,7 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
             rows = h;
             if (square) {
                 rows = (rows + 3) & ~3u;
-            } else if (td->le && (td->tile & 0x8)) {
+            } else if (GUEST_LE && (td->tile & 0x8)) {
                 /* The driver also rounds the height up to the micro tile's height (r300_get_pixel_alignment:
                  * 4 rows for 8bpp, 2 for 16..64bpp), so a 1-row level takes 2 rows and every level after it
                  * sits that much further on. */
@@ -719,7 +719,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         unsigned bpp, decode = 0;
         bool dxt = false;
-        bool le = st->le_guest;
+        bool le = GUEST_LE;
         switch (fmt) {
         case 0x0:                       /* X8 */
             t->kind = R300_TEXK_R8; bpp = 1;
@@ -1386,7 +1386,7 @@ typedef struct Gb {
     size_t n, cap;
 } Gb;
 
-static void gb_printf(Gb *g, const char *fmt, ...)
+static void __attribute__((format(printf, 2, 3))) gb_printf(Gb *g, const char *fmt, ...)
 {
     va_list ap;
     int k;
@@ -1428,7 +1428,7 @@ static bool gpu_vs_wanted(const R300State *st, unsigned prim, bool rects, bool b
     if (mode < 0) {
         const char *e = getenv("R300_PVS_GPU");
 
-        mode = e ? atoi(e) : 0;
+        mode = e ? atoi(e) : 1;   /* default on; R300_PVS_GPU=0 disables */
     }
     if (!mode || rects || bypass || !((1u << prim) & 0xE0F0u)) {
         return false;
@@ -1735,7 +1735,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                       (br & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
     pkt->scissor[3] = (((br >> 13) & 0x1FFF) >= SC_COORD_BIAS) ?
                       ((br >> 13) & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
-    if (st->le_guest) {
+    if (GUEST_LE) {
         /* The DRM clips with up to four cliprects (SC_CLIPRECT_TL/BR_0..3) chosen by
          * SC_CLIP_RULE: bit (in0 | in1<<1 | in2<<2 | in3<<3) says whether a pixel inside
          * exactly those rectangles is drawn.  Use the bounding box of the rectangles that
@@ -2236,37 +2236,6 @@ void r300_draw_free(R300DrawPacket *pkt)
     }
 }
 
-/* ---- texel repacking for renderers ------------------------------------ */
-
-/* A 16bpp texel as the card sees it: the guest wrote big-endian halfwords. */
-static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
-{
-    uint32_t x, y, z, w;
-
-    switch (fmt) {
-    case 0x6:   /* Z5Y6X5 */
-        x = (v & 31) * 255 / 31; y = ((v >> 5) & 63) * 255 / 63;
-        z = (v >> 11) * 255 / 31; w = 255;
-        break;
-    case 0x7:   /* Z6Y5X5 */
-        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
-        z = (v >> 10) * 255 / 63; w = 255;
-        break;
-    case 0xA:   /* W4Z4Y4X4 */
-        x = (v & 15) * 17; y = ((v >> 4) & 15) * 17;
-        z = ((v >> 8) & 15) * 17; w = (v >> 12) * 17;
-        break;
-    case 0xB:   /* W1Z5Y5X5 */
-        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
-        z = ((v >> 10) & 31) * 255 / 31; w = (v >> 15) ? 255 : 0;
-        break;
-    default:    /* X16 */
-        x = v >> 8; y = z = 0; w = 255;
-        break;
-    }
-    out[0] = x; out[1] = y; out[2] = z; out[3] = w;
-}
-
 uint64_t r300_hash_bytes(const uint8_t *p, size_t n)
 {
     const uint64_t m = 0x9E3779B97F4A7C15ull;
@@ -2314,69 +2283,3 @@ uint64_t r300_hash_tex(const uint8_t *p, size_t n)
     return h ^ n;
 }
 
-uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
-                                 uint32_t l, uint32_t w, uint32_t h,
-                                 uint32_t *bpr)
-{
-    uint32_t pitch = td->lvl_pitch[l];
-    uint8_t *out;
-
-    switch (td->kind) {
-    case R300_TEXK_CONVERT16:
-        *bpr = w * 4;
-        out = malloc((size_t)w * h * 4);
-        for (uint32_t y = 0; y < h; y++) {
-            const uint8_t *row = src + (uint64_t)y * pitch;
-            for (uint32_t x = 0; x < w; x++) {
-                uint16_t v = td->le ? (uint16_t)(row[2 * x] | row[2 * x + 1] << 8)
-                                    : (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
-                r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
-            }
-        }
-        return out;
-    case R300_TEXK_DXT1:
-    case R300_TEXK_DXT3:
-    case R300_TEXK_DXT5: {
-        uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
-        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-        *bpr = bw * bs;
-        out = malloc((size_t)bw * bh * bs);
-        for (uint32_t y = 0; y < bh; y++) {
-            memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
-        }
-        /*
-         * Blocks are little-endian words to the card.  VRAM holds the
-         * big-endian CPU's view (GART copies the other side of the
-         * aperture), and the card's dword is the TX_OFFSET endian swap of
-         * that, as r300_texel does for shader-decoded formats: with no
-         * swap, every word is byte-reversed.  (Doom 3 on Tiger: untouched
-         * blocks decode to coloured speckle, reversed ones to the art.)
-         */
-        for (size_t i = 0; i < (size_t)bw * bh * bs; i += 4) {
-            uint32_t l, v;
-            memcpy(&l, out + i, 4);
-            if (td->host_data && !td->le) {
-                l = __builtin_bswap32(l);
-            }
-            v = __builtin_bswap32(l);                       /* the BE value */
-            switch (td->endian & 3) {
-            case 1: v = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu); break;
-            case 2: v = __builtin_bswap32(v); break;
-            case 3: v = (v << 16) | (v >> 16); break;
-            default: break;
-            }
-            memcpy(out + i, &v, 4);
-        }
-        return out;
-    }
-    default: {                          /* RGBA8, R8, RG8: bytes as they lie */
-        uint32_t bpp = td->kind == R300_TEXK_RGBA8 ? 4 : td->kind == R300_TEXK_RG8 ? 2 : 1;
-        *bpr = w * bpp;
-        out = malloc((size_t)w * h * bpp);
-        for (uint32_t y = 0; y < h; y++) {
-            memcpy(out + (size_t)y * w * bpp, src + (uint64_t)y * pitch, (size_t)w * bpp);
-        }
-        return out;
-    }
-    }
-}

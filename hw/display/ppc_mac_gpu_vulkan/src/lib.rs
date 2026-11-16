@@ -7,7 +7,7 @@
 //! `ppc_mac_gpu_vulkan.c` (kept beside it, unbuilt, as the reference) and
 //! uses `ash`.  Every C type comes from bindgen over QEMU's own headers.
 
-#![allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, clippy::all)]
+#![allow(unknown_lints, non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, unnecessary_transmutes, clippy::all)]
 
 mod batch;
 mod cache;
@@ -131,14 +131,14 @@ unsafe extern "C" fn r_zpass_r300(_opaque: *mut c_void, reset: bool, value: u32)
     r
 }
 
-unsafe extern "C" fn r_flush_r200(_opaque: *mut c_void) -> bool {
+unsafe extern "C" fn r_flush_sync(_opaque: *mut c_void) -> bool {
     match vk_opt() {
         Some(v) => v.flush(),
         None => false,
     }
 }
 
-unsafe extern "C" fn r_submit_r200(
+unsafe extern "C" fn r_submit_fence(
     _opaque: *mut c_void,
     done: Option<unsafe extern "C" fn(*mut c_void, u32)>,
     arg: *mut c_void,
@@ -149,7 +149,7 @@ unsafe extern "C" fn r_submit_r200(
     }
 }
 
-unsafe extern "C" fn r_range_busy_r200(_opaque: *mut c_void, lo: u64, hi: u64, write_access: bool) -> bool {
+unsafe extern "C" fn r_range_busy_sync(_opaque: *mut c_void, lo: u64, hi: u64, write_access: bool) -> bool {
     match vk_opt() {
         Some(v) => v.range_busy(lo, hi, write_access),
         None => false,
@@ -186,9 +186,9 @@ pub unsafe extern "C" fn ppc_mac_gpu_renderer_vulkan() -> *mut PPCMacGPURenderer
     r.fini = Some(r_fini);
     r.draw_r300 = Some(r_draw_r300);
     r.zpass_r300 = Some(r_zpass_r300);
-    r.flush_r200 = Some(r_flush_r200);
-    r.submit_r200 = Some(r_submit_r200);
-    r.range_busy_r200 = Some(r_range_busy_r200);
+    r.flush_sync = Some(r_flush_sync);
+    r.submit_fence = Some(r_submit_fence);
+    r.range_busy_sync = Some(r_range_busy_sync);
     r.set_dirty_source = Some(r_set_dirty_source);
     r.get_caps = Some(r_get_caps);
     Box::into_raw(Box::new(r))

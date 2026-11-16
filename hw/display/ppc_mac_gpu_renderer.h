@@ -6,7 +6,6 @@
  * platform-specific APIs (Metal via Objective-C, etc.).
  *
  * Backends:
- *   - Software (ppc_mac_gpu_renderer_sw.c): always available, pure C
  *   - Metal (ppc_mac_gpu_metal.m): macOS only, the default there
  *   - Vulkan (ppc_mac_gpu_vulkan.c): R300 only; MoltenVK on macOS, the
  *     Vulkan loader elsewhere
@@ -168,7 +167,7 @@ typedef struct PPCMacGPU3DState {
  *
  * All functions receive an opaque pointer that the backend can use for
  * its internal state. The vram_ptr and vram_size are provided for backends
- * that need direct VRAM access (the software renderer always does).
+ * that need direct VRAM access.
  */
 
 /*
@@ -193,56 +192,6 @@ typedef struct R200Vertex {
     float spec[4];                /* specular RGBA, 0..1 */
     float tex[R200_MAX_TEX][4];   /* s,t,r,q per texture unit */
 } R200Vertex;
-
-typedef struct R200TexUnit {
-    uint32_t enabled;
-    uint32_t offset;              /* byte offset in VRAM */
-    uint32_t pitch;               /* bytes per row */
-    uint32_t width, height;
-    uint32_t format;              /* R200_TXFORMAT_* (bits 4:0) */
-    uint32_t alpha_in_map;
-    uint32_t filter;              /* raw PP_TXFILTER */
-    uint32_t denorm;              /* s,t are in texels, not 0..1 */
-    uint32_t swap;                /* TXOFFSET endian swap: 0 none, 1 16-bit,
-                                   * 2 32-bit, 3 half-dword */
-    const uint8_t *host_data;     /* non-NULL: texels copied out of AGP/system
-                                   * memory (same byte layout as VRAM) */
-} R200TexUnit;
-
-typedef struct R200DrawPacket {
-    /* Render target */
-    uint32_t rt_offset;           /* byte offset in VRAM */
-    uint32_t rt_pitch;            /* pixels per row */
-    uint32_t rt_format;           /* RB3D_CNTL colour format field */
-    uint32_t rt_width, rt_height;
-    uint32_t scissor[4];          /* x0, y0, x1, y1 (exclusive) */
-    uint32_t excl[3][4];          /* exclusive aux scissors: x0, y0, x1, y1 */
-    uint32_t num_excl;
-
-    /* Pixel pipeline */
-    uint32_t pp_cntl, pp_misc, rb3d_cntl;
-    /* Depth / stencil (RB3D_CNTL Z_ENABLE / STENCIL_ENABLE) */
-    uint32_t depth_enable, stencil_enable;
-    uint32_t zstencil;            /* RB3D_ZSTENCILCNTL */
-    uint32_t stencil_refmask;     /* RB3D_STENCILREFMASK */
-    uint32_t depth_offset;        /* byte offset in VRAM */
-    uint32_t depth_pitch;         /* pixels */
-    uint32_t depth_bpp;           /* 2 (16-bit Z) or 4 (24/32-bit Z) */
-    uint32_t cblend, ablend, blend_color;
-    uint32_t plane_mask;          /* colour write mask, ARGB (all ones = off) */
-    uint32_t fog_color;           /* PP_FOG_COLOR (colour + factor source) */
-    uint32_t prim_class;          /* 0 triangles, 1 lines, 2 points */
-    uint32_t txcblend[R200_MAX_STAGES], txcblend2[R200_MAX_STAGES];
-    uint32_t txablend[R200_MAX_STAGES], txablend2[R200_MAX_STAGES];
-    uint32_t tfactor[8];
-    R200TexUnit tex[R200_MAX_TEX];
-
-    /* Geometry: an indexed triangle list in window coordinates */
-    const R200Vertex *verts;
-    uint32_t num_verts;
-    const uint32_t *indices;
-    uint32_t num_indices;
-} R200DrawPacket;
 
 typedef struct PPCMacGPURenderer {
     const char *name;           /* e.g. "software", "metal", "vulkan" */
@@ -320,18 +269,9 @@ typedef struct PPCMacGPURenderer {
 
 
     /*
-     * Render one decoded R200 draw straight into VRAM (see R200DrawPacket).
-     * May be batched; the caller calls flush_r200() before touching VRAM.
-     * Returns 0 on success, -1 if the packet uses something the backend
-     * cannot render.
-     */
-    int (*draw_r200)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
-                     const R200DrawPacket *pkt);
-
-    /*
      * Render one assembled R300 draw (see hw/display/r300/r300_draw.h);
      * rt_gpu_addr and tex[].gpu_addr are already VRAM offsets.  Batched
-     * with draw_r200 work: flush_r200() finishes both.
+     * with other batched work: flush_sync() finishes both.
      */
     int (*draw_r300)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                      const struct R300DrawPacket *pkt);
@@ -344,36 +284,36 @@ typedef struct PPCMacGPURenderer {
     uint32_t (*zpass_r300)(void *opaque, bool reset, uint32_t value);
 
     /*
-     * Finish all batched draw_r200 work.  The device calls this before any
+     * Finish all batched renderer work.  The device calls this before any
      * CPU-side access to VRAM that 3D rendering may have written.
      */
-    bool (*flush_r200)(void *opaque);   /* true if work was pending */
+    bool (*flush_sync)(void *opaque);   /* true if work was pending */
 
     /*
-     * Commit batched draw_r200 work without waiting.  Returns a nonzero
+     * Commit batched renderer work without waiting.  Returns a nonzero
      * sequence number and later calls done(arg, seq) — from a backend
      * thread — once that work has completed; returns 0 if nothing was
-     * pending.  flush_r200() also waits for everything submitted this way.
+     * pending.  flush_sync() also waits for everything submitted this way.
      */
-    uint32_t (*submit_r200)(void *opaque,
+    uint32_t (*submit_fence)(void *opaque,
                             void (*done)(void *arg, uint32_t seq), void *arg);
+
+    /*
+     * Does batched, unflushed renderer work touch VRAM [lo, hi)?  If
+     * write_access, any pending read or write of the range counts; otherwise
+     * only pending writes.  The device flushes only when this says so.
+     */
+    bool (*range_busy_sync)(void *opaque, uint64_t lo, uint64_t hi,
+                            bool write_access);
 
     /*
      * A 2D fill wrote VRAM (pixel rect of the surface at offset/pitch, in
      * bytes, bpp bytes per pixel, fill value).  Lets the backend mirror depth
      * buffer clears into its private depth storage.  Called after the fill.
      */
-    /*
-     * Does batched, unflushed draw_r200 work touch VRAM [lo, hi)?  If
-     * write_access, any pending read or write of the range counts; otherwise
-     * only pending writes.  The device flushes only when this says so.
-     */
-    bool (*range_busy_r200)(void *opaque, uint64_t lo, uint64_t hi,
-                            bool write_access);
-
-    void (*fill_notify_r200)(void *opaque, uint32_t offset, uint32_t pitch,
-                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                             uint32_t bpp, uint32_t value);
+    void (*fill_notify)(void *opaque, uint32_t offset, uint32_t pitch,
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                        uint32_t bpp, uint32_t value);
 
     /*
      * Backends that keep copies of VRAM (Vulkan: images on the GPU) learn
@@ -447,12 +387,6 @@ typedef struct PPCMacGPURenderer {
 #define PPC_MAC_GPU_RENDERER_CAP_2D_FILL   (1 << 1)
 #define PPC_MAC_GPU_RENDERER_CAP_3D        (1 << 2)
 #define PPC_MAC_GPU_RENDERER_CAP_ACCEL     (1 << 3)  /* hardware accelerated */
-
-/*
- * Get the default renderer (software fallback).
- * Always available on all platforms.
- */
-PPCMacGPURenderer *ppc_mac_gpu_renderer_sw(void);
 
 /*
  * Get the Metal renderer (macOS only).

@@ -16,21 +16,17 @@
 #include "hw/pci/pci_device.h"
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/display/i2c-ddc.h"
+#include "hw/display/bochs-vbe.h"
 #include "ui/console.h"
 #include "qom/object.h"
 #include "qapi/qapi-types-common.h"
 
 /* Defined in hw/display/ppc_mac_gpu_renderer.h, private to the device. */
-struct R200Vertex;
-
 /* ========================================================================
- * PCI Identity - ATI Radeon 9200 PRO (RV280)
+ * PCI Identity - ATI Radeon 9700 PRO Mac Edition (R300)
  * ======================================================================== */
 
 #define PPC_MAC_GPU_PCI_VENDOR_ID      0x1002  /* ATI Technologies */
-#define PPC_MAC_GPU_PCI_DEVICE_ID      0x5960  /* RV280 [Radeon 9200 PRO] */
-#define PPC_MAC_GPU_PCI_REVISION       0x01
-
 /* ATI Radeon 9700 PRO Mac Edition (R300 "ND", FCode ATY,GoldenEye). */
 #define PPC_MAC_GPU_R300_DEVICE_ID     0x4E44
 #define PPC_MAC_GPU_PCI_CLASS          PCI_CLASS_DISPLAY_VGA  /* 0x0300 */
@@ -330,25 +326,7 @@ struct R200Vertex;
  *   Extended at:   boardRegAddress + (reg << 2) + 0x600
  * ======================================================================== */
 
-/* VBE DISPI register indices */
-#define VBE_DISPI_INDEX_ID               0x0
-#define VBE_DISPI_INDEX_XRES             0x1
-#define VBE_DISPI_INDEX_YRES             0x2
-#define VBE_DISPI_INDEX_BPP              0x3
-#define VBE_DISPI_INDEX_ENABLE           0x4
-#define VBE_DISPI_INDEX_BANK             0x5
-#define VBE_DISPI_INDEX_VIRT_WIDTH       0x6
-#define VBE_DISPI_INDEX_VIRT_HEIGHT      0x7
-#define VBE_DISPI_INDEX_X_OFFSET         0x8
-#define VBE_DISPI_INDEX_Y_OFFSET         0x9
-#define VBE_DISPI_INDEX_VIDEO_MEMORY_64K 0xa
-#define VBE_DISPI_INDEX_NB               0xb
-
-#define VBE_DISPI_ID5                    0xB0C5
-
-#define VBE_DISPI_DISABLED               0x00
-#define VBE_DISPI_ENABLED                0x01
-#define VBE_DISPI_LFB_ENABLED           0x40
+/* VBE DISPI register indices and flags come from bochs-vbe.h. */
 
 /* MMIO offsets for VBE/VGA register blocks */
 #define PPC_MAC_GPU_VGA_OFFSET           0x0400
@@ -395,7 +373,9 @@ struct R200Vertex;
 #define R200_RBBM_ACTIVE               (1 << 31)
 
 /* CRTC_STATUS bits */
+#define R200_CRTC_VBLANK_CUR           (1 << 0)   /* in vertical blank right now */
 #define R200_CRTC_VBLANK_SAVE          (1 << 1)
+#define R200_CRTC_VBLANK_SAVE_CLEAR    (1 << 2)   /* write 1: clear VBLANK_SAVE */
 
 /* MC_STATUS bits */
 #define R200_MC_IDLE                   (1 << 0)
@@ -439,6 +419,7 @@ typedef struct PPCMacGPURegs {
     uint32_t crtc_offset;
     uint32_t crtc_offset_cntl;
     int64_t crtc_offset_write_ns;   /* CRTC_OFFSET write time: GUI_TRIG_OFFSET (bit 30) reads set until the next 60 Hz frame boundary */
+    int64_t crtc_vblank_clear_ns;   /* virtual time of the last VBLANK_SAVE clear (derived CRTC_STATUS) */
     uint32_t crtc_pitch;
 
     /* DAC */
@@ -647,18 +628,15 @@ struct PPCMacGPUState {
      *
      * Not thread-safe, and deliberately so: one draw is in flight at a time.
      */
-    struct R200Vertex *draw_verts;
-    uint32_t draw_verts_cap;      /* in vertices */
-    uint32_t *draw_idx;
-    size_t draw_idx_cap;          /* in indices */
 
     /* Display console */
     QemuConsole *con;
 
     /* Memory regions */
     MemoryRegion vram;          /* BAR0: VRAM aperture */
-    MemoryRegion vram_bar;      /* r300: BAR0 = aperture 0 (vram) + aperture 1 */
-    MemoryRegion vram_ap1;      /* r300: aperture 1, byte-swapping view of vram */
+    MemoryRegion vram_bar;      /* BAR0: the single VRAM aperture (aperture 0) */
+    MemoryRegion vga_bank;      /* the 0xa0000 window onto VRAM in an extended mode (MEM_VGA_WP/RP_SEL) */
+    MemoryRegion vram_swap;     /* PowerPC build: aperture 0 is a byte-swapping view of vram */
     uint32_t r300_surf[32];     /* r300: SURFACE0..7 regs (0x0B00 + 4*i) */
     MemoryRegion r300_watch;    /* $R300_SURFWATCH: logs CPU access to surface 0 */
     bool r300_watch_on;
@@ -678,7 +656,6 @@ struct PPCMacGPUState {
     char *renderer_name;
 
     /* Device configuration */
-    bool r300;                  /* ati-radeon-9700: R300 instead of RV280 */
     struct R300State *r3;       /* R300 3D register file (r300 only) */
     struct R300Arrays r3_arrays;    /* last 3D_LOAD_VBPNTR */
     FILE *r3_dump;              /* $R300_DUMP: state dumps at draws */
@@ -822,24 +799,17 @@ struct PPCMacGPUState {
      */
     uint32_t r300_shadow[0x5000 / 4];
 
+    /* R300 memory controller indirect registers (MC_IND_INDEX/MC_IND_DATA) */
+    uint32_t mc_ind_index;
+    uint32_t mc_ind[128];
+
     /* Hardware cursor (patched qemu_vga.ndrv, MMIO BAR + 0xFF00) */
     uint32_t hwc_pix[64 * 64];
     uint32_t hwc_w, hwc_h, hwc_idx;
     bool host_aspect_modes;       /* EDID offers the patched NDRV's 1.545 modes */
-    /*
-     * The guest CPU's byte order, as the model has to treat it: the CP ring,
-     * indirect buffers, the 32bpp scanout, pixel formats, the 2D fill colour
-     * and the old vertex path all follow it.  Property "byte-swap": "on" treats
-     * the guest as big-endian (PowerPC: words are swapped), "off" as
-     * little-endian (x86: no swapping), "auto" (default) by the machine.
-     * Behaviour driven by the card's own swap registers (SURFACE endian, the
-     * second VRAM aperture) is not affected.
-     */
     bool legacy_vga;                /* property: standard VGA registers and text modes */
     bool vga_shown;                 /* the legacy VGA is what the screen shows */
     struct VGACommonState *vga;
-    OnOffAuto byte_swap_prop;
-    bool swap;                    /* resolved at realize */
     int32_t hwc_x, hwc_y;
     bool hwc_visible;
     /* A woken machine's window has never been told what the pointer looks
