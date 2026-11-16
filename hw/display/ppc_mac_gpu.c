@@ -2570,6 +2570,22 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
             r300_reg(r, 0x421C));
     fprintf(f, " pt=%08x,%08x,%08x,%08x mm=%08x pm=%08x gb=%08x", r300_reg(r, 0x4200), r300_reg(r, 0x4204),
             r300_reg(r, 0x4208), r300_reg(r, 0x420C), r300_reg(r, 0x4230), r300_reg(r, 0x4288), r300_reg(r, 0x4008));
+    {   /* how much of texture 0 is non-zero in VRAM right now (is it uploaded yet?) */
+        uint32_t toff = r300_reg(r, 0x4540) - ((s->regs.mc_fb_location & 0xFFFF) << 16);
+        uint32_t tw = (r300_reg(r, 0x4480) & 0x7FF) + 1, th = ((r300_reg(r, 0x4480) >> 11) & 0x7FF) + 1, nz = 0;
+        uint8_t *vr = memory_region_get_ram_ptr(&s->vram);
+
+        if ((r300_reg(r, 0x4104) & 1) && (uint64_t)toff + tw * th * 4 <= s->vram_size && tw * th <= 1 << 20) {
+            for (uint32_t k = 0; k < tw * th; k++) {
+                nz += ((uint32_t *)(vr + toff))[k] != 0;
+            }
+        }
+        fprintf(f, " t0nz=%u/%u", nz, tw * th);
+    }
+    fprintf(f, " vtx:");
+    for (uint32_t k = 1; k < body_dw && k < 25; k++) {
+        fprintf(f, " %08x", d[k]);
+    }
     fprintf(f, "\n");
     if (getenv("R300_USDISASM")) {
         char *dis = r300_us_disasm(r);
@@ -2893,6 +2909,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
+    if (GUEST_LE && !s->disp.height) {
+        ppc_mac_gpu_update_display_mode(s);     /* headless: nothing has asked for the mode yet */
+    }
     s->r3->le_screen_h = GUEST_LE ? s->disp.height : 0;
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
@@ -3416,6 +3435,14 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
                                      const uint32_t *d, uint32_t body_dw)
 {
     static uint32_t op_seen[256];
+
+    /* Windows' ati2mtag draws with 3D_DRAW_IMMD (0x29): one leading dword, VAP_VF_CNTL, vertex data; it is
+     * DRAW_IMMD_2 (0x35) with that extra dword in front. */
+    if (opcode == 0x29 && body_dw >= 2) {
+        opcode = 0x35;
+        d++;
+        body_dw--;
+    }
     bool draw = opcode == 0x34 || opcode == 0x35 || opcode == 0x36;
 
     if (s->r3_dump && op_seen[opcode & 0xFF]++ == 0) {
@@ -5966,6 +5993,13 @@ static bool ppc_mac_gpu_pm4_2d(PPCMacGPUState *s, uint32_t opcode,
      * Windows colour HOSTDATA_BLT: gmc, dst PITCH_OFFSET, two clip words (zero), dst (y<<16|x), size (h<<16|w),
      * dword count (= n - 7), then the pixels.  Re-laid out as the form ppc_mac_gpu_hostdata_mono reads.
      */
+    if (opcode == 0x9c && g_seq_log_enabled > 0) {
+        char b[300] = "";
+        for (uint32_t i = 0; i < n && i < 20; i++) {
+            sprintf(b + strlen(b), " %08x", d[i]);
+        }
+        seq_log("TRANS9C n=%u%s", n, b);
+    }
     if (opcode == 0x94 && n > 9 && ((d[0] >> 12) & 3) == 3 && d[6] == n - 7 && (d[5] & 0xFFFF) && (d[5] >> 16)) {
         uint32_t *t = g_new(uint32_t, n + 2);
         bool ok;
@@ -5980,6 +6014,13 @@ static bool ppc_mac_gpu_pm4_2d(PPCMacGPUState *s, uint32_t opcode,
     if (opcode == 0x94 && n >= 9) {
         seq_log("HD94 n=%u d: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", n, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], n > 9 ? d[9] : 0, n > 10 ? d[10] : 0);
         return ppc_mac_gpu_hostdata_mono(s, d, n);
+    }
+    if (opcode == 0x9b && g_seq_log_enabled > 0) {
+        char b[300] = "";
+        for (uint32_t i = 0; i < n && i < 14; i++) {
+            sprintf(b + strlen(b), " %08x", d[i]);
+        }
+        seq_log("BB9B n=%u%s", n, b);
     }
     if (opcode == 0x9b && n >= 4) {
         uint32_t gmc = d[0], hdr = 1, spo, dpo;

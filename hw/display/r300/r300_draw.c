@@ -94,7 +94,8 @@
 #define GA_FOG_SCALE                0x4294
 #define GA_FOG_OFFSET               0x4298
 
-#define SC_COORD_BIAS               1440    /* scissor/cliprect origin */
+static uint32_t sc_bias(const R300State *st);
+#define SC_COORD_BIAS               sc_bias(st)  /* scissor/cliprect origin: 1440, or 1088 (see sc_bias) */
 #define CLIP_MIN(a, b)              ((a) < (b) ? (a) : (b))
 #define CLIP_MAX(a, b)              ((a) > (b) ? (a) : (b))
 
@@ -497,6 +498,33 @@ static void rs_values(const R300State *st, const Layout *l, const Route *r,
 
 /* ---- draw ----------------------------------------------------------- */
 
+
+/*
+ * Scissor and clip rectangle coordinates carry a bias so they stay positive: the Linux driver (and Apple's) uses
+ * 1440.  The Windows driver (ati2mtag) uses 1088: its clip rectangles for sprites it crops (the Start button's
+ * flag and label) only line up with its vertex positions that way, and read with 1440 they are empty, which
+ * clips every fragment.  A rectangle coordinate in 1000..1439 cannot come from a 1440 bias (it would be a
+ * negative coordinate), so the first one seen switches to 1088 for good.  WORKAROUND, narrow and evidenced.
+ */
+static uint32_t sc_bias(const R300State *st)
+{
+    static uint32_t bias = 1440;
+
+    if (bias == 1440) {
+        for (int i = 0; i < 8; i++) {
+            uint32_t v = r300_reg(st, SC_CLIPRECT_TL_0 + 4 * i);
+
+            for (int k = 0; k < 2; k++) {
+                uint32_t c = (v >> (13 * k)) & 0x1FFF;
+
+                if (c >= 1000 && c < 1440) {
+                    bias = 1088;
+                }
+            }
+        }
+    }
+    return bias;
+}
 static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
 {
     R300FSUniforms *u = &pkt->uniforms;
