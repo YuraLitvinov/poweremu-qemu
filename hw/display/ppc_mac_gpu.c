@@ -7991,6 +7991,15 @@ static bool ppc_mac_gpu_mmio_read_display(PPCMacGPUState *s, hwaddr addr, unsign
             val = gpu_dac_get(s, s->regs.palette_index);
         }
         break;
+    case R200_PALETTE_30_DATA:
+        if (s->regs.palette_index < 256) {
+            uint32_t c = gpu_dac_get(s, s->regs.palette_index);
+            uint32_t r = c >> 16 & 0xFF, g = c >> 8 & 0xFF, b = c & 0xFF;
+
+            val = (r << 2 | r >> 6) << 20 | (g << 2 | g >> 6) << 10 | (b << 2 | b >> 6);
+            s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
+        }
+        break;
 
     /* Cursor */
     case R200_CUR_OFFSET:
@@ -9324,6 +9333,12 @@ static bool ppc_mac_gpu_mmio_write_display(PPCMacGPUState *s, hwaddr addr,
     case R200_PALETTE_DATA:
         if (s->regs.palette_index < 256) {
             gpu_dac_set(s, s->regs.palette_index, val);
+            s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
+        }
+        break;
+    case R200_PALETTE_30_DATA:
+        if (s->regs.palette_index < 256) {
+            gpu_dac_set(s, s->regs.palette_index, ((val>>22&0xFF)<<16)|((val>>12&0xFF)<<8)|(val>>2&0xFF));
             s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
         }
         break;
