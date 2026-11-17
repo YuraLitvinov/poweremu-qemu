@@ -7460,6 +7460,7 @@ static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_g
     { 0x0d9c, 0x00000000, "UNNAMED_0D9C" },
     { 0x0dc0, 0x00000000, "UNNAMED_0DC0" },
     { 0x0dcc, 0x00000000, "UNNAMED_0DCC" },
+    { 0x0da4, 0x00000000, "UNNAMED_0DA4" },
     { 0x0dd4, 0x00000000, "UNNAMED_0DD4" },
     { 0x0dac, 0x00000000, "UNNAMED_0DAC" },
     { 0x0d00, 0x5b000000, "DISP_MISC_CNTL" },
