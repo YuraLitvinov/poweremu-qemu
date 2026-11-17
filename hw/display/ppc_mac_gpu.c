@@ -7412,6 +7412,7 @@ static bool is_r300_register(uint32_t addr)
  */
 static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_gpu_post_regs[] = {
     { 0x0038, 0x00000000, "MEM_VGA_WP_SEL" },       /* VGA aperture bank: writes (VBE 4F05) */
+    { 0x0c40, 0x00000000, "VIPH_CONTROL" },
     { 0x003c, 0x00000000, "MEM_VGA_RP_SEL" },       /* ... and reads */
     { 0x0094, 0x00000000, "I2C_CNTL_1" },
     { 0x0118, 0x0008bbbb, "FW_CNTL" },
@@ -9789,7 +9790,6 @@ static bool ppc_mac_gpu_mmio_write_gart_stub_3d(PPCMacGPUState *s, hwaddr addr,
     case R200_SUBPIC_CNTL:        /* 0x0540 */
     case R200_CAP0_TRIG_CNTL:     /* 0x0950 */
     case R200_DISP2_MERGE_CNTL:   /* 0x0D68 */
-    case R200_VIPH_CONTROL:       /* 0x0C40 */
     case R200_GPIOPAD_MASK:       /* 0x0198 */
     case R200_GPIOPAD_A:          /* 0x019C */
     case R200_DAC_RANGE_CNTL:     /* 0x0484 */
