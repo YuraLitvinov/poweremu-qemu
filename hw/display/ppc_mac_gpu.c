@@ -7439,6 +7439,7 @@ static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_g
     { 0x01a8, 0x00000000, "ZV_LCDPAD_MASK" },
     { 0x01ac, 0x00000000, "ZV_LCDPAD_A" },
     { 0x01b0, 0x00000000, "ZV_LCDPAD_EN" },
+    { 0x01c0, 0x00000000, "SEPROM_CNTL1" },
     { 0x01ec, 0x00000000, "UNNAMED_01EC" },
     { 0x0234, 0x00000000, "OVR_WID_LEFT_RIGHT" },
     { 0x0238, 0x00000000, "OVR_WID_TOP_BOTTOM" },
