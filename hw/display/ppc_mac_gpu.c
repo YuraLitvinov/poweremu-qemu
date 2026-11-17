@@ -7417,6 +7417,7 @@ static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_g
     { 0x15c0, 0x00000000, "CLR_CMP_CNTL" },
     { 0x15cc, 0x00000000, "CLR_CMP_MASK" },
     { 0x15c4, 0x00000000, "CLR_CMP_CLR_SRC" },
+    { 0x15c8, 0x00000000, "CLR_CMP_CLR_DST" },
     { 0x003c, 0x00000000, "MEM_VGA_RP_SEL" },       /* ... and reads */
     { 0x0094, 0x00000000, "I2C_CNTL_1" },
     { 0x0118, 0x0008bbbb, "FW_CNTL" },
