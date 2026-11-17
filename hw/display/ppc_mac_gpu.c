@@ -7414,6 +7414,7 @@ static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_g
     { 0x003c, 0x00000000, "MEM_VGA_RP_SEL" },       /* ... and reads */
     { 0x0094, 0x00000000, "I2C_CNTL_1" },
     { 0x0118, 0x0008bbbb, "FW_CNTL" },
+    { 0x0120, 0x00000000, "TEST_DEBUG_CNTL" },
     { 0x0140, 0x00000022, "MEM_CNTL" },
     { 0x0144, 0x1a3a5523, "MEM_TIMING_CNTL" },
     { 0x0154, 0x20000000, "MC_INIT_GFX_LAT_TIMER" },
