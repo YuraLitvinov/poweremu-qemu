@@ -7453,6 +7453,7 @@ static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_g
     { 0x0910, 0x00000004, "FCP_CNTL" },
     { 0x0aa0, 0x6000037d, "PAD_CTLR_MISC" },
     { 0x1608, 0x00000000, "DST_LINE_PATCOUNT" },
+    { 0x0d94, 0x00000000, "UNNAMED_0D94" },
     { 0x0d00, 0x5b000000, "DISP_MISC_CNTL" },
     { 0x0d04, 0x00000808, "DAC_MACRO_CNTL" },
     { 0x0d10, 0x10000000, "DISP_TEST_DEBUG_CNTL" },
