@@ -8516,6 +8516,12 @@ static bool ppc_mac_gpu_mmio_read_stub_3d(PPCMacGPUState *s, hwaddr addr, unsign
             break;
         }
 
+        /* SURFACE4_UPPER_BOUND: reads back the value the write path stored */
+        if (addr == 0x0b48) {
+            val = s->r300_surf[18];
+            break;
+        }
+
         /* R300 register catch-all: any register in R300-specific ranges
          * that isn't handled by a specific case above gets returned from
          * shadow storage.  This lets ATIRadeon9700.kext read back any
