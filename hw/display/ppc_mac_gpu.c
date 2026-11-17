@@ -7412,6 +7412,7 @@ static bool is_r300_register(uint32_t addr)
 static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_gpu_post_regs[] = {
     { 0x0038, 0x00000000, "MEM_VGA_WP_SEL" },       /* VGA aperture bank: writes (VBE 4F05) */
     { 0x003c, 0x00000000, "MEM_VGA_RP_SEL" },       /* ... and reads */
+    { 0x0094, 0x00000000, "I2C_CNTL_1" },
     { 0x0118, 0x0008bbbb, "FW_CNTL" },
     { 0x0140, 0x00000022, "MEM_CNTL" },
     { 0x0144, 0x1a3a5523, "MEM_TIMING_CNTL" },
