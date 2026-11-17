@@ -7443,6 +7443,7 @@ static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_g
     { 0x02a4, 0x10000040, "TMDS_TRANSMITTER_CNTL" },
     { 0x02a8, 0x000b01d7, "TMDS_?_02A8" },
     { 0x02f0, 0x20204f4f, "GRPH_BUFFER_CNTL" },
+    { 0x0334, 0x00000000, "OVR2_WID_LEFT_RIGHT" },
     { 0x0360, 0x00000000, "CUR2_OFFSET" },
     { 0x03e8, 0x000f5474, "?_03E8" },
     { 0x03f0, 0x20204f4f, "GRPH2_BUFFER_CNTL" },
