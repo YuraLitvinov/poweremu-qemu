@@ -7415,6 +7415,7 @@ static const struct { uint16_t reg; uint32_t post; const char *name; } ppc_mac_g
     { 0x0038, 0x00000000, "MEM_VGA_WP_SEL" },       /* VGA aperture bank: writes (VBE 4F05) */
     { 0x0c40, 0x00000000, "VIPH_CONTROL" },
     { 0x15c0, 0x00000000, "CLR_CMP_CNTL" },
+    { 0x15cc, 0x00000000, "CLR_CMP_MASK" },
     { 0x15c4, 0x00000000, "CLR_CMP_CLR_SRC" },
     { 0x003c, 0x00000000, "MEM_VGA_RP_SEL" },       /* ... and reads */
     { 0x0094, 0x00000000, "I2C_CNTL_1" },
@@ -10037,10 +10038,9 @@ static bool ppc_mac_gpu_mmio_write_gart_stub_3d(PPCMacGPUState *s, hwaddr addr,
         }
 
         /* VAP/TCL and RBBM registers below 0x1C00 — store for readback.
-         * 0x15CC = VAP_VTX_STATE_CNTL,
+         * 0x15CC = CLR_CMP_MASK,
          * 0x1700 = RBBM_GUICNTL, 0x1704 = SE_TCL_TEX_PROC_CTL_0 */
-        if (addr == 0x15CC ||
-            addr == 0x1700 || addr == 0x1704) {
+        if (addr == 0x1700 || addr == 0x1704) {
             break;
         }
 
