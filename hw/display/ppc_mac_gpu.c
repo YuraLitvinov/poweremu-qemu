@@ -879,6 +879,7 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_GPIO_VGA_DDC:        return "GPIO_VGA_DDC";
     case R200_GPIO_DVI_DDC:        return "GPIO_DVI_DDC";
     case R200_GPIO_MONID:          return "GPIO_MONID";
+    case 0x00A4:                   return "UNNAMED_00A4";
     default:
         if (ppc_mac_gpu_post_reg_name(addr)) {
             return ppc_mac_gpu_post_reg_name(addr);
