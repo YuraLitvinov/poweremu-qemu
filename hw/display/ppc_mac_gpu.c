@@ -870,6 +870,7 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_CP_CSQ_IND_ADDR:     return "CP_CSQ_IND_ADDR";
     case R200_CP_CSQ_IND_DATA:     return "CP_CSQ_IND_DATA";
     case R200_CP_CSQ_STAT:         return "CP_CSQ_STAT";
+    case R200_CP_CSQ2_STAT:        return "CP_CSQ2_STAT";
     case R200_ISYNC_CNTL:          return "ISYNC_CNTL";
     case R200_WAIT_UNTIL:          return "WAIT_UNTIL";
     case R200_AGP_BASE:            return "AGP_BASE";
@@ -8222,6 +8223,29 @@ static bool ppc_mac_gpu_mmio_read_2d(PPCMacGPUState *s, hwaddr addr, unsigned in
          * continue initialization with an error (which is acceptable —
          * we're reverting to the 8500 kext anyway). */
         val = 0;
+#if !PPC_MAC_GPU_BE
+        /* x86 guests (Windows Catalyst): the driver's engine bring-up polls the queue status (CSQ_STAT here,
+         * CSQ2_STAT at 0x07FC, Linux radeon_reg.h) for a value that CHANGES once the CP has taken a packet, and
+         * 10000+ unchanged reads end in "engine dead": 2D only, no DirectDraw/Direct3D (dxdiag: Not Available).
+         * Report read pointer == write pointer (idle) at a position that moves with every submission and every read.  Unproven
+         * against the real poll loop (first boot after the driver install); see PPCGPU_NO_CSQ_MOVE. */
+        if (!getenv("PPCGPU_NO_CSQ_MOVE")) {
+            uint32_t p = s->regs.cp_csq_stat_counter++ & 0xff;
+
+            val = p | p << 8 | p << 16 | p << 24;
+        }
+#endif
+        break;
+    case R200_CP_CSQ2_STAT:
+        /* indirect2 queue pointers, same idea ([7:0] read, [15:8] write: the header does not define the fields) */
+        val = 0;
+#if !PPC_MAC_GPU_BE
+        if (!getenv("PPCGPU_NO_CSQ_MOVE")) {
+            uint32_t p = s->regs.cp_csq_stat_counter++ & 0xff;
+
+            val = p | p << 8;
+        }
+#endif
         break;
     case R200_CP_CSQ_IND_ADDR:
         val = 0;
