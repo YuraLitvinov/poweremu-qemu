@@ -8067,6 +8067,9 @@ static bool ppc_mac_gpu_mmio_read_2d(PPCMacGPUState *s, hwaddr addr, unsigned in
     case R200_DST_PITCH:
         val = s->regs.dst_pitch;
         break;
+    case R200_DST_HEIGHT:
+        val = s->regs.dst_height;
+        break;
     case R200_SRC_OFFSET:
         val = s->regs.src_offset;
         break;
