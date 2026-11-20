@@ -50,10 +50,11 @@
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "exec/target_page.h"
 #include "hw/ppc/ppc.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/nvram/mac_nvram.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "hw/pci-host/uninorth.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -64,15 +65,15 @@
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/ppc/openpic.h"
-#include "hw/loader.h"
-#include "hw/fw-path-provider.h"
+#include "hw/core/loader.h"
+#include "hw/core/fw-path-provider.h"
 #include "elf.h"
 #include "qemu/error-report.h"
 #include "system/kvm.h"
 #include "system/reset.h"
 #include "kvm_ppc.h"
-#include "hw/usb.h"
-#include "hw/sysbus.h"
+#include "hw/usb/usb.h"
+#include "hw/core/sysbus.h"
 #include "trace.h"
 
 #define MAX_IDE_BUS 2
@@ -123,12 +124,6 @@ static void ppc_core99_reset(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
 
-    /*
-     * A guest-initiated restart must not leave the decrementer that Mac OS X
-     * programmed armed for the firmware, as the Old World machine already
-     * ensures.
-     */
-    cpu_ppc_tb_reset(&cpu->env);
     cpu_reset(CPU(cpu));
     /* 970 CPUs want to get their initial IP as part of their boot protocol */
     cpu->env.nip = PROM_BASE + 0x100;
@@ -193,7 +188,8 @@ static void ppc_core99_init(MachineState *machine)
 
         if (bios_size <= 0) {
             /* or load binary ROM image */
-            bios_size = load_image_targphys(filename, PROM_BASE, PROM_SIZE);
+            bios_size = load_image_targphys(filename, PROM_BASE, PROM_SIZE,
+                                            &error_fatal);
         }
         g_free(filename);
     }
@@ -215,24 +211,16 @@ static void ppc_core99_init(MachineState *machine)
         if (kernel_size < 0) {
             kernel_size = load_image_targphys(machine->kernel_filename,
                                               kernel_base,
-                                              machine->ram_size - kernel_base);
-        }
-        if (kernel_size < 0) {
-            error_report("could not load kernel '%s'",
-                         machine->kernel_filename);
-            exit(1);
+                                              machine->ram_size - kernel_base,
+                                              &error_fatal);
         }
         /* load initrd */
         if (machine->initrd_filename) {
             initrd_base = TARGET_PAGE_ALIGN(kernel_base + kernel_size + KERNEL_GAP);
             initrd_size = load_image_targphys(machine->initrd_filename,
                                               initrd_base,
-                                              machine->ram_size - initrd_base);
-            if (initrd_size < 0) {
-                error_report("could not load initial ram disk '%s'",
-                             machine->initrd_filename);
-                exit(1);
-            }
+                                              machine->ram_size - initrd_base,
+                                              &error_fatal);
             cmdline_base = TARGET_PAGE_ALIGN(initrd_base + initrd_size);
         } else {
             cmdline_base = TARGET_PAGE_ALIGN(kernel_base + kernel_size + KERNEL_GAP);
@@ -444,6 +432,15 @@ static void ppc_core99_init(MachineState *machine)
 
     pci_vga_init(pci_bus);
 
+    if (!graphic_width) {
+        graphic_width = 800;
+    }
+    if (!graphic_height) {
+        graphic_height = 600;
+    }
+    if (!graphic_depth) {
+        graphic_depth = 32;
+    }
     if (graphic_depth != 15 && graphic_depth != 32 && graphic_depth != 8) {
         graphic_depth = 15;
     }
@@ -457,17 +454,12 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    /*
-     * 16 KB of byte-addressed storage: an Open Firmware bank and a Mac OS X
-     * bank, laid out by pmac_format_nvram_partition, which explains why the
-     * chip is addressed this way rather than with a stride.
-     */
-    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE * 2);
-    qdev_prop_set_uint32(dev, "it_shift", 0);
+    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
+    qdev_prop_set_uint32(dev, "it_shift", 1);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
-    pmac_format_nvram_banks(nvr, MACIO_NVRAM_SIZE);
+    pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
@@ -519,9 +511,7 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
     /* MacOS NDRV VGA driver */
-    /* QEMU_PPC_NDRV overrides the VGA NDRV (e.g. the hardware-cursor build) */
-    filename = getenv("QEMU_PPC_NDRV") ? g_strdup(getenv("QEMU_PPC_NDRV")) :
-               qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
     if (filename) {
         gchar *ndrv_file;
         gsize ndrv_size;
@@ -575,7 +565,7 @@ static int core99_kvm_type(MachineState *machine, const char *arg)
     return 2;
 }
 
-static void core99_machine_class_init(ObjectClass *oc, void *data)
+static void core99_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     FWPathProviderClass *fwc = FW_PATH_PROVIDER_CLASS(oc);
@@ -643,8 +633,6 @@ static void core99_instance_init(Object *obj)
     object_property_set_description(obj, "via",
                                     "Set VIA configuration. "
                                     "Valid values are cuda, pmu and pmu-adb");
-
-    return;
 }
 
 static const TypeInfo core99_machine_info = {
@@ -653,7 +641,7 @@ static const TypeInfo core99_machine_info = {
     .class_init    = core99_machine_class_init,
     .instance_init = core99_instance_init,
     .instance_size = sizeof(Core99MachineState),
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_FW_PATH_PROVIDER },
         { }
     },

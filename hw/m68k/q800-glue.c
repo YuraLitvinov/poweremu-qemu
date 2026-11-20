@@ -21,12 +21,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "cpu.h"
+#include "target/m68k/cpu.h"
 #include "hw/m68k/q800-glue.h"
-#include "hw/boards.h"
-#include "hw/irq.h"
-#include "hw/nmi.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/boards.h"
+#include "hw/core/irq.h"
+#include "hw/core/nmi.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 
 /*
@@ -159,7 +159,7 @@ static void glue_auxmode_set_irq(void *opaque, int irq, int level)
     s->auxmode = level;
 }
 
-static void glue_nmi(NMIState *n, int cpu_index, Error **errp)
+static void glue_nmi(NMIState *n)
 {
     GLUEState *s = GLUE(n);
 
@@ -228,7 +228,7 @@ static void glue_init(Object *obj)
     s->nmi_release = timer_new_ms(QEMU_CLOCK_VIRTUAL, glue_nmi_release, s);
 }
 
-static void glue_class_init(ObjectClass *klass, void *data)
+static void glue_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
@@ -237,7 +237,7 @@ static void glue_class_init(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_glue;
     device_class_set_props(dc, glue_properties);
     rc->phases.hold = glue_reset_hold;
-    nc->nmi_monitor_handler = glue_nmi;
+    nc->raise_nmi = glue_nmi;
 }
 
 static const TypeInfo glue_info_types[] = {
@@ -248,7 +248,7 @@ static const TypeInfo glue_info_types[] = {
         .instance_init = glue_init,
         .instance_finalize = glue_finalize,
         .class_init = glue_class_init,
-        .interfaces = (InterfaceInfo[]) {
+        .interfaces = (const InterfaceInfo[]) {
              { TYPE_NMI },
              { }
         },

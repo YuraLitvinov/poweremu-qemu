@@ -53,24 +53,150 @@ static void ufs_build_scsi_response_upiu(UfsRequest *req, uint8_t *sense,
         response = UFS_COMMAND_RESULT_FAIL;
     }
 
-    data_segment_length =
-        cpu_to_be16(sense_len + sizeof(req->rsp_upiu.sr.sense_data_len));
+    data_segment_length = sense_len + sizeof(req->rsp_upiu.sr.sense_data_len);
     ufs_build_upiu_header(req, UFS_UPIU_TRANSACTION_RESPONSE, flags, response,
                           status, data_segment_length);
+}
+
+#define UFS_GROUP_NUMBER_MASK 0x1F
+#define UFS_WB_GROUP_NUMBER_DEFAULT 0x00 /* 00000b */
+#define UFS_WB_GROUP_NUMBER_PINNED 0x18 /* 11000b */
+static bool ufs_wb_check_write_pinned(UfsHc *u, UfsRequest *req)
+{
+    uint8_t cmd = req->req_upiu.sc.cdb[0];
+    uint8_t group_number = UFS_WB_GROUP_NUMBER_DEFAULT;
+
+    if (u->attributes.wb_buffer_partial_flush_mode != UFS_WB_FLUSH_PINNED) {
+        return false;
+    }
+
+    if (cmd == WRITE_16) {
+        group_number = req->req_upiu.sc.cdb[14] & UFS_GROUP_NUMBER_MASK;
+
+    } else if (cmd == WRITE_10) {
+        group_number = req->req_upiu.sc.cdb[6] & UFS_GROUP_NUMBER_MASK;
+    }
+
+    return (group_number == UFS_WB_GROUP_NUMBER_PINNED);
+}
+
+static void ufs_wb_process_write_normal(UfsHc *u, uint32_t transfered_len)
+{
+    UfsWb *wb = &u->wb;
+    uint64_t curr_bytes, used_bytes, remain_bytes;
+
+    if (!wb->curr_bytes) {
+        return;
+    }
+
+    curr_bytes = wb->curr_bytes - wb->pinned_curr_bytes;
+    used_bytes = wb->used_bytes - wb->pinned_used_bytes;
+
+    if (used_bytes >= curr_bytes) {
+        return;
+    }
+
+    remain_bytes = curr_bytes - used_bytes;
+    wb->used_bytes += MIN(remain_bytes, transfered_len);
+}
+
+#define UFS_WB_TOTAL_WRITTEN_DIV (10 * 1024 * 1024) /* 10MiB */
+static void ufs_wb_process_write_pinned(UfsHc *u, uint32_t transfered_len)
+{
+    UfsWb *wb = &u->wb;
+    uint64_t remain_bytes, remain_data;
+    uint32_t total_written;
+
+    if (!wb->pinned_curr_bytes) {
+        ufs_wb_process_write_normal(u, transfered_len);
+        return;
+    }
+
+    if (wb->pinned_used_bytes >= wb->pinned_curr_bytes) {
+        ufs_wb_process_write_normal(u, transfered_len);
+        return;
+    }
+
+    remain_bytes = wb->pinned_curr_bytes - wb->pinned_used_bytes;
+    if (remain_bytes >= transfered_len) {
+        wb->pinned_total_written_bytes += transfered_len;
+        wb->pinned_used_bytes += transfered_len;
+        wb->used_bytes += transfered_len;
+        remain_data = 0;
+
+    } else {
+        wb->pinned_total_written_bytes += remain_bytes;
+        wb->pinned_used_bytes += remain_bytes;
+        wb->used_bytes += remain_bytes;
+        remain_data = transfered_len - remain_bytes;
+    }
+
+    total_written = wb->pinned_total_written_bytes / UFS_WB_TOTAL_WRITTEN_DIV;
+    u->attributes.pinned_wb_cumm_written_size = cpu_to_be32(total_written);
+
+    ufs_wb_process_write_normal(u, remain_data);
+}
+
+static void ufs_wb_process_write_req(UfsRequest *req, uint32_t transfered_len)
+{
+    UfsHc *u = req->hc;
+
+    if (!u->flags.wb_en || !ufs_is_write_req(req)) {
+        return;
+    }
+
+    if (ufs_wb_check_write_pinned(u, req)) {
+        ufs_wb_process_write_pinned(u, transfered_len);
+    } else {
+        ufs_wb_process_write_normal(u, transfered_len);
+    }
+
+    ufs_wb_update_avail_buffer(u);
+}
+
+#define UFS_HID_MAX_FRAGMENTS 1024
+static void ufs_hid_count_fragments(UfsRequest *req)
+{
+    UfsHc *u = req->hc;
+
+    if (!ufs_is_write_req(req)) {
+        return;
+    }
+
+    u->hid_fragment_count =
+        MIN(u->hid_fragment_count + 1, UFS_HID_MAX_FRAGMENTS);
 }
 
 static void ufs_scsi_command_complete(SCSIRequest *scsi_req, size_t resid)
 {
     UfsRequest *req = scsi_req->hba_private;
     int16_t status = scsi_req->status;
-
     uint32_t transfered_len = scsi_req->cmd.xfer - resid;
+
+    assert(req != NULL);
+    req->sreq = NULL;
+
+    /* WB / HID accounting should only happen for successful commands */
+    if (status == GOOD) {
+        ufs_wb_process_write_req(req, transfered_len);
+        ufs_hid_count_fragments(req);
+    }
 
     ufs_build_scsi_response_upiu(req, scsi_req->sense, scsi_req->sense_len,
                                  transfered_len, status);
 
     ufs_complete_req(req, UFS_REQUEST_SUCCESS);
 
+    scsi_req->hba_private = NULL;
+    scsi_req_unref(scsi_req);
+}
+
+static void ufs_scsi_command_cancelled(SCSIRequest *scsi_req)
+{
+    UfsRequest *req = scsi_req->hba_private;
+
+    assert(req != NULL);
+    req->sreq = NULL;
     scsi_req->hba_private = NULL;
     scsi_req_unref(scsi_req);
 }
@@ -89,7 +215,23 @@ static const struct SCSIBusInfo ufs_scsi_info = {
 
     .get_sg_list = ufs_get_sg_list,
     .complete = ufs_scsi_command_complete,
+    .cancel = ufs_scsi_command_cancelled,
 };
+
+static bool ufs_append_lun(uint8_t *outbuf, uint32_t outbuf_len, int *len,
+                           uint8_t lun, uint8_t lun_msb)
+{
+    if (*len + 8 > outbuf_len) {
+        return false;
+    }
+
+    memset(outbuf + *len, 0, 8);
+    outbuf[*len] = lun_msb;
+    outbuf[*len + 1] = lun;
+    *len += 8;
+
+    return true;
+}
 
 static int ufs_emulate_report_luns(UfsRequest *req, uint8_t *outbuf,
                                    uint32_t outbuf_len)
@@ -97,23 +239,36 @@ static int ufs_emulate_report_luns(UfsRequest *req, uint8_t *outbuf,
     UfsHc *u = req->hc;
     int len = 0;
 
-    /* TODO: Support for cases where SELECT REPORT is 1 and 2 */
-    if (req->req_upiu.sc.cdb[2] != 0) {
+    uint8_t report_lun_cmd = req->req_upiu.sc.cdb[2];
+
+    if (report_lun_cmd > 2) {
         return SCSI_COMMAND_FAIL;
     }
 
+    if (outbuf_len < 8) {
+        return SCSI_COMMAND_FAIL;
+    }
+
+    memset(outbuf, 0, 8);
     len += 8;
 
-    for (uint8_t lun = 0; lun < UFS_MAX_LUS; ++lun) {
-        if (u->lus[lun]) {
-            if (len + 8 > outbuf_len) {
+    if (report_lun_cmd == 2 || report_lun_cmd == 1) {
+        ufs_append_lun(outbuf, outbuf_len, &len, u->report_wlu.lun & 0x7F,
+                       UFS_WLUN_MSB);
+        ufs_append_lun(outbuf, outbuf_len, &len, u->dev_wlu.lun & 0x7F,
+                       UFS_WLUN_MSB);
+        ufs_append_lun(outbuf, outbuf_len, &len, u->boot_wlu.lun & 0x7F,
+                       UFS_WLUN_MSB);
+        ufs_append_lun(outbuf, outbuf_len, &len, u->rpmb_wlu.lun & 0x7F,
+                       UFS_WLUN_MSB);
+    }
+
+    if (report_lun_cmd == 0 || report_lun_cmd == 2) {
+        for (uint8_t lun = 0; lun < UFS_MAX_LUS; ++lun) {
+            if (u->lus[lun] &&
+                !ufs_append_lun(outbuf, outbuf_len, &len, lun, 0)) {
                 break;
             }
-
-            memset(outbuf + len, 0, 8);
-            outbuf[len] = 0;
-            outbuf[len + 1] = lun;
-            len += 8;
         }
     }
 
@@ -194,7 +349,7 @@ static int ufs_emulate_wlun_inquiry(UfsRequest *req, uint8_t *outbuf,
 static UfsReqResult ufs_emulate_scsi_cmd(UfsLu *lu, UfsRequest *req)
 {
     uint8_t lun = lu->lun;
-    uint8_t outbuf[4096];
+    QEMU_UNINITIALIZED uint8_t outbuf[4096];
     uint8_t sense_buf[UFS_SENSE_SIZE];
     uint8_t scsi_status;
     int len = 0;
@@ -251,6 +406,10 @@ static UfsReqResult ufs_emulate_scsi_cmd(UfsLu *lu, UfsRequest *req)
 static UfsReqResult ufs_process_scsi_cmd(UfsLu *lu, UfsRequest *req)
 {
     uint8_t task_tag = req->req_upiu.header.task_tag;
+    uint8_t *cdb = req->req_upiu.sc.cdb;
+    uint8_t sync_cache_10[UFS_CDB_SIZE] = { SYNCHRONIZE_CACHE };
+    SCSIRequest *scsi_req;
+    uint32_t len;
 
     /*
      * Each ufs-lu has its own independent virtual SCSI bus. Therefore, we can't
@@ -262,11 +421,41 @@ static UfsReqResult ufs_process_scsi_cmd(UfsLu *lu, UfsRequest *req)
         return ufs_emulate_scsi_cmd(lu, req);
     }
 
-    SCSIRequest *scsi_req =
-        scsi_req_new(lu->scsi_dev, task_tag, lu->lun, req->req_upiu.sc.cdb,
-                     UFS_CDB_SIZE, req);
+    /*
+     * scsi-hd implements SYNCHRONIZE CACHE(10) only, while Linux sends the
+     * 16-byte variant to zoned disks. scsi-hd flushes the whole medium for
+     * SYNCHRONIZE CACHE(10) whatever its LBA range, so pass the 16-byte
+     * command on as the 10-byte one, keeping IMMED.
+     */
+    if (cdb[0] == SYNCHRONIZE_CACHE_16) {
+        sync_cache_10[1] = cdb[1] & 0x02;
+        cdb = sync_cache_10;
+    }
 
-    uint32_t len = scsi_req_enqueue(scsi_req);
+    scsi_req = scsi_req_new(lu->scsi_dev, task_tag, lu->lun, cdb, UFS_CDB_SIZE,
+                            req);
+
+    /*
+     * scsi-hd moves as many bytes as the SG list holds, and without an SG
+     * list it would call the transfer_data callback, which ufs-lu does not
+     * set. A UFS device moves what the CDB asks for, so fit the PRDT to the
+     * transfer length, and fail a request whose PRDT describes less, a
+     * missing PRDT included, with OCS MISMATCH DATA BUFFER SIZE, as
+     * virtio-scsi fails a buffer that does not match the command. The
+     * response reports the rest of the Expected Data Transfer Length as a
+     * residual. A request that reports a pending unit attention moves no
+     * data; its sense is already set, so let it through and the guest sees
+     * the UA.
+     */
+    if (!scsi_req->sense_len &&
+        !ufs_fit_data_buffer(req, scsi_req->cmd.xfer)) {
+        scsi_req_unref(scsi_req);
+        return UFS_REQUEST_MISMATCH_DATA_BUF;
+    }
+
+    req->sreq = scsi_req;
+
+    len = scsi_req_enqueue(scsi_req);
     if (len) {
         scsi_req_continue(scsi_req);
     }
@@ -380,7 +569,7 @@ static void ufs_lu_realize(DeviceState *dev, Error **errp)
 {
     UfsLu *lu = DO_UPCAST(UfsLu, qdev, dev);
     BusState *s = qdev_get_parent_bus(dev);
-    UfsHc *u = UFS(s->parent);
+    UfsHc *u = UFS_BUS(s)->hc;
     BlockBackend *blk = lu->conf.blk;
 
     if (!ufs_lu_check_constraints(lu, errp)) {
@@ -413,13 +602,10 @@ static void ufs_lu_unrealize(DeviceState *dev)
 {
     UfsLu *lu = DO_UPCAST(UfsLu, qdev, dev);
 
-    if (lu->scsi_dev) {
-        object_unref(OBJECT(lu->scsi_dev));
-        lu->scsi_dev = NULL;
-    }
+    lu->scsi_dev = NULL;
 }
 
-static void ufs_lu_class_init(ObjectClass *oc, void *data)
+static void ufs_lu_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 

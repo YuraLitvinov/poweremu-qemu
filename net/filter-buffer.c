@@ -10,6 +10,7 @@
 #include "net/filter.h"
 #include "net/queue.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qemu/timer.h"
 #include "qemu/iov.h"
 #include "qapi/qapi-builtin-visit.h"
@@ -159,6 +160,7 @@ static void filter_buffer_set_interval(Object *obj, Visitor *v,
                                        Error **errp)
 {
     FilterBufferState *s = FILTER_BUFFER(obj);
+    NetFilterState *nf = NETFILTER(obj);
     uint32_t value;
 
     if (!visit_type_uint32(v, name, &value, errp)) {
@@ -170,13 +172,18 @@ static void filter_buffer_set_interval(Object *obj, Visitor *v,
         return;
     }
     s->interval = value;
+
+    if (nf->netdev && nf->on) {
+        timer_mod(&s->release_timer,
+                  qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + s->interval);
+    }
 }
 
-static void filter_buffer_class_init(ObjectClass *oc, void *data)
+static void filter_buffer_class_init(ObjectClass *oc, const void *data)
 {
     NetFilterClass *nfc = NETFILTER_CLASS(oc);
 
-    object_class_property_add(oc, "interval", "uint32",
+    object_class_property_add(oc, "interval", "uint32", &uint32_type_info,
                               filter_buffer_get_interval,
                               filter_buffer_set_interval, NULL, NULL);
 

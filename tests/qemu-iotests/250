@@ -19,8 +19,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-# creator
-owner=v.sementsov-og@mail.ru
 
 seq=`basename $0`
 echo "QA output created by $seq"
@@ -51,11 +49,6 @@ _unsupported_imgopts data_file
 # data of the beginning of the disk mapped to the end of file to prevent
 # bdrv_co_truncate(bs->file) call in qcow2_co_truncate(), which might succeed
 # anyway.
-
-disk_usage()
-{
-    du --block-size=1 $1 | awk '{print $1}'
-}
 
 size=2100M
 

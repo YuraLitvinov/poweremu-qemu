@@ -817,11 +817,11 @@ impl Runner<'_, '_> {
                 return pc + 1;
             }
         }
-        if let Some(&k) = jsr.last() {
-            if ((fc.addrs[k] >> 16) & 0xFF) as usize == pc {
-                jsr.pop();
-                return ((fc.addrs[k] >> 24) & 0xFF) as usize;
-            }
+        if let Some(&k) = jsr.last()
+            && ((fc.addrs[k] >> 16) & 0xFF) as usize == pc
+        {
+            jsr.pop();
+            return ((fc.addrs[k] >> 24) & 0xFF) as usize;
         }
         for k in 0..16 {
             let op = (fc.opc >> (2 * k)) & 3;

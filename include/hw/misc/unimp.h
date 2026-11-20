@@ -8,8 +8,8 @@
 #ifndef HW_MISC_UNIMP_H
 #define HW_MISC_UNIMP_H
 
-#include "hw/qdev-properties.h"
-#include "hw/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
 #include "qapi/error.h"
 #include "qom/object.h"
 
@@ -24,6 +24,27 @@ struct UnimplementedDeviceState {
     char *name;
     uint64_t size;
 };
+
+typedef struct UnimplementedDeviceConfig {
+    const char *qom_name;
+    const char *region_name;
+    uint64_t offset;
+    uint64_t size;
+    int priority;
+} UnimplementedDeviceConfig;
+
+/**
+ * create_unimplemented_devices:
+ * @parentobj: the parent object
+ * @container: a #MemoryRegion within which @addr is a relative address
+ * @devconfigs: NULL terminated array of #UnimplementedDeviceConfig
+ *
+ * For each entries in @devconfigs, create a TYPE_UNIMPLEMENTED_DEVICE
+ * and mmap it in @container at UnimplementedDeviceConfig::offset.
+ * @container is expected to be a QOM child of @parentobj.
+ */
+void create_unimplemented_devices(Object *parentobj, MemoryRegion *container,
+                                  const UnimplementedDeviceConfig *devconfigs);
 
 /**
  * create_unimplemented_device: create and map a dummy device

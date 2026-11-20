@@ -1,0 +1,6 @@
+[wrap-file]
+directory = libloading-0.7.4
+source_url = https://crates.io/api/v1/crates/libloading/0.7.4/download
+source_filename = libloading-0.7.4.tar.gz
+source_hash = b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f
+method = cargo

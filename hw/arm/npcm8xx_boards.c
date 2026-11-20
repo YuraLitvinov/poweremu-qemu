@@ -17,12 +17,12 @@
 #include "qemu/osdep.h"
 
 #include "chardev/char.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "hw/arm/npcm8xx.h"
 #include "hw/core/cpu.h"
-#include "hw/loader.h"
-#include "hw/qdev-core.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/loader.h"
+#include "hw/core/qdev.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/datadir.h"
@@ -197,7 +197,7 @@ static void npcm845_evb_init(MachineState *machine)
     npcm8xx_connect_flash(&soc->fiu[0], 0, "w25q256", drive_get(IF_MTD, 0, 0));
     npcm845_evb_i2c_init(soc);
     npcm845_evb_fan_init(NPCM8XX_MACHINE(machine), soc);
-    npcm8xx_load_kernel(machine, soc);
+    npcm8xx_load_kernel(machine, soc, &NPCM8XX_MACHINE(machine)->bootinfo);
 }
 
 static void npcm8xx_set_soc_type(NPCM8xxMachineClass *nmc, const char *type)
@@ -209,7 +209,7 @@ static void npcm8xx_set_soc_type(NPCM8xxMachineClass *nmc, const char *type)
     mc->default_cpus = mc->min_cpus = mc->max_cpus = sc->num_cpus;
 }
 
-static void npcm8xx_machine_class_init(ObjectClass *oc, void *data)
+static void npcm8xx_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     static const char * const valid_cpu_types[] = {
@@ -224,7 +224,7 @@ static void npcm8xx_machine_class_init(ObjectClass *oc, void *data)
     mc->valid_cpu_types = valid_cpu_types;
 }
 
-static void npcm845_evb_machine_class_init(ObjectClass *oc, void *data)
+static void npcm845_evb_machine_class_init(ObjectClass *oc, const void *data)
 {
     NPCM8xxMachineClass *nmc = NPCM8XX_MACHINE_CLASS(oc);
     MachineClass *mc = MACHINE_CLASS(oc);

@@ -12,10 +12,13 @@
 
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qemu/iov.h"
 #include "qemu/main-loop.h"
 #include "qemu/log.h"
 #include "qemu/memalign.h"
 #include "linux-headers/linux/vhost.h"
+
+#define VIRTIO_RING_NOT_IN_BATCH UINT16_MAX
 
 /**
  * Validate the transport device features that both guests can use with the SVQ
@@ -34,6 +37,8 @@ bool vhost_svq_valid_features(uint64_t features, Error **errp)
         switch (b) {
         case VIRTIO_F_ANY_LAYOUT:
         case VIRTIO_RING_F_EVENT_IDX:
+        case VIRTIO_RING_F_INDIRECT_DESC:
+        case VIRTIO_F_IN_ORDER:
             continue;
 
         case VIRTIO_F_ACCESS_PLATFORM:
@@ -94,19 +99,25 @@ static bool vhost_svq_translate_addr(const VhostShadowVirtqueue *svq,
         const DMAMap *map;
         DMAMap needle;
 
+        if (unlikely(iovec[i].iov_len == 0)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "Zero-sized buffer made available by guest");
+            return false;
+        }
+
         /* Check if the descriptor is backed by guest memory  */
         if (gpas) {
             /* Search the GPA->IOVA tree */
             needle = (DMAMap) {
                 .translated_addr = gpas[i],
-                .size = iovec[i].iov_len,
+                .size = iovec[i].iov_len - 1,  /* Inclusive */
             };
             map = vhost_iova_tree_find_gpa(svq->iova_tree, &needle);
         } else {
             /* Search the IOVA->HVA tree */
             needle = (DMAMap) {
                 .translated_addr = (hwaddr)(uintptr_t)iovec[i].iov_base,
-                .size = iovec[i].iov_len,
+                .size = iovec[i].iov_len - 1, /* Inclusive */
             };
             map = vhost_iova_tree_find_iova(svq->iova_tree, &needle);
         }
@@ -136,6 +147,46 @@ static bool vhost_svq_translate_addr(const VhostShadowVirtqueue *svq,
     }
 
     return true;
+}
+
+/**
+ * Get the next descriptor in the chain in SVQ vring from a descriptor id
+ *
+ * @svq Shadow Virtqueue
+ * @id ID of the descriptor
+ *
+ * Return the id of the next descriptor.
+ */
+static uint16_t vhost_svq_next_desc(const VhostShadowVirtqueue *svq,
+                                    uint16_t id)
+{
+    if (virtio_vdev_has_feature(svq->vdev, VIRTIO_F_IN_ORDER)) {
+        return (++id == svq->vring.num) ? 0 : id;
+    } else {
+        return svq->desc_state[id].next;
+    }
+}
+
+/**
+ * Updates the SVQ free_head member after adding them to the SVQ avail ring.
+ * The new free_head is the next descriptor that SVQ will make available by
+ * forwarding a new guest descriptor.
+ *
+ * @svq Shadow Virtqueue
+ * @num Number of descriptors added
+ * @id ID of the last descriptor added to the SVQ avail ring.
+ */
+static void vhost_svq_update_free_head(VhostShadowVirtqueue *svq,
+                                       size_t num, uint16_t id)
+{
+    if (virtio_vdev_has_feature(svq->vdev, VIRTIO_F_IN_ORDER)) {
+        svq->free_head += num;
+        if (svq->free_head >= svq->vring.num) {
+            svq->free_head -= svq->vring.num;
+        }
+    } else {
+        svq->free_head = vhost_svq_next_desc(svq, id);
+    }
 }
 
 /**
@@ -172,9 +223,11 @@ static bool vhost_svq_vring_write_descs(VhostShadowVirtqueue *svq, hwaddr *sg,
     }
 
     for (n = 0; n < num; n++) {
+        uint16_t next = vhost_svq_next_desc(svq, i);
+
         if (more_descs || (n + 1 < num)) {
             descs[i].flags = flags | cpu_to_le16(VRING_DESC_F_NEXT);
-            descs[i].next = cpu_to_le16(svq->desc_next[i]);
+            descs[i].next = cpu_to_le16(next);
         } else {
             descs[i].flags = flags;
         }
@@ -182,10 +235,10 @@ static bool vhost_svq_vring_write_descs(VhostShadowVirtqueue *svq, hwaddr *sg,
         descs[i].len = cpu_to_le32(iovec[n].iov_len);
 
         last = i;
-        i = svq->desc_next[i];
+        i = next;
     }
 
-    svq->free_head = svq->desc_next[last];
+    vhost_svq_update_free_head(svq, num, last);
     return true;
 }
 
@@ -289,6 +342,9 @@ int vhost_svq_add(VhostShadowVirtqueue *svq, const struct iovec *out_sg,
     svq->num_free -= ndescs;
     svq->desc_state[qemu_head].elem = elem;
     svq->desc_state[qemu_head].ndescs = ndescs;
+    if (virtio_vdev_has_feature(svq->vdev, VIRTIO_F_IN_ORDER)) {
+        svq->desc_state[qemu_head].in_bytes = iov_size(in_sg, in_num);
+    }
     vhost_svq_kick(svq);
     return 0;
 }
@@ -384,6 +440,12 @@ static void vhost_handle_guest_kick_notifier(EventNotifier *n)
 static bool vhost_svq_more_used(VhostShadowVirtqueue *svq)
 {
     uint16_t *used_idx = &svq->vring.used->idx;
+
+    if (virtio_vdev_has_feature(svq->vdev, VIRTIO_F_IN_ORDER) &&
+        svq->batch_last.id != VIRTIO_RING_NOT_IN_BATCH) {
+        return true;
+    }
+
     if (svq->last_used_idx != svq->shadow_used_idx) {
         return true;
     }
@@ -427,23 +489,121 @@ static void vhost_svq_disable_notification(VhostShadowVirtqueue *svq)
     }
 }
 
+/*
+ * Gets the next buffer id and moves forward the used idx, so the next time
+ * SVQ calls this function will get the next one.
+ *
+ * @svq: Shadow VirtQueue
+ * @len: Consumed length by the device.
+ *
+ * Return the next descriptor consumed by the device.
+ */
+static uint16_t vhost_svq_get_last_used_split(VhostShadowVirtqueue *svq,
+                                              uint32_t *len)
+{
+    const vring_used_t *used = svq->vring.used;
+    uint16_t last_used = svq->last_used_idx++ & (svq->vring.num - 1);
+
+    *len = le32_to_cpu(used->ring[last_used].len);
+    return le32_to_cpu(used->ring[last_used].id);
+}
+
+/*
+ * Gets the next buffer id and moves forward the used idx, so the next time
+ * SVQ calls this function will get the next one.  IN_ORDER version
+ *
+ * @svq: Shadow VirtQueue
+ * @len: Consumed length by the device.
+ *
+ * Return the next descriptor consumed by the device.
+ */
+static int32_t vhost_svq_get_last_used_split_in_order(
+        VhostShadowVirtqueue *svq,
+        uint32_t *len)
+{
+    unsigned num = svq->vring.num;
+    const vring_used_t *used = svq->vring.used;
+    uint16_t last_used = svq->last_used & (num - 1);
+    uint16_t last_used_idx = svq->last_used_idx & (num - 1);
+
+    if (svq->batch_last.id == VIRTIO_RING_NOT_IN_BATCH) {
+        svq->batch_last.id = le32_to_cpu(used->ring[last_used_idx].id);
+        svq->batch_last.len = le32_to_cpu(used->ring[last_used_idx].len);
+    }
+
+    if (unlikely(last_used >= num)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "Device %s says index %u is used",
+                      svq->vdev->name, last_used);
+        return -1;
+    }
+
+    if (svq->batch_last.id == last_used) {
+        svq->batch_last.id = VIRTIO_RING_NOT_IN_BATCH;
+        *len = svq->batch_last.len;
+    } else {
+        *len = svq->desc_state[last_used].in_bytes;
+    }
+
+    svq->last_used += svq->desc_state[last_used].ndescs;
+    svq->last_used_idx++;
+    return last_used;
+}
+
 static uint16_t vhost_svq_last_desc_of_chain(const VhostShadowVirtqueue *svq,
                                              uint16_t num, uint16_t i)
 {
     for (uint16_t j = 0; j < (num - 1); ++j) {
-        i = svq->desc_next[i];
+        i = vhost_svq_next_desc(svq, i);
     }
 
     return i;
 }
 
 G_GNUC_WARN_UNUSED_RESULT
+static VirtQueueElement *vhost_svq_detach_buf_split(VhostShadowVirtqueue *svq,
+                                                    uint16_t id)
+{
+    uint16_t num = svq->desc_state[id].ndescs;
+    uint16_t last_used_chain = vhost_svq_last_desc_of_chain(svq, num, id);
+
+    svq->desc_state[last_used_chain].next = svq->free_head;
+    svq->free_head = id;
+
+    return g_steal_pointer(&svq->desc_state[id].elem);
+}
+
+G_GNUC_WARN_UNUSED_RESULT
+static VirtQueueElement *vhost_svq_detach_buf_split_in_order(
+        VhostShadowVirtqueue *svq,
+        uint16_t id)
+{
+    return g_steal_pointer(&svq->desc_state[id].elem);
+}
+
+/*
+ * Return the descriptor id (and the chain of ids) to the free list
+ *
+ * @svq: Shadow Virtqueue
+ * @id: Id of the buffer to return.
+ *
+ * Return the element associated to the buffer if any.
+ */
+G_GNUC_WARN_UNUSED_RESULT
+static VirtQueueElement *vhost_svq_detach_buf(VhostShadowVirtqueue *svq,
+                                              uint16_t id)
+{
+    if (virtio_vdev_has_feature(svq->vdev, VIRTIO_F_IN_ORDER)) {
+        return vhost_svq_detach_buf_split_in_order(svq, id);
+    } else {
+        return vhost_svq_detach_buf_split(svq, id);
+    }
+}
+
+G_GNUC_WARN_UNUSED_RESULT
 static VirtQueueElement *vhost_svq_get_buf(VhostShadowVirtqueue *svq,
                                            uint32_t *len)
 {
-    const vring_used_t *used = svq->vring.used;
-    vring_used_elem_t used_elem;
-    uint16_t last_used, last_used_chain, num;
+    uint16_t last_used;
 
     if (!vhost_svq_more_used(svq)) {
         return NULL;
@@ -451,33 +611,35 @@ static VirtQueueElement *vhost_svq_get_buf(VhostShadowVirtqueue *svq,
 
     /* Only get used array entries after they have been exposed by dev */
     smp_rmb();
-    last_used = svq->last_used_idx & (svq->vring.num - 1);
-    used_elem.id = le32_to_cpu(used->ring[last_used].id);
-    used_elem.len = le32_to_cpu(used->ring[last_used].len);
 
-    svq->last_used_idx++;
-    if (unlikely(used_elem.id >= svq->vring.num)) {
+    if (virtio_vdev_has_feature(svq->vdev, VIRTIO_F_IN_ORDER)) {
+        int32_t r;
+        r = vhost_svq_get_last_used_split_in_order(svq, len);
+        if (r < 0) {
+            return NULL;
+        }
+
+        last_used = r;
+    } else {
+        last_used = vhost_svq_get_last_used_split(svq, len);
+    }
+
+    if (unlikely(last_used >= svq->vring.num)) {
         qemu_log_mask(LOG_GUEST_ERROR, "Device %s says index %u is used",
-                      svq->vdev->name, used_elem.id);
+                      svq->vdev->name, last_used);
         return NULL;
     }
 
-    if (unlikely(!svq->desc_state[used_elem.id].ndescs)) {
+    if (unlikely(!svq->desc_state[last_used].ndescs)) {
         qemu_log_mask(LOG_GUEST_ERROR,
             "Device %s says index %u is used, but it was not available",
-            svq->vdev->name, used_elem.id);
+            svq->vdev->name, last_used);
         return NULL;
     }
 
-    num = svq->desc_state[used_elem.id].ndescs;
-    svq->desc_state[used_elem.id].ndescs = 0;
-    last_used_chain = vhost_svq_last_desc_of_chain(svq, num, used_elem.id);
-    svq->desc_next[last_used_chain] = svq->free_head;
-    svq->free_head = used_elem.id;
-    svq->num_free += num;
-
-    *len = used_elem.len;
-    return g_steal_pointer(&svq->desc_state[used_elem.id].elem);
+    svq->num_free += svq->desc_state[last_used].ndescs;
+    svq->desc_state[last_used].ndescs = 0;
+    return vhost_svq_detach_buf(svq, last_used);
 }
 
 /**
@@ -589,6 +751,15 @@ static void vhost_svq_handle_call(EventNotifier *n)
     vhost_svq_flush(svq, true);
 }
 
+static void event_notifier_set_or_zero(EventNotifier *e, int fd)
+{
+    if (fd == VHOST_FILE_UNBIND) {
+        memset(e, 0, sizeof(*e));
+    } else {
+        event_notifier_init_fd(e, fd);
+    }
+}
+
 /**
  * Set the call notifier for the SVQ to call the guest
  *
@@ -599,17 +770,13 @@ static void vhost_svq_handle_call(EventNotifier *n)
  */
 void vhost_svq_set_svq_call_fd(VhostShadowVirtqueue *svq, int call_fd)
 {
-    if (call_fd == VHOST_FILE_UNBIND) {
-        /*
-         * Fail event_notifier_set if called handling device call.
-         *
-         * SVQ still needs device notifications, since it needs to keep
-         * forwarding used buffers even with the unbind.
-         */
-        memset(&svq->svq_call, 0, sizeof(svq->svq_call));
-    } else {
-        event_notifier_init_fd(&svq->svq_call, call_fd);
-    }
+    /*
+     * Fail event_notifier_set if called handling device call.
+     *
+     * SVQ still needs device notifications, since it needs to keep
+     * forwarding used buffers even with the unbind.
+     */
+    event_notifier_set_or_zero(&svq->svq_call, call_fd);
 }
 
 /**
@@ -652,14 +819,14 @@ size_t vhost_svq_device_area_size(const VhostShadowVirtqueue *svq)
 void vhost_svq_set_svq_kick_fd(VhostShadowVirtqueue *svq, int svq_kick_fd)
 {
     EventNotifier *svq_kick = &svq->svq_kick;
-    bool poll_stop = VHOST_FILE_UNBIND != event_notifier_get_fd(svq_kick);
+    bool poll_stop = event_notifier_initialized(svq_kick);
     bool poll_start = svq_kick_fd != VHOST_FILE_UNBIND;
 
     if (poll_stop) {
         event_notifier_set_handler(svq_kick, NULL);
     }
 
-    event_notifier_init_fd(svq_kick, svq_kick_fd);
+    event_notifier_set_or_zero(&svq->svq_kick, svq_kick_fd);
     /*
      * event_notifier_set_handler already checks for guest's notifications if
      * they arrive at the new file descriptor in the switch, so there is no
@@ -688,6 +855,8 @@ void vhost_svq_start(VhostShadowVirtqueue *svq, VirtIODevice *vdev,
     svq->next_guest_avail_elem = NULL;
     svq->shadow_avail_idx = 0;
     svq->shadow_used_idx = 0;
+    memset(&svq->batch_last, 0, sizeof(svq->batch_last));
+    svq->last_used = 0;
     svq->last_used_idx = 0;
     svq->vdev = vdev;
     svq->vq = vq;
@@ -704,9 +873,12 @@ void vhost_svq_start(VhostShadowVirtqueue *svq, VirtIODevice *vdev,
                            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
                            -1, 0);
     svq->desc_state = g_new0(SVQDescState, svq->vring.num);
-    svq->desc_next = g_new0(uint16_t, svq->vring.num);
-    for (unsigned i = 0; i < svq->vring.num - 1; i++) {
-        svq->desc_next[i] = i + 1;
+    if (virtio_vdev_has_feature(svq->vdev, VIRTIO_F_IN_ORDER)) {
+        svq->batch_last.id = VIRTIO_RING_NOT_IN_BATCH;
+    } else {
+        for (unsigned i = 0; i < svq->vring.num - 1; i++) {
+            svq->desc_state[i].next = i + 1;
+        }
     }
 }
 
@@ -743,7 +915,6 @@ void vhost_svq_stop(VhostShadowVirtqueue *svq)
         virtqueue_unpop(svq->vq, next_avail_elem, 0);
     }
     svq->vq = NULL;
-    g_free(svq->desc_next);
     g_free(svq->desc_state);
     munmap(svq->vring.desc, vhost_svq_driver_area_size(svq));
     munmap(svq->vring.used, vhost_svq_device_area_size(svq));
@@ -762,7 +933,6 @@ VhostShadowVirtqueue *vhost_svq_new(const VhostShadowVirtqueueOps *ops,
 {
     VhostShadowVirtqueue *svq = g_new0(VhostShadowVirtqueue, 1);
 
-    event_notifier_init_fd(&svq->svq_kick, VHOST_FILE_UNBIND);
     svq->ops = ops;
     svq->ops_opaque = ops_opaque;
     return svq;

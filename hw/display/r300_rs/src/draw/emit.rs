@@ -137,12 +137,12 @@ impl Build<'_> {
         let t1 = bits_to_float(st.reg(GA_POINT_T1));
         const CORNER: [usize; 6] = [0, 1, 2, 0, 2, 3];
 
-        if self.point_psize {
-            if let Some(slot) = self.lay.psize {
-                let d = fmin(fmax(self.outs[i as usize][slot][0], self.point_min), self.point_max);
-                hw = d * 0.5;
-                hh = hw;
-            }
+        if self.point_psize
+            && let Some(slot) = self.lay.psize
+        {
+            let d = fmin(fmax(self.outs[i as usize][slot][0], self.point_min), self.point_max);
+            hw = d * 0.5;
+            hh = hw;
         }
         let (cx, cy) = self.ndc_px(&p);
         // corners: top-left, top-right, bottom-right, bottom-left

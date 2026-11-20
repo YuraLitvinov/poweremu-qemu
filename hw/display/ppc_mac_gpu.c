@@ -34,9 +34,9 @@
 #include "qemu/timer.h"
 #include "qemu/datadir.h"
 #include "hw/pci/pci_device.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
 #include "exec/tswap.h"
 #include "ppc_mac_gpu_byteorder.h"
 #include "ppc_mac_gpu_scanout.h"
@@ -55,6 +55,17 @@
 #endif
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
+
+/*
+ * c2rust-only shims (inactive in the normal build).  c2rust cannot translate
+ * QEMU's ARRAY_SIZE (__builtin_types_compatible_p) or glibc's strstr macro
+ * (_Generic), so give the transpiler plain equivalents.
+ */
+#ifdef C2RUST
+#undef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#undef strstr
+#endif
 
 /* UniNorth AGP bridge GART base — defined in hw/pci-host/uninorth.c */
 hwaddr uninorth_get_agp_gart_base(void);
@@ -1447,7 +1458,7 @@ static void gpu_dac_set(PPCMacGPUState *s, unsigned i, uint32_t rgb)
     }
 }
 
-static void ppc_mac_gpu_display_update(void *opaque)
+static bool ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
 
@@ -1475,7 +1486,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 }
             }
             s->vga->hw_ops->gfx_update(s->vga);
-            return;
+            return true;
         }
         if (s->vga_shown) {
             /* the card's own scanout takes over: make a new surface for it */
@@ -1494,10 +1505,10 @@ static void ppc_mac_gpu_display_update(void *opaque)
             c->hot_x = 0;               /* X/Y are the image's top-left */
             c->hot_y = 0;
             memcpy(c->data, s->hwc_pix, s->hwc_w * s->hwc_h * 4);
-            dpy_cursor_define(s->con, c);
+            qemu_console_set_cursor(s->con, c);
             cursor_unref(c);
         }
-        dpy_mouse_set(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
+        qemu_console_set_mouse(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
     }
 
     if (s->disp.stride && s->disp.height) {
@@ -1526,7 +1537,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
                     s->disp.width, s->disp.height);
             zero_count++;
         }
-        return;
+        return true;
     }
 
     vram_ptr = memory_region_get_ram_ptr(&s->vram);
@@ -1600,7 +1611,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
             s->display_invalid = false;
             DisplaySurface *ds = qemu_create_displaysurface_from(
                 width, height, PIXMAN_x8r8g8b8, width * 4, s->shadow_buf);
-            dpy_gfx_replace_surface(s->con, ds);
+            qemu_console_set_surface(s->con, ds);
         }
         bool is565 = s->disp.bpp == 16;
         if ((uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
@@ -1610,8 +1621,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 GUEST_SCAN16(sp, dp, width, is565);
             }
         }
-        dpy_gfx_update_full(s->con);
-        return;
+        qemu_console_update_full(s->con);
+        return true;
     }
 
     /* 8bpp (VBE 256-colour and the like): indices through the DAC */
@@ -1627,7 +1638,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
         }
         if (mode_changed || s->display_invalid) {
             s->display_invalid = false;
-            dpy_gfx_replace_surface(s->con, qemu_create_displaysurface_from(
+            qemu_console_set_surface(s->con, qemu_create_displaysurface_from(
                 width, height, PIXMAN_x8r8g8b8, width * 4, s->shadow_buf));
         }
         for (unsigned i = 0; i < 256; i++) {
@@ -1643,8 +1654,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 }
             }
         }
-        dpy_gfx_update_full(s->con);
-        return;
+        qemu_console_update_full(s->con);
+        return true;
     }
 
     /* other non-32bpp modes */
@@ -1661,10 +1672,10 @@ static void ppc_mac_gpu_display_update(void *opaque)
             DisplaySurface *ds = qemu_create_displaysurface_from(
                 width, height, s->disp.format, stride,
                 vram_ptr + s->disp.offset);
-            dpy_gfx_replace_surface(s->con, ds);
+            qemu_console_set_surface(s->con, ds);
         }
-        dpy_gfx_update_full(s->con);
-        return;
+        qemu_console_update_full(s->con);
+        return true;
     }
 
     /*
@@ -1789,7 +1800,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
             PIXMAN_x8r8g8b8,   /* native LE — matches Cocoa's hardcoded LE */
             stride,
             s->shadow_buf);
-        dpy_gfx_replace_surface(s->con, ds);
+        qemu_console_set_surface(s->con, ds);
     } else {
         s->display_invalid = false;
     }
@@ -1953,18 +1964,19 @@ static void ppc_mac_gpu_display_update(void *opaque)
     }
 
     if (surface_replaced) {
-        dpy_gfx_update_full(s->con);
+        qemu_console_update_full(s->con);
         if (s->fps_frames_ptr) {
             (*s->fps_frames_ptr)++;
             *s->fps_rows_ptr += height;
         }
     } else if (lo >= 0) {
-        dpy_gfx_update(s->con, 0, lo, width, hi - lo);
+        qemu_console_update(s->con, 0, lo, width, hi - lo);
         if (s->fps_frames_ptr) {
             (*s->fps_frames_ptr)++;
             *s->fps_rows_ptr += hi - lo;
         }
     }
+    return true;
 }
 
 static const GraphicHwOps ppc_mac_gpu_gfx_ops = {
@@ -2338,7 +2350,7 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
     }
     if (ppc_mac_gpu_agp_translate(s, gpu_addr, &phys) ||
         ppc_mac_gpu_gart_translate(s, gpu_addr, &phys)) {
-        cpu_physical_memory_write(phys, bytes, 4);
+        address_space_write(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED, bytes, 4);
         return true;
     }
     return false;
@@ -2578,6 +2590,28 @@ static FILE *r300_drawlog(void)
     return f;
 }
 
+
+/* r300_state_dump / r300_us_disasm hand their text over in pieces. */
+static void r300_text_to_file(void *ctx, const uint8_t *text, size_t len)
+{
+    fwrite(text, 1, len, (FILE *)ctx);
+}
+
+static void r300_text_to_gstring(void *ctx, const uint8_t *text, size_t len)
+{
+    g_string_append_len((GString *)ctx, (const char *)text, len);
+}
+
+/* The packet's texture copies of GART memory are the device's (malloc'd in r300_render); the rest is the R300 code's. */
+static void r300_draw_release(R300DrawPacket *pkt)
+{
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        free(pkt->tex[t].host_data);
+        pkt->tex[t].host_data = NULL;
+    }
+    r300_draw_free(pkt);
+}
+
 static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
                               const uint32_t *d, uint32_t body_dw)
 {
@@ -2642,12 +2676,11 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
     }
     fprintf(f, "\n");
     if (getenv("R300_USDISASM")) {
-        char *dis = r300_us_disasm(r);
+        GString *dis = g_string_new(NULL);
 
-        if (dis) {
-            fprintf(f, "%s\n", dis);
-            g_free(dis);
-        }
+        r300_us_disasm(r, r300_text_to_gstring, dis);
+        fprintf(f, "%s\n", dis->str);
+        g_string_free(dis, true);
     }
     fflush(f);
 }
@@ -3090,7 +3123,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 !(gart_backup = g_try_malloc(rt_len))) {
                 r300_warn_once("colour buffer outside VRAM", NULL);
                 g_free(gart_backup);
-                r300_draw_free(&pkt);
+                r300_draw_release(&pkt);
                 return;
             }
             gart_scratch = (s->vram_size - rt_len) & ~0xFFFu;
@@ -3157,7 +3190,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         h = (h ^ vram[td->gpu_addr + i]) * 1099511628211ull;
                     }
                     for (unsigned i = 0; i < nseen; i++) {
-                        dump_new &= !(seen[i].addr == td->gpu_addr && seen[i].h == h);
+                        if (seen[i].addr == td->gpu_addr && seen[i].h == h) {
+                            dump_new = false;
+                        }
                     }
                     if (dump_new && nseen < 512) {
                         seen[nseen].addr = td->gpu_addr;
@@ -3327,7 +3362,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             gpu_vram_dirty(s, gart_scratch, gart_len);
             g_free(gart_backup);
         }
-        r300_draw_free(&pkt);
+        r300_draw_release(&pkt);
         s->regs.stall_draws++;
         return;
     }
@@ -3542,7 +3577,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         gpu_vram_dirty(s, gart_scratch, gart_len);
         g_free(gart_backup);
     }
-    r300_draw_free(&pkt);
+    r300_draw_release(&pkt);
     s->regs.stall_draws++;
 }
 
@@ -3696,7 +3731,8 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
             fprintf(s->r3_dump, " %08X", d[k]);
         }
         fprintf(s->r3_dump, "\n");
-        r300_state_dump(s->r3, s->r3_dump);
+        r300_state_dump(s->r3, r300_text_to_file, s->r3_dump);
+        fflush(s->r3_dump);
     }
     r300_render(s, opcode, d, body_dw, NULL);
     return true;
@@ -7798,7 +7834,7 @@ static G_GNUC_UNUSED void ppc_mac_gpu_cursor_sync(PPCMacGPUState *s)
             /* hide the host pointer: the cursor is part of the frame */
             QEMUCursor *c = cursor_alloc(1, 1);
 
-            dpy_cursor_define(s->con, c);
+            qemu_console_set_cursor(s->con, c);
             cursor_unref(c);
             s->hwc_w = s->hwc_h = 64;
         }
@@ -7810,7 +7846,7 @@ static G_GNUC_UNUSED void ppc_mac_gpu_cursor_sync(PPCMacGPUState *s)
         fprintf(stderr, "CURSOR posn %08x off %08x gen %08x -> top-left (%d,%d) on %d\n",
                 s->regs.cur_horz_vert_posn, s->regs.cur_horz_vert_off, s->regs.crtc_gen_cntl, x, y, on);
     }
-    dpy_mouse_set(s->con, 0, 0, false);
+    qemu_console_set_mouse(s->con, 0, 0, false);
 }
 
 static void ppc_mac_gpu_hwc_write(PPCMacGPUState *s, uint32_t reg, uint32_t val)
@@ -7832,7 +7868,7 @@ static void ppc_mac_gpu_hwc_write(PPCMacGPUState *s, uint32_t reg, uint32_t val)
             c->hot_x = 0;               /* X/Y are the image's top-left */
             c->hot_y = 0;
             memcpy(c->data, s->hwc_pix, s->hwc_w * s->hwc_h * 4);
-            dpy_cursor_define(s->con, c);
+            qemu_console_set_cursor(s->con, c);
             cursor_unref(c);
             static int defined;
             if (defined++ < 6) {
@@ -7855,7 +7891,7 @@ static void ppc_mac_gpu_hwc_write(PPCMacGPUState *s, uint32_t reg, uint32_t val)
                      s->hwc_visible ? "shown" : "hidden");
         }
         if (s->con) {
-            dpy_mouse_set(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
+            qemu_console_set_mouse(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
         }
         break;
     }
@@ -9245,7 +9281,7 @@ static uint64_t ppc_mac_gpu_mmio_read_impl(void *opaque, hwaddr addr,
         }
     }
 
-    if (unlikely(trace_event_get_state(TRACE_PPC_MAC_GPU_MMIO_READ))) {
+    if (unlikely(trace_event_get_state_backends(TRACE_PPC_MAC_GPU_MMIO_READ))) {
         trace_ppc_mac_gpu_mmio_read(size, addr, ppc_mac_gpu_reg_name(addr), val);
     }
     if (unlikely(s->r3_dump && s->r3 && s->r3->draws && s->r3_trace_lines < 40000)) {
@@ -10825,7 +10861,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
     s->hwc_visible = false;
     if (s->con) {
-        dpy_mouse_set(s->con, 0, 0, false);
+        qemu_console_set_mouse(s->con, 0, 0, false);
     }
 
     /* Initialize register defaults.
@@ -10988,7 +11024,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     }
 
     /* Create graphics console */
-    s->con = graphic_console_init(DEVICE(dev), 0,
+    s->con = qemu_graphic_console_create(DEVICE(dev), 0,
                                   &ppc_mac_gpu_gfx_ops, s);
 
     if (s->legacy_vga) {
@@ -11494,7 +11530,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
     timer_del(&s->vblank_timer);
     g_free(s->shadow_buf);
     s->shadow_buf = NULL;
-    graphic_console_close(s->con);
+    qemu_graphic_console_close(s->con);
 }
 
 /* ========================================================================
@@ -11616,7 +11652,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
      */
     s->hwc_announce = true;
     if (s->con) {
-        dpy_gfx_update_full(s->con);
+        qemu_console_update_full(s->con);
     }
     return 0;
 }
@@ -11628,9 +11664,7 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
     .post_load = ppc_mac_gpu_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(pci, PPCMacGPUState),
-        VMSTATE_UINT32_EQUAL(regs_size, PPCMacGPUState,
-                             "this machine was saved by a build whose "
-                             "graphics registers were laid out differently"),
+        VMSTATE_UINT32_EQUAL(regs_size, PPCMacGPUState),
         VMSTATE_BUFFER_UNSAFE(regs, PPCMacGPUState, 1, sizeof(PPCMacGPURegs)),
         VMSTATE_BOOL(display_invalid, PPCMacGPUState),
         /*
@@ -11682,7 +11716,7 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
     }
 };
 
-static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
+static void ppc_mac_gpu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -11709,7 +11743,7 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
  * ATIRadeon9700.kext (IOPCIMatch
  * 0x4E441002) and its GL driver take the card.
  */
-static void ati_radeon_9700_class_init(ObjectClass *klass, void *data)
+static void ati_radeon_9700_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 

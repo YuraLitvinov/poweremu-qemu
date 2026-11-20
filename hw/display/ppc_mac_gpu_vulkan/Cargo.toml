@@ -12,9 +12,12 @@ ash = "0.37"
 # The Rust R300 code (draw assembly, shader translators, state).  Enabled by
 # meson for every build that has no C implementation of it (all but ppc).
 r300 = { path = "../r300_rs", optional = true }
+# The device itself (c2rust output of ppc_mac_gpu.c), x86 builds only.
+ppc_mac_gpu_dev = { path = "../ppc_mac_gpu_dev", optional = true }
 
 [features]
 r300_rs = ["dep:r300"]
+device_rs = ["dep:ppc_mac_gpu_dev"]
 
 # The C types (renderer vtable, R300 draw packet, uniforms, ...) are
 # generated from QEMU's own headers at build time, so a change to them
@@ -25,3 +28,6 @@ bindgen = "0.72"
 [profile.release]
 panic = "abort"
 debug = 1
+
+# Keep out of QEMU's own Cargo workspace (the root Cargo.toml).
+[workspace]

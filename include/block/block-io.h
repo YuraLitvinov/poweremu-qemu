@@ -24,8 +24,10 @@
 #ifndef BLOCK_IO_H
 #define BLOCK_IO_H
 
-#include "block/aio-wait.h"
+#include "qemu/aiocb.h"
+#include "qemu/aio-wait.h"
 #include "block/block-common.h"
+#include "block/graph-lock.h"
 #include "qemu/coroutine.h"
 #include "qemu/iov.h"
 
@@ -124,6 +126,20 @@ int coroutine_fn GRAPH_RDLOCK bdrv_co_zone_append(BlockDriverState *bs,
                                                   int64_t *offset,
                                                   QEMUIOVector *qiov,
                                                   BdrvRequestFlags flags);
+/* The index of the zone that @offset falls in. */
+uint32_t bdrv_zone_index(BlockDriverState *bs, uint64_t offset);
+/*
+ * True if the zone at @index is a conventional zone, which can be written
+ * anywhere in any order. The type of a zone does not change, so unlike
+ * bdrv_zone_is_full() this does not need the write pointer lock.
+ */
+bool bdrv_zone_is_conv(BlockDriverState *bs, uint32_t index);
+/*
+ * True when the write pointer of a zone has reached the end of the writable
+ * part of that zone, so that nothing more can be written to it until it is
+ * reset. The write pointer lock must be held when called.
+ */
+bool bdrv_zone_is_full(BlockDriverState *bs, uint32_t index);
 
 bool bdrv_can_write_zeroes_with_unmap(BlockDriverState *bs);
 
@@ -161,6 +177,8 @@ bdrv_is_allocated_above(BlockDriverState *bs, BlockDriverState *base,
 
 int coroutine_fn GRAPH_RDLOCK
 bdrv_co_is_zero_fast(BlockDriverState *bs, int64_t offset, int64_t bytes);
+int coroutine_fn GRAPH_RDLOCK
+bdrv_co_is_all_zeroes(BlockDriverState *bs);
 
 int GRAPH_RDLOCK
 bdrv_apply_auto_read_only(BlockDriverState *bs, const char *errmsg,
@@ -429,7 +447,7 @@ bdrv_drain_poll(BlockDriverState *bs, BdrvChild *ignore_parent,
  *
  * This function can be recursive.
  */
-void bdrv_drained_begin(BlockDriverState *bs);
+void GRAPH_UNLOCKED bdrv_drained_begin(BlockDriverState *bs);
 
 /**
  * bdrv_do_drained_begin_quiesce:

@@ -24,16 +24,15 @@
  */
 
 #include "qemu/osdep.h"
-#ifdef __APPLE__
-#include <pthread/qos.h>
-#endif
+#include "exec/cpu-common.h"
 #include "system/tcg.h"
 #include "system/replay.h"
-#include "system/cpu-timers.h"
+#include "exec/icount.h"
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
+#include "accel/tcg/cpu-loop.h"
 #include "tcg/startup.h"
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-mttcg.h"
@@ -73,12 +72,6 @@ static void *mttcg_cpu_thread_fn(void *arg)
     g_assert(!icount_enabled());
 
     rcu_register_thread();
-#ifdef __APPLE__
-    /* The vCPU thread is the emulator's critical path: keep it on the
-     * performance cores instead of letting macOS park it on efficiency
-     * cores whenever the host is busy or the window is in the background. */
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
     force_rcu.notifier.notify = mttcg_force_rcu;
     force_rcu.cpu = cpu;
     rcu_add_force_rcu_notifier(&force_rcu.notifier);
@@ -93,16 +86,16 @@ static void *mttcg_cpu_thread_fn(void *arg)
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
-    /* process any pending work */
-    cpu->exit_request = 1;
-
     do {
+        qemu_process_cpu_events(cpu);
+
         if (cpu_can_run(cpu)) {
-            int r;
+            int excp;
+
             bql_unlock();
-            r = tcg_cpu_exec(cpu);
+            excp = tcg_cpu_exec(cpu);
             bql_lock();
-            switch (r) {
+            switch (excp) {
             case EXCP_DEBUG:
                 cpu_handle_guest_debug(cpu);
                 break;
@@ -121,9 +114,6 @@ static void *mttcg_cpu_thread_fn(void *arg)
                 break;
             }
         }
-
-        qatomic_set_mb(&cpu->exit_request, 0);
-        qemu_wait_io_event(cpu);
     } while (!cpu->unplug || cpu_can_run(cpu));
 
     tcg_cpu_destroy(cpu);
@@ -131,11 +121,6 @@ static void *mttcg_cpu_thread_fn(void *arg)
     rcu_remove_force_rcu_notifier(&force_rcu.notifier);
     rcu_unregister_thread();
     return NULL;
-}
-
-void mttcg_kick_vcpu_thread(CPUState *cpu)
-{
-    cpu_exit(cpu);
 }
 
 void mttcg_start_vcpu_thread(CPUState *cpu)

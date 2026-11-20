@@ -20,9 +20,9 @@
 
 #include "qemu/osdep.h"
 #include "hw/char/imx_serial.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
-#include "hw/qdev-properties-system.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -43,14 +43,15 @@
 
 static const VMStateDescription vmstate_imx_serial = {
     .name = TYPE_IMX_SERIAL,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_FIFO32(rx_fifo, IMXSerialState),
         VMSTATE_TIMER(ageing_timer, IMXSerialState),
         VMSTATE_UINT32(usr1, IMXSerialState),
         VMSTATE_UINT32(usr2, IMXSerialState),
         VMSTATE_UINT32(ucr1, IMXSerialState),
+        VMSTATE_UINT32(ucr2, IMXSerialState),
         VMSTATE_UINT32(uts1, IMXSerialState),
         VMSTATE_UINT32(onems, IMXSerialState),
         VMSTATE_UINT32(ufcr, IMXSerialState),
@@ -185,7 +186,7 @@ static void imx_serial_reset_at_boot(DeviceState *dev)
 static uint64_t imx_serial_read(void *opaque, hwaddr offset,
                                 unsigned size)
 {
-    IMXSerialState *s = (IMXSerialState *)opaque;
+    IMXSerialState *s = opaque;
     Chardev *chr = qemu_chr_fe_get_driver(&s->chr);
     uint32_t c, rx_used;
     uint8_t rxtl = s->ufcr & TL_MASK;
@@ -276,11 +277,11 @@ static uint64_t imx_serial_read(void *opaque, hwaddr offset,
 static void imx_serial_write(void *opaque, hwaddr offset,
                              uint64_t value, unsigned size)
 {
-    IMXSerialState *s = (IMXSerialState *)opaque;
-    Chardev *chr = qemu_chr_fe_get_driver(&s->chr);
+    IMXSerialState *s = opaque;
+    g_autofree char *label = qemu_chr_fe_backend_name(&s->chr);
     unsigned char ch;
 
-    trace_imx_serial_write(chr ? chr->label : "NODEV", offset, value);
+    trace_imx_serial_write(label ? label : "NODEV", offset, value);
 
     switch (offset >> 2) {
     case 0x10: /* UTXD */
@@ -385,14 +386,14 @@ static void imx_serial_write(void *opaque, hwaddr offset,
 
 static int imx_can_receive(void *opaque)
 {
-    IMXSerialState *s = (IMXSerialState *)opaque;
+    IMXSerialState *s = opaque;
 
     return s->ucr2 & UCR2_RXEN ? fifo32_num_free(&s->rx_fifo) : 0;
 }
 
 static void imx_put_data(void *opaque, uint32_t value)
 {
-    IMXSerialState *s = (IMXSerialState *)opaque;
+    IMXSerialState *s = opaque;
     Chardev *chr = qemu_chr_fe_get_driver(&s->chr);
     uint8_t rxtl = s->ufcr & TL_MASK;
 
@@ -415,7 +416,7 @@ static void imx_put_data(void *opaque, uint32_t value)
 
 static void imx_receive(void *opaque, const uint8_t *buf, int size)
 {
-    IMXSerialState *s = (IMXSerialState *)opaque;
+    IMXSerialState *s = opaque;
 
     s->usr2 |= USR2_WAKE;
 
@@ -467,7 +468,7 @@ static const Property imx_serial_properties[] = {
     DEFINE_PROP_CHR("chardev", IMXSerialState, chr),
 };
 
-static void imx_serial_class_init(ObjectClass *klass, void *data)
+static void imx_serial_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

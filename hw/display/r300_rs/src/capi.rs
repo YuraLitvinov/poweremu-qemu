@@ -11,83 +11,25 @@ use core::{fmt, ptr, slice};
 use std::ffi::CString;
 use std::sync::Mutex;
 
-use crate::draw::layout::tex_level_dims;
 use crate::draw::misc::{self, Arrays, MAX_ARRAYS};
 use crate::draw::{draw_build, draw_build_indexed, DrawPacket, Indices};
 use crate::state::{reg_name, R300State};
-use crate::texel::{convert_level, LevelSpec};
-use crate::types::{R300TexDesc, TexKind, TEX_MAX_LEVELS};
-
-fn spec_for(td: &R300TexDesc, level: u32) -> Option<LevelSpec> {
-    Some(LevelSpec {
-        kind: TexKind::from_raw(td.kind),
-        format: td.format,
-        src_pitch: *td.lvl_pitch.get(level as usize).filter(|_| (level as usize) < TEX_MAX_LEVELS)?,
-    })
-}
-
-/// Size in bytes of the converted `w` x `h` level `l` of `td`, and its row
-/// size in `*bpr`.  Returns 0 (and leaves `*bpr` alone) if the level cannot be
-/// converted.
-///
-/// # Safety
-/// `td` and `bpr` must be valid pointers.
-#[no_mangle]
-pub unsafe extern "C" fn r300_tex_level_size(
-    td: *const R300TexDesc,
-    l: u32,
-    w: u32,
-    h: u32,
-    bpr: *mut u32,
-) -> usize {
-    let (td, bpr) = (&*td, &mut *bpr);
-    let Some(geo) = spec_for(td, l).and_then(|s| s.geometry(w, h).ok()) else {
-        return 0;
-    };
-    *bpr = geo.out_row as u32;
-    geo.out_len()
-}
-
-/// Converts the `w` x `h` level `l` of `td` from `src` into `out` (the size
-/// [`r300_tex_level_size`] returned).  `src` is the level's first byte in the
-/// guest copy of the texture.  Returns false if the level cannot be converted.
-///
-/// # Safety
-/// `td` must be valid, `out` must have `out_len` writable bytes, and `src`
-/// must be readable for the level's source rows
-/// (`(rows - 1) * lvl_pitch[l] + row bytes`).
-#[no_mangle]
-pub unsafe extern "C" fn r300_tex_level_convert(
-    td: *const R300TexDesc,
-    src: *const u8,
-    l: u32,
-    w: u32,
-    h: u32,
-    out: *mut u8,
-    out_len: usize,
-) -> bool {
-    let Some(spec) = spec_for(&*td, l) else {
-        return false;
-    };
-    let Ok(geo) = spec.geometry(w, h) else {
-        return false;
-    };
-    let src = slice::from_raw_parts(src, geo.src_len(spec.src_pitch));
-    let out = slice::from_raw_parts_mut(out, out_len);
-    convert_level(&spec, src, w, h, out).is_ok()
-}
+use crate::types::R300TexDesc;
 
 /// A register write from MMIO or a PM4 type-0/1 packet.
 ///
 /// # Safety
 /// `st` must point to a valid `R300State`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_state_write(st: *mut R300State, addr: u32, val: u32) {
-    (*st).write(addr, val);
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        (*st).write(addr, val);
+    }
 }
 
 /// Name of the register at `addr` for traces, or NULL.  The string is static.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn r300_reg_name(addr: u32) -> *const c_char {
     reg_name(addr).map_or(ptr::null(), CStr::as_ptr)
 }
@@ -115,75 +57,47 @@ impl fmt::Write for CallbackWriter {
 ///
 /// # Safety
 /// `st` must be valid and `write` must be safe to call with `ctx`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_state_dump(st: *const R300State, write: DumpWriteFn, ctx: *mut c_void) {
-    // Writing to the callback cannot fail, so neither can the dump.
-    let _ = (*st).dump(&mut CallbackWriter { write, ctx });
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        // Writing to the callback cannot fail, so neither can the dump.
+        let _ = (*st).dump(&mut CallbackWriter { write, ctx });
+    }
 }
 
 // ---- small helpers -----------------------------------------------------------
-
-/// Width, height and depth of mip level `l`.
-///
-/// # Safety
-/// All pointers must be valid.
-#[no_mangle]
-pub unsafe extern "C" fn r300_tex_level_dims(td: *const R300TexDesc, l: u32, w: *mut u32, h: *mut u32, d: *mut u32) {
-    let (tw, th, tdp) = tex_level_dims(&*td, l);
-    (*w, *h, *d) = (tw, th, tdp);
-}
+// (Only what the C device calls is exported; the Vulkan crate uses the Rust API directly.)
 
 /// `GB_AA_CONFIG`'s sample count (1 without antialiasing).
 ///
 /// # Safety
 /// `st` must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_aa_samples(st: *const R300State) -> u32 {
-    misc::aa_samples(&*st)
-}
-
-/// `GB_MSPOS`' sample positions, as offsets from the pixel centre in pixels.
-///
-/// # Safety
-/// `st` must be valid and `pos` point to 12 floats.
-#[no_mangle]
-pub unsafe extern "C" fn r300_aa_positions(st: *const R300State, pos: *mut [f32; 2]) {
-    slice::from_raw_parts_mut(pos, 6).copy_from_slice(&misc::aa_positions(&*st));
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        misc::aa_samples(&*st)
+    }
 }
 
 /// Byte offset of a sample in a multisampled buffer, or `~0u`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn r300_msaa_offset(x: u32, y: u32, ns: u32, pitch_px: u32, bpp: u32, sample: u32) -> u32 {
     misc::msaa_offset(x, y, ns, pitch_px, bpp, sample).unwrap_or(u32::MAX)
-}
-
-/// 64-bit content hash of `n` bytes.
-///
-/// # Safety
-/// `p` must be readable for `n` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn r300_hash_bytes(p: *const u8, n: usize) -> u64 {
-    misc::hash_bytes(if n == 0 { &[] } else { slice::from_raw_parts(p, n) })
-}
-
-/// Identity of a texture's texels for the renderers' caches (sampled for large
-/// chains).
-///
-/// # Safety
-/// `p` must be readable for `n` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn r300_hash_tex(p: *const u8, n: usize) -> u64 {
-    misc::hash_tex(if n == 0 { &[] } else { slice::from_raw_parts(p, n) })
 }
 
 /// Disassembles the active US program through `write`, for traces.
 ///
 /// # Safety
 /// `st` must be valid and `write` safe to call with `ctx`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_us_disasm(st: *const R300State, write: DumpWriteFn, ctx: *mut c_void) {
-    let text = crate::us::disasm(&*st);
-    write(ctx, text.as_ptr(), text.len());
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        let text = crate::us::disasm(&*st);
+        write(ctx, text.as_ptr(), text.len());
+    }
 }
 
 // ---- draw assembly -------------------------------------------------------------
@@ -299,14 +213,17 @@ fn static_cstr(msg: &'static str) -> *const c_char {
 ///
 /// # Safety
 /// `arr` must be valid for writing and `d` readable for `ndw` dwords.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_load_vbpntr(arr: *mut CArrays, d: *const u32, ndw: u32) {
-    let a = misc::load_vbpntr(if ndw == 0 { &[] } else { slice::from_raw_parts(d, ndw as usize) });
-    let mut out = CArrays { count: a.count as u32, a: [CArray { addr: 0, size_dw: 0, stride_dw: 0 }; MAX_ARRAYS] };
-    for (o, s) in out.a.iter_mut().zip(&a.a) {
-        *o = CArray { addr: s.addr, size_dw: s.size_dw, stride_dw: s.stride_dw };
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        let a = misc::load_vbpntr(if ndw == 0 { &[] } else { slice::from_raw_parts(d, ndw as usize) });
+        let mut out = CArrays { count: a.count as u32, a: [CArray { addr: 0, size_dw: 0, stride_dw: 0 }; MAX_ARRAYS] };
+        for (o, s) in out.a.iter_mut().zip(&a.a) {
+            *o = CArray { addr: s.addr, size_dw: s.size_dw, stride_dw: s.stride_dw };
+        }
+        *arr = out;
     }
-    *arr = out;
 }
 
 fn export_packet(p: DrawPacket, out: &mut CDrawPacket) {
@@ -371,7 +288,7 @@ fn empty_packet() -> CDrawPacket {
 /// # Safety
 /// All pointers must be valid; `d` readable for `ndw` dwords; `read` safe to
 /// call with `opaque`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_draw_build(
     st: *const R300State,
     arr: *const CArrays,
@@ -383,10 +300,13 @@ pub unsafe extern "C" fn r300_draw_build(
     pkt: *mut CDrawPacket,
     err: *mut *const c_char,
 ) -> bool {
-    *err = ptr::null();
-    let body = if ndw == 0 { &[] } else { slice::from_raw_parts(d, ndw as usize) };
-    let mut rd = |addr: u32, dst: &mut [u8]| read(opaque, addr, dst.as_mut_ptr().cast(), dst.len() as u32);
-    finish(draw_build(&*st, &arrays_from_c(&*arr), opcode, body, &mut rd), pkt, err)
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        *err = ptr::null();
+        let body = if ndw == 0 { &[] } else { slice::from_raw_parts(d, ndw as usize) };
+        let mut rd = |addr: u32, dst: &mut [u8]| read(opaque, addr, dst.as_mut_ptr().cast(), dst.len() as u32);
+        finish(draw_build(&*st, &arrays_from_c(&*arr), opcode, body, &mut rd), pkt, err)
+    }
 }
 
 /// The same for `DRAW_INDX_2` whose indices come from memory: `vf` is the
@@ -394,7 +314,7 @@ pub unsafe extern "C" fn r300_draw_build(
 ///
 /// # Safety
 /// As [`r300_draw_build`]; `idx.dw` must be readable for `idx.ndw` dwords.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_draw_build_indexed(
     st: *const R300State,
     arr: *const CArrays,
@@ -405,23 +325,29 @@ pub unsafe extern "C" fn r300_draw_build_indexed(
     pkt: *mut CDrawPacket,
     err: *mut *const c_char,
 ) -> bool {
-    *err = ptr::null();
-    let idx = &*idx;
-    let dw = if idx.ndw == 0 { &[] } else { slice::from_raw_parts(idx.dw, idx.ndw as usize) };
-    let mut rd = |addr: u32, dst: &mut [u8]| read(opaque, addr, dst.as_mut_ptr().cast(), dst.len() as u32);
-    finish(draw_build_indexed(&*st, &arrays_from_c(&*arr), vf, &Indices { dw }, &mut rd), pkt, err)
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        *err = ptr::null();
+        let idx = &*idx;
+        let dw = if idx.ndw == 0 { &[] } else { slice::from_raw_parts(idx.dw, idx.ndw as usize) };
+        let mut rd = |addr: u32, dst: &mut [u8]| read(opaque, addr, dst.as_mut_ptr().cast(), dst.len() as u32);
+        finish(draw_build_indexed(&*st, &arrays_from_c(&*arr), vf, &Indices { dw }, &mut rd), pkt, err)
+    }
 }
 
 unsafe fn finish(r: Result<DrawPacket, &'static str>, pkt: *mut CDrawPacket, err: *mut *const c_char) -> bool {
-    match r {
-        Ok(p) => {
-            export_packet(p, &mut *pkt);
-            true
-        }
-        Err(e) => {
-            *pkt = empty_packet();
-            *err = static_cstr(e);
-            false
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        match r {
+            Ok(p) => {
+                export_packet(p, &mut *pkt);
+                true
+            }
+            Err(e) => {
+                *pkt = empty_packet();
+                *err = static_cstr(e);
+                false
+            }
         }
     }
 }
@@ -431,20 +357,23 @@ unsafe fn finish(r: Result<DrawPacket, &'static str>, pkt: *mut CDrawPacket, err
 ///
 /// # Safety
 /// `pkt` must have come from `r300_draw_build*` and not been freed already.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn r300_draw_free(pkt: *mut CDrawPacket) {
-    let p = &mut *pkt;
-    if !p.glsl.is_null() {
-        drop(CString::from_raw(p.glsl));
-        p.glsl = ptr::null_mut();
-    }
-    if !p.verts.is_null() {
-        let n = (p.num_verts + p.num_line_verts) as usize;
-        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(p.verts, n)));
-        p.verts = ptr::null_mut();
-    }
-    if !p.gpu_data.is_null() {
-        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(p.gpu_data, p.gpu_words as usize)));
-        p.gpu_data = ptr::null_mut();
+    // SAFETY: the caller upholds the contract in the function documentation.
+    unsafe {
+        let p = &mut *pkt;
+        if !p.glsl.is_null() {
+            drop(CString::from_raw(p.glsl));
+            p.glsl = ptr::null_mut();
+        }
+        if !p.verts.is_null() {
+            let n = (p.num_verts + p.num_line_verts) as usize;
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(p.verts, n)));
+            p.verts = ptr::null_mut();
+        }
+        if !p.gpu_data.is_null() {
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(p.gpu_data, p.gpu_words as usize)));
+            p.gpu_data = ptr::null_mut();
+        }
     }
 }

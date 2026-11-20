@@ -47,8 +47,9 @@ def list_accel(qemu_bin: str) -> List[str]:
     except:
         LOG.debug("Failed to get the list of accelerators in %s", qemu_bin)
         raise
-    # Skip the first line which is the header.
-    return [acc.strip() for acc in out.splitlines()[1:]]
+    # Skip the first line which is the header, and drop annotations
+    # such as " (secure)" from the accelerator names.
+    return [acc.split(' ')[0] for acc in out.splitlines()[1:]]
 
 
 def kvm_available(target_arch: Optional[str] = None,
@@ -82,3 +83,12 @@ def tcg_available(qemu_bin: str) -> bool:
     @param qemu_bin (str): path to the QEMU binary
     """
     return 'tcg' in list_accel(qemu_bin)
+
+
+def hvf_available(qemu_bin: str) -> bool:
+    """
+    Check if HVF is available.
+
+    @param qemu_bin (str): path to the QEMU binary
+    """
+    return 'hvf' in list_accel(qemu_bin)

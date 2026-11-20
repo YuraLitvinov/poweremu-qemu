@@ -12,11 +12,12 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
+#include "qemu/bswap.h"
 #include "qapi/error.h"
-#include "hw/sysbus.h"
-#include "hw/loader.h"
-#include "hw/qdev-core.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/loader.h"
+#include "hw/core/qdev.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
 #include "trace.h"
@@ -854,6 +855,12 @@ static int vram_bit_write(ARTISTState *s, uint32_t pos, int posy,
         vram_write_bufidx(s) == ARTIST_BUFFER_CURSOR2) {
         artist_invalidate_cursor(s);
     }
+
+    if (vram_write_bufidx(s) == ARTIST_BUFFER_CMAP) {
+        /* A colormap change affects every pixel on screen. */
+        artist_invalidate(s);
+    }
+
     return pos;
 }
 
@@ -1310,7 +1317,7 @@ static void artist_draw_line(void *opaque, uint8_t *d, const uint8_t *src,
     }
 }
 
-static void artist_update_display(void *opaque)
+static bool artist_update_display(void *opaque)
 {
     ARTISTState *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
@@ -1323,8 +1330,10 @@ static void artist_update_display(void *opaque)
     artist_draw_cursor(s);
 
     if (first >= 0) {
-        dpy_gfx_update(s->con, 0, first, s->width, last - first + 1);
+        qemu_console_update(s->con, 0, first, s->width, last - first + 1);
     }
+
+    return true;
 }
 
 static void artist_invalidate(void *opaque)
@@ -1421,7 +1430,7 @@ static void artist_realizefn(DeviceState *dev, Error **errp)
     s->misc_video |= 0x0A000000;
     s->misc_ctrl  |= 0x00800000;
 
-    s->con = graphic_console_init(dev, 0, &artist_ops, s);
+    s->con = qemu_graphic_console_create(dev, 0, &artist_ops, s);
     qemu_console_resize(s->con, s->width, s->height);
 }
 
@@ -1487,7 +1496,7 @@ static void artist_reset(DeviceState *qdev)
 {
 }
 
-static void artist_class_init(ObjectClass *klass, void *data)
+static void artist_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

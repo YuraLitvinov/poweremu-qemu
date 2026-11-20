@@ -19,12 +19,13 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/gpio/stm32l4x5_gpio.h"
-#include "hw/irq.h"
-#include "hw/clock.h"
-#include "hw/qdev-clock.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/clock.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/visitor.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "migration/vmstate.h"
 #include "trace.h"
 
@@ -409,10 +410,10 @@ static void stm32l4x5_gpio_init(Object *obj)
 
     s->clk = qdev_init_clock_in(DEVICE(s), "clk", NULL, s, 0);
 
-    object_property_add(obj, "disconnected-pins", "uint16",
+    object_property_add(obj, "disconnected-pins", "uint16", &uint16_type_info,
                         disconnected_pins_get, disconnected_pins_set,
                         NULL, &s->disconnected_pins);
-    object_property_add(obj, "clock-freq-hz", "uint32",
+    object_property_add(obj, "clock-freq-hz", "uint32", &uint32_type_info,
                         clock_freq_get, NULL, NULL, NULL);
 }
 
@@ -454,7 +455,7 @@ static const Property stm32l4x5_gpio_properties[] = {
     DEFINE_PROP_UINT32("pupd-reset", Stm32l4x5GpioState, pupdr_reset, 0),
 };
 
-static void stm32l4x5_gpio_class_init(ObjectClass *klass, void *data)
+static void stm32l4x5_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);

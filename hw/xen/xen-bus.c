@@ -9,14 +9,15 @@
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/uuid.h"
-#include "hw/qdev-properties.h"
-#include "hw/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
 #include "hw/xen/xen.h"
 #include "hw/xen/xen-backend.h"
 #include "hw/xen/xen-legacy-backend.h" /* xen_be_init() */
 #include "hw/xen/xen-bus.h"
 #include "hw/xen/xen-bus-helper.h"
 #include "monitor/monitor.h"
+#include "monitor/hmp.h"
 #include "qapi/error.h"
 #include "qobject/qdict.h"
 #include "system/system.h"
@@ -100,13 +101,15 @@ abort:
     qemu_xen_xs_transaction_end(xenbus->xsh, tid, true);
 }
 
-static void xen_bus_print_dev(Monitor *mon, DeviceState *dev, int indent)
+#ifdef CONFIG_HMP
+static void xen_bus_print_dev(MonitorHMP *hmp, DeviceState *dev, int indent)
 {
     XenDevice *xendev = XEN_DEVICE(dev);
 
-    monitor_printf(mon, "%*sname = '%s' frontend_id = %u\n",
-                   indent, "", xendev->name, xendev->frontend_id);
+    monitor_hmp_printf(hmp, "%*sname = '%s' frontend_id = %u\n",
+                       indent, "", xendev->name, xendev->frontend_id);
 }
+#endif
 
 static char *xen_bus_get_dev_path(DeviceState *dev)
 {
@@ -371,7 +374,7 @@ fail:
     g_free(key);
 }
 
-static void xen_bus_unplug_request(HotplugHandler *hotplug,
+static void xen_bus_unplug_request(const HotplugHandler *hotplug,
                                    DeviceState *dev,
                                    Error **errp)
 {
@@ -380,12 +383,14 @@ static void xen_bus_unplug_request(HotplugHandler *hotplug,
     xen_device_unplug(xendev, errp);
 }
 
-static void xen_bus_class_init(ObjectClass *class, void *data)
+static void xen_bus_class_init(ObjectClass *class, const void *data)
 {
     BusClass *bus_class = BUS_CLASS(class);
     HotplugHandlerClass *hotplug_class = HOTPLUG_HANDLER_CLASS(class);
 
+#ifdef CONFIG_HMP
     bus_class->print_dev = xen_bus_print_dev;
+#endif
     bus_class->get_dev_path = xen_bus_get_dev_path;
     bus_class->realize = xen_bus_realize;
     bus_class->unrealize = xen_bus_unrealize;
@@ -399,7 +404,8 @@ static const TypeInfo xen_bus_type_info = {
     .instance_size = sizeof(XenBus),
     .class_size = sizeof(XenBusClass),
     .class_init = xen_bus_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .secure = true,
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_HOTPLUG_HANDLER },
         { }
     },
@@ -1107,7 +1113,7 @@ static const Property xen_device_props[] = {
                        DOMID_INVALID),
 };
 
-static void xen_device_class_init(ObjectClass *class, void *data)
+static void xen_device_class_init(ObjectClass *class, const void *data)
 {
     DeviceClass *dev_class = DEVICE_CLASS(class);
 
@@ -1136,6 +1142,7 @@ static const TypeInfo xen_bridge_type_info = {
     .name = TYPE_XEN_BRIDGE,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(XenBridge),
+    .secure = true,
 };
 
 static void xen_register_types(void)

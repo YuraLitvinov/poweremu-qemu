@@ -167,8 +167,13 @@ static int bochs_open(BlockDriverState *bs, QDict *options, int flags,
 
     s->data_offset = le32_to_cpu(bochs.header) + (s->catalog_size * 4);
 
+    if (le32_to_cpu(bochs.bitmap) == 0) {
+        error_setg(errp, "Bitmap size must not be zero");
+        ret = -EINVAL;
+        goto fail;
+    }
+
     s->bitmap_blocks = 1 + (le32_to_cpu(bochs.bitmap) - 1) / 512;
-    s->extent_blocks = 1 + (le32_to_cpu(bochs.extent) - 1) / 512;
 
     s->extent_size = le32_to_cpu(bochs.extent);
     if (s->extent_size < BDRV_SECTOR_SIZE) {
@@ -187,6 +192,8 @@ static int bochs_open(BlockDriverState *bs, QDict *options, int flags,
         ret = -EINVAL;
         goto fail;
     }
+
+    s->extent_blocks = 1 + (s->extent_size - 1) / 512;
 
     if (s->catalog_size < DIV_ROUND_UP(bs->total_sectors,
                                        s->extent_size / BDRV_SECTOR_SIZE))
@@ -300,15 +307,15 @@ static void bochs_close(BlockDriverState *bs)
 }
 
 static BlockDriver bdrv_bochs = {
-    .format_name	= "bochs",
-    .instance_size	= sizeof(BDRVBochsState),
-    .bdrv_probe		= bochs_probe,
-    .bdrv_open		= bochs_open,
+    .format_name         = "bochs",
+    .instance_size       = sizeof(BDRVBochsState),
+    .bdrv_probe          = bochs_probe,
+    .bdrv_open           = bochs_open,
     .bdrv_child_perm     = bdrv_default_perms,
     .bdrv_refresh_limits = bochs_refresh_limits,
-    .bdrv_co_preadv = bochs_co_preadv,
-    .bdrv_close		= bochs_close,
-    .is_format          = true,
+    .bdrv_co_preadv      = bochs_co_preadv,
+    .bdrv_close          = bochs_close,
+    .is_format           = true,
 };
 
 static void bdrv_bochs_init(void)

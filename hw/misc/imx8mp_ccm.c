@@ -129,6 +129,9 @@ static uint32_t imx8mp_ccm_get_clock_frequency(IMXCCMState *dev, IMXClk clock)
     case CLK_HIGH:
         freq = CKIH_FREQ;
         break;
+    case CLK_CAN:
+        freq = 40000000; /* 40Mhz, taken from device tree */
+        break;
     case CLK_IPG:
     case CLK_IPG_HIGH:
         /*
@@ -150,7 +153,7 @@ static uint32_t imx8mp_ccm_get_clock_frequency(IMXCCMState *dev, IMXClk clock)
     return freq;
 }
 
-static void imx8mp_ccm_class_init(ObjectClass *klass, void *data)
+static void imx8mp_ccm_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     IMXCCMClass *ccm = IMX_CCM_CLASS(klass);

@@ -71,6 +71,7 @@ Board-specific documentation
 .. toctree::
    :maxdepth: 1
 
+   arm/max78000
    arm/integratorcp
    arm/mps2
    arm/musca
@@ -82,20 +83,17 @@ Board-specific documentation
    arm/bananapi_m2u.rst
    arm/b-l475e-iot01a.rst
    arm/sabrelite
-   arm/highbank
    arm/digic
    arm/cubieboard
    arm/emcraft-sf2
    arm/exynos
-   arm/fby35
-   arm/musicpal
    arm/kzm
    arm/nrf
    arm/nuvoton
    arm/imx25-pdk
    arm/mcimx6ul-evk
    arm/mcimx7d-sabre
-   arm/imx8mp-evk
+   arm/imx8m
    arm/orangepi
    arm/raspi
    arm/collie

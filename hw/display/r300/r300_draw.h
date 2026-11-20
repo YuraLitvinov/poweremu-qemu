@@ -294,10 +294,15 @@ void r300_draw_free(R300DrawPacket *pkt);
  * other than R300_TEXK_RAW), repacked with tight rows: 16bpp formats
  * decoded to RGBA8, DXT blocks and 8/16/32-bit texels copied as they lie.
  * src is the face's first byte; w, h the level's size (for DXT, rounded
- * up to whole blocks).  Returns malloc'd bytes and their row pitch.
+ * up to whole blocks).  r300_tex_level_size gives the converted level's size
+ * and row pitch (0: it cannot be converted); r300_tex_level_convert fills a
+ * buffer of that size.
  */
-uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
-                              uint32_t l, uint32_t w, uint32_t h, uint32_t *bpr);
+size_t r300_tex_level_size(const R300TexDesc *td, uint32_t l, uint32_t w,
+                           uint32_t h, uint32_t *bpr);
+bool r300_tex_level_convert(const R300TexDesc *td, const uint8_t *src,
+                            uint32_t l, uint32_t w, uint32_t h, uint8_t *out,
+                            size_t out_len);
 
 /* 64-bit content hash, for caches of textures copied out of guest memory. */
 uint64_t r300_hash_bytes(const uint8_t *p, size_t n);

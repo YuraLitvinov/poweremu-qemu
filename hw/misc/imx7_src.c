@@ -17,7 +17,7 @@
 #include "qemu/module.h"
 #include "target/arm/arm-powerctl.h"
 #include "hw/core/cpu.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 
 #include "trace.h"
 
@@ -105,7 +105,7 @@ static void imx7_src_reset(DeviceState *dev)
 static uint64_t imx7_src_read(void *opaque, hwaddr offset, unsigned size)
 {
     uint32_t value = 0;
-    IMX7SRCState *s = (IMX7SRCState *)opaque;
+    IMX7SRCState *s = opaque;
     uint32_t index = offset >> 2;
 
     if (index < SRC_MAX) {
@@ -167,7 +167,7 @@ static void imx7_defer_clear_reset_bit(uint32_t cpuid,
 static void imx7_src_write(void *opaque, hwaddr offset, uint64_t value,
                            unsigned size)
 {
-    IMX7SRCState *s = (IMX7SRCState *)opaque;
+    IMX7SRCState *s = opaque;
     uint32_t index = offset >> 2;
     long unsigned int change_mask;
     uint32_t current_value = value;
@@ -251,7 +251,7 @@ static void imx7_src_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 }
 
-static void imx7_src_class_init(ObjectClass *klass, void *data)
+static void imx7_src_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

@@ -11,8 +11,9 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qemu/module.h"
 #include "virtio-ccw-mem.h"
 #include "hw/mem/memory-device.h"
@@ -160,7 +161,7 @@ static const Property virtio_ccw_mem_properties[] = {
                        VIRTIO_CCW_MAX_REV),
 };
 
-static void virtio_ccw_mem_class_init(ObjectClass *klass, void *data)
+static void virtio_ccw_mem_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtIOCCWDeviceClass *k = VIRTIO_CCW_DEVICE_CLASS(klass);
@@ -206,6 +207,7 @@ static void virtio_ccw_mem_instance_init(Object *obj)
     object_property_add_alias(obj, VIRTIO_MEM_SIZE_PROP, OBJECT(&dev->vdev),
                               VIRTIO_MEM_SIZE_PROP);
     object_property_add(obj, VIRTIO_MEM_REQUESTED_SIZE_PROP, "size",
+                        &size_type_info,
                         virtio_ccw_mem_get_requested_size,
                         virtio_ccw_mem_set_requested_size, NULL, NULL);
 }
@@ -216,6 +218,7 @@ static const TypeInfo virtio_ccw_mem = {
     .instance_size = sizeof(VirtIOMEMCcw),
     .instance_init = virtio_ccw_mem_instance_init,
     .class_init = virtio_ccw_mem_class_init,
+    .secure = true,
 };
 
 static void virtio_ccw_mem_register_types(void)

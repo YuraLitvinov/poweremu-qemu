@@ -1,14 +1,14 @@
 /*
  * QEMU single LED device
  *
- * Copyright (C) 2020 Philippe Mathieu-Daudé <f4bug@amsat.org>
+ * Copyright (C) 2020 Philippe Mathieu-Daudé
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/led.h"
 #include "trace.h"
 
@@ -107,7 +107,7 @@ static const Property led_properties[] = {
     DEFINE_PROP_BOOL("gpio-active-high", LEDState, gpio_active_high, true),
 };
 
-static void led_class_init(ObjectClass *klass, void *data)
+static void led_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

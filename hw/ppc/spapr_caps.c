@@ -24,10 +24,10 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "system/hw_accel.h"
-#include "exec/ram_addr.h"
 #include "target/ppc/cpu.h"
 #include "target/ppc/mmu-hash64.h"
 #include "cpu-models.h"
@@ -61,13 +61,13 @@ typedef struct SpaprCapabilityInfo {
     ObjectPropertyAccessor *get;
     ObjectPropertyAccessor *set;
     const char *type;
+    const QAPITypeInfo *qapi_type;
     /* Possible values if this is a custom string type */
     SpaprCapPossible *possible;
     /* Make sure the virtual hardware can support this capability */
     void (*apply)(SpaprMachineState *spapr, uint8_t val, Error **errp);
     void (*cpu_apply)(SpaprMachineState *spapr, PowerPCCPU *cpu,
                       uint8_t val, Error **errp);
-    bool (*migrate_needed)(void *opaque);
 } SpaprCapabilityInfo;
 
 static void spapr_cap_get_bool(Object *obj, Visitor *v, const char *name,
@@ -131,7 +131,7 @@ static void spapr_cap_set_string(Object *obj, Visitor *v, const char *name,
         return;
     }
     for (i = 0; i < cap->possible->num; i++) {
-        if (!strcasecmp(val, cap->possible->vals[i])) {
+        if (!g_ascii_strcasecmp(val, cap->possible->vals[i])) {
             spapr->cmd_line_caps[cap->index] = true;
             spapr->eff.caps[cap->index] = i;
             return;
@@ -335,11 +335,6 @@ static void cap_hpt_maxpagesize_apply(SpaprMachineState *spapr,
     }
 
     spapr_check_pagesize(spapr, qemu_minrampagesize(), errp);
-}
-
-static bool cap_hpt_maxpagesize_migrate_needed(void *opaque)
-{
-    return !SPAPR_MACHINE_GET_CLASS(opaque)->pre_4_1_migration;
 }
 
 static bool spapr_pagesize_cb(void *opaque, uint32_t seg_pshift,
@@ -683,7 +678,7 @@ static void cap_ail_mode_3_apply(SpaprMachineState *spapr,
 
     if (tcg_enabled()) {
         /* AIL-3 is only supported on POWER8 and above CPUs. */
-        if (!(pcc->insns_flags2 & PPC2_ISA207S)) {
+        if (!(pcc->insns_flags2 & PPC2_ISA207)) {
             error_setg(errp, "TCG only supports cap-ail-mode-3 on POWER8 and later CPUs");
             error_append_hint(errp, "Try appending -machine cap-ail-mode-3=off\n");
             return;
@@ -733,6 +728,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_htm_apply,
     },
     [SPAPR_CAP_VSX] = {
@@ -742,6 +738,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_vsx_apply,
     },
     [SPAPR_CAP_DFP] = {
@@ -751,6 +748,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_dfp_apply,
     },
     [SPAPR_CAP_CFPC] = {
@@ -760,6 +758,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_string,
         .set = spapr_cap_set_string,
         .type = "string",
+        .qapi_type = &str_type_info,
         .possible = &cap_cfpc_possible,
         .apply = cap_safe_cache_apply,
     },
@@ -770,6 +769,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_string,
         .set = spapr_cap_set_string,
         .type = "string",
+        .qapi_type = &str_type_info,
         .possible = &cap_sbbc_possible,
         .apply = cap_safe_bounds_check_apply,
     },
@@ -782,6 +782,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_string,
         .set = spapr_cap_set_string,
         .type = "string",
+        .qapi_type = &str_type_info,
         .possible = &cap_ibs_possible,
         .apply = cap_safe_indirect_branch_apply,
     },
@@ -792,9 +793,9 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_pagesize,
         .set = spapr_cap_set_pagesize,
         .type = "int",
+        .qapi_type = &size_type_info,
         .apply = cap_hpt_maxpagesize_apply,
         .cpu_apply = cap_hpt_maxpagesize_cpu_apply,
-        .migrate_needed = cap_hpt_maxpagesize_migrate_needed,
     },
     [SPAPR_CAP_NESTED_KVM_HV] = {
         .name = "nested-hv",
@@ -803,6 +804,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_nested_kvm_hv_apply,
     },
     [SPAPR_CAP_NESTED_PAPR] = {
@@ -812,6 +814,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_nested_papr_apply,
     },
     [SPAPR_CAP_LARGE_DECREMENTER] = {
@@ -821,6 +824,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_large_decr_apply,
         .cpu_apply = cap_large_decr_cpu_apply,
     },
@@ -831,6 +835,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_ccf_assist_apply,
     },
     [SPAPR_CAP_FWNMI] = {
@@ -840,6 +845,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_fwnmi_apply,
     },
     [SPAPR_CAP_RPT_INVALIDATE] = {
@@ -849,6 +855,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_rpt_invalidate_apply,
     },
     [SPAPR_CAP_AIL_MODE_3] = {
@@ -858,6 +865,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_ail_mode_3_apply,
     },
     [SPAPR_CAP_DAWR1] = {
@@ -867,6 +875,7 @@ SpaprCapabilityInfo capability_table[SPAPR_CAP_NUM] = {
         .get = spapr_cap_get_bool,
         .set = spapr_cap_set_bool,
         .type = "bool",
+        .qapi_type = &bool_type_info,
         .apply = cap_dawr1_apply,
     },
 };
@@ -983,11 +992,8 @@ int spapr_caps_post_migration(SpaprMachineState *spapr)
 static bool spapr_cap_##sname##_needed(void *opaque)    \
 {                                                       \
     SpaprMachineState *spapr = opaque;                  \
-    bool (*needed)(void *opaque) =                      \
-        capability_table[cap].migrate_needed;           \
                                                         \
-    return needed ? needed(opaque) : true &&            \
-           spapr->cmd_line_caps[cap] &&                 \
+    return spapr->cmd_line_caps[cap] &&                 \
            (spapr->eff.caps[cap] !=                     \
             spapr->def.caps[cap]);                      \
 }                                                       \
@@ -1080,7 +1086,7 @@ void spapr_caps_add_properties(SpaprMachineClass *smc)
         g_autofree char *name = g_strdup_printf("cap-%s", cap->name);
         g_autofree char *desc = g_strdup(cap->description);
 
-        object_class_property_add(klass, name, cap->type,
+        object_class_property_add(klass, name, cap->type, cap->qapi_type,
                                   cap->get, cap->set,
                                   NULL, cap);
 

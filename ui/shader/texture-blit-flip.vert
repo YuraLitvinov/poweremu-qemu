@@ -1,3 +1,5 @@
+#version 300 es
+
 in vec2  in_position;
 out vec2 ex_tex_coord;
 

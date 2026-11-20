@@ -566,6 +566,16 @@ vhdx_open_region_tables(BlockDriverState *bs, BDRVVHDXState *s)
 
         vhdx_region_entry_le_import(&rt_entry);
 
+        /*
+         * According to the VHDX spec, offset and length must be multiple
+         * of 1 MiB and offset must be at least 1 MiB.
+         */
+        if (!QEMU_IS_ALIGNED(rt_entry.file_offset, MiB) ||
+            !QEMU_IS_ALIGNED(rt_entry.length, MiB) || !rt_entry.file_offset) {
+            ret = -EINVAL;
+            goto fail;
+        }
+
         /* check for region overlap between these entries, and any
          * other memory regions in the file */
         ret = vhdx_region_check(s, rt_entry.file_offset, rt_entry.length);
@@ -815,6 +825,11 @@ vhdx_parse_metadata(BlockDriverState *bs, BDRVVHDXState *s)
     }
 
     s->virtual_disk_size = le64_to_cpu(s->virtual_disk_size);
+    if (s->virtual_disk_size > VHDX_MAX_IMAGE_SIZE) {
+        ret = -EFBIG;
+        goto exit;
+    }
+
     s->logical_sector_size = le32_to_cpu(s->logical_sector_size);
     s->physical_sector_size = le32_to_cpu(s->physical_sector_size);
 
@@ -1149,6 +1164,7 @@ static void vhdx_block_translate(BDRVVHDXState *s, int64_t sector_num,
 
     sinfo->bytes_avail = sinfo->sectors_avail << s->logical_sector_size_bits;
 
+    assert(sinfo->bat_idx < s->bat_entries);
     sinfo->file_offset = s->bat[sinfo->bat_idx] & VHDX_BAT_FILE_OFF_MASK;
 
     sinfo->block_offset = block_offset << s->logical_sector_size_bits;
@@ -2096,7 +2112,7 @@ vhdx_co_create_opts(BlockDriver *drv, const char *filename,
     }
 
     /* Create and open the file (protocol layer) */
-    ret = bdrv_co_create_file(filename, opts, errp);
+    ret = bdrv_co_create_file(filename, opts, true, errp);
     if (ret < 0) {
         goto fail;
     }

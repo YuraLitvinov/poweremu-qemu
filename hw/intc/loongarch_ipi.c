@@ -7,10 +7,12 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "qapi/error.h"
+#include "hw/intc/intc.h"
 #include "hw/intc/loongarch_ipi.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
+#include "system/kvm.h"
 #include "target/loongarch/cpu.h"
 
 static AddressSpace *get_iocsr_as(CPUState *cpu)
@@ -91,9 +93,43 @@ static void loongarch_ipi_realize(DeviceState *dev, Error **errp)
         lics->cpu[i].ipi = lics;
         qdev_init_gpio_out(dev, &lics->cpu[i].irq, 1);
     }
+
+    if (kvm_irqchip_in_kernel()) {
+        kvm_ipi_realize(dev, errp);
+    }
 }
 
-static void loongarch_ipi_cpu_plug(HotplugHandler *hotplug_dev,
+static void loongarch_ipi_reset_hold(Object *obj, ResetType type)
+{
+    int i;
+    LoongarchIPIClass *lic = LOONGARCH_IPI_GET_CLASS(obj);
+    LoongsonIPICommonState *lics = LOONGSON_IPI_COMMON(obj);
+    IPICore *core;
+
+    if (lic->parent_phases.hold) {
+        lic->parent_phases.hold(obj, type);
+    }
+
+    for (i = 0; i < lics->num_cpu; i++) {
+        core = lics->cpu + i;
+        /* IPI with targeted CPU available however not present */
+        if (!core->cpu) {
+            continue;
+        }
+
+        core->status = 0;
+        core->en = 0;
+        core->set = 0;
+        core->clear = 0;
+        memset(core->buf, 0, sizeof(core->buf));
+    }
+
+    if (kvm_irqchip_in_kernel()) {
+        kvm_ipi_put(obj, 0);
+    }
+}
+
+static void loongarch_ipi_cpu_plug(const HotplugHandler *hotplug_dev,
                                    DeviceState *dev, Error **errp)
 {
     LoongsonIPICommonState *lics = LOONGSON_IPI_COMMON(hotplug_dev);
@@ -119,7 +155,7 @@ static void loongarch_ipi_cpu_plug(HotplugHandler *hotplug_dev,
     qdev_connect_gpio_out(DEVICE(lics), index, qdev_get_gpio_in(dev, IRQ_IPI));
 }
 
-static void loongarch_ipi_cpu_unplug(HotplugHandler *hotplug_dev,
+static void loongarch_ipi_cpu_unplug(const HotplugHandler *hotplug_dev,
                                      DeviceState *dev, Error **errp)
 {
     LoongsonIPICommonState *lics = LOONGSON_IPI_COMMON(hotplug_dev);
@@ -140,19 +176,83 @@ static void loongarch_ipi_cpu_unplug(HotplugHandler *hotplug_dev,
     core->cpu = NULL;
 }
 
-static void loongarch_ipi_class_init(ObjectClass *klass, void *data)
+static int loongarch_ipi_pre_save(void *opaque)
 {
+    if (kvm_irqchip_in_kernel()) {
+        return kvm_ipi_get(opaque);
+    }
+
+    return 0;
+}
+
+static int loongarch_ipi_post_load(void *opaque, int version_id)
+{
+    if (kvm_irqchip_in_kernel()) {
+        return kvm_ipi_put(opaque, version_id);
+    }
+
+    return 0;
+}
+
+static void loongarch_ipi_print_info(InterruptStatsProvider *obj, GString *buf)
+{
+    LoongsonIPICommonState *lics = LOONGSON_IPI_COMMON(obj);
+    int i, j;
+    IPICore *core;
+    uint32_t mbx;
+    unsigned long pos;
+
+    loongarch_ipi_pre_save(lics);
+
+    g_string_append_printf(buf, "%s:\n", object_get_typename(OBJECT(obj)));
+    for (i = 0; i < lics->num_cpu; i++) {
+        core = lics->cpu + i;
+        /* IPI with targeted CPU available however not present */
+        if (!core->cpu) {
+            continue;
+        }
+
+        g_string_append_printf(buf, "  CPU %-3u status=0x%x en=0x%x\n",
+                                    i, core->status, core->en);
+
+        pos = find_first_bit((unsigned long *)core->buf, IPI_MBX_NUM * 64);
+        /* All zero in mailbox */
+        if (pos == (IPI_MBX_NUM * 64)) {
+            continue;
+        }
+
+        for (j = 0; j < (IPI_MBX_NUM * 2); j++) {
+            mbx = core->buf[j];
+            if (mbx) {
+                g_string_append_printf(buf, "          MBX[%-1u] 0x%08"PRIx32,
+                                            j, mbx);
+            }
+        }
+
+        g_string_append_c(buf, '\n');
+    }
+}
+
+static void loongarch_ipi_class_init(ObjectClass *klass, const void *data)
+{
+    InterruptStatsProviderClass *ic = INTERRUPT_STATS_PROVIDER_CLASS(klass);
     LoongsonIPICommonClass *licc = LOONGSON_IPI_COMMON_CLASS(klass);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(klass);
     LoongarchIPIClass *lic = LOONGARCH_IPI_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_parent_realize(dc, loongarch_ipi_realize,
                                     &lic->parent_realize);
+    resettable_class_set_parent_phases(rc, NULL, loongarch_ipi_reset_hold,
+                                       NULL, &lic->parent_phases);
     licc->get_iocsr_as = get_iocsr_as;
     licc->cpu_by_arch_id = loongarch_cpu_by_arch_id;
     hc->plug = loongarch_ipi_cpu_plug;
     hc->unplug = loongarch_ipi_cpu_unplug;
+    licc->pre_save = loongarch_ipi_pre_save;
+    licc->post_load = loongarch_ipi_post_load;
+    ic->print_info = loongarch_ipi_print_info;
 }
 
 static const TypeInfo loongarch_ipi_types[] = {
@@ -162,8 +262,9 @@ static const TypeInfo loongarch_ipi_types[] = {
         .instance_size      = sizeof(LoongarchIPIState),
         .class_size         = sizeof(LoongarchIPIClass),
         .class_init         = loongarch_ipi_class_init,
-        .interfaces         = (InterfaceInfo[]) {
+        .interfaces         = (const InterfaceInfo[]) {
             { TYPE_HOTPLUG_HANDLER },
+            { TYPE_INTERRUPT_STATS_PROVIDER },
             { }
         },
     }

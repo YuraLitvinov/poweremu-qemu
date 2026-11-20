@@ -108,7 +108,7 @@ static void wdt_diag288_unrealize(DeviceState *dev)
     timer_free(diag288->timer);
 }
 
-static void wdt_diag288_class_init(ObjectClass *klass, void *data)
+static void wdt_diag288_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     DIAG288Class *diag288 = DIAG288_CLASS(klass);
@@ -129,6 +129,7 @@ static const TypeInfo wdt_diag288_info = {
     .name  = TYPE_WDT_DIAG288,
     .instance_size  = sizeof(DIAG288State),
     .class_size = sizeof(DIAG288Class),
+    .secure = true,
 };
 
 static void wdt_diag288_register_types(void)

@@ -1,0 +1,15 @@
+[package]
+name = "ppc_mac_gpu_dev"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "ATI Radeon 9700 (R300) device model with its Vulkan renderer"
+
+[lib]
+name = "ppc_mac_gpu_dev"
+path = "lib.rs"
+
+[dependencies]
+r300 = { path = "../r300" }
+c2rust-bitfields = "0.22.1"
+ash = "0.37"

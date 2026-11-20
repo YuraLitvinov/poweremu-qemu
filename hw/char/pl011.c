@@ -21,11 +21,11 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/char/pl011.h"
-#include "hw/irq.h"
-#include "hw/sysbus.h"
-#include "hw/qdev-clock.h"
-#include "hw/qdev-properties.h"
-#include "hw/qdev-properties-system.h"
+#include "hw/core/irq.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "chardev/char-fe.h"
 #include "chardev/char-serial.h"
@@ -227,10 +227,25 @@ static void pl011_loopback_tx(PL011State *s, uint32_t value)
 static void pl011_write_txdata(PL011State *s, uint8_t data)
 {
     if (!(s->cr & CR_UARTEN)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "PL011 data written to disabled UART\n");
+        /*
+         * Only log this message once, not every time the guest outputs:
+         * otherwise we would flood the logs with this message, making
+         * harder to debug guests. (Some very popular guests like Linux
+         * don't actively enable the UART.)
+         */
+        if (!s->logged_disabled_uart) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "PL011 data written to disabled UART\n");
+            s->logged_disabled_uart = true;
+        }
     }
     if (!(s->cr & CR_TXE)) {
+        /*
+         * We don't bother with the only-log-once machinery for this check
+         * because TXE is enabled by default from PL011 reset, so there
+         * isn't likely to be existing in-the-wild guest code that trips
+         * over this one.
+         */
         qemu_log_mask(LOG_GUEST_ERROR,
                       "PL011 data written to disabled TX UART\n");
     }
@@ -410,6 +425,11 @@ static void pl011_loopback_break(PL011State *s, int brk_enable)
     }
 }
 
+static inline void pl011_set_break(PL011State *s, int brk_enable)
+{
+    qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_BREAK, &brk_enable);
+}
+
 static void pl011_write(void *opaque, hwaddr offset,
                         uint64_t value, unsigned size)
 {
@@ -447,9 +467,8 @@ static void pl011_write(void *opaque, hwaddr offset,
             pl011_reset_tx_fifo(s);
         }
         if ((s->lcr ^ value) & LCR_BRK) {
-            int break_enable = value & LCR_BRK;
-            qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_BREAK,
-                              &break_enable);
+            bool break_enable = value & LCR_BRK;
+            pl011_set_break(s, break_enable);
             pl011_loopback_break(s, break_enable);
         }
         s->lcr = value;
@@ -457,6 +476,10 @@ static void pl011_write(void *opaque, hwaddr offset,
         break;
     case 12: /* UARTCR */
         /* ??? Need to implement the enable bit.  */
+        if ((s->cr ^ value) & CR_UARTEN) {
+            /* Re-arm the log warning when the guest toggles UARTEN */
+            s->logged_disabled_uart = false;
+        }
         s->cr = value;
         pl011_loopback_mdmctrl(s);
         break;
@@ -538,7 +561,7 @@ static void pl011_clock_update(void *opaque, ClockEvent event)
 static const MemoryRegionOps pl011_ops = {
     .read = pl011_read,
     .write = pl011_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_LITTLE_ENDIAN,
     .impl.min_access_size = 4,
     .impl.max_access_size = 4,
 };
@@ -641,12 +664,29 @@ static void pl011_init(Object *obj)
     s->id = pl011_id_arm;
 }
 
+static int pl011_be_change(void *opaque);
+
+static inline void pl011_set_handlers(PL011State *s)
+{
+    qemu_chr_fe_set_handlers(&s->chr, pl011_can_receive, pl011_receive,
+                             pl011_event, pl011_be_change, s, NULL, true);
+}
+
+static int pl011_be_change(void *opaque)
+{
+    PL011State *s = opaque;
+
+    pl011_set_handlers(s);
+    pl011_set_break(s, s->lcr & LCR_BRK);
+
+    return 0;
+}
+
 static void pl011_realize(DeviceState *dev, Error **errp)
 {
     PL011State *s = PL011(dev);
 
-    qemu_chr_fe_set_handlers(&s->chr, pl011_can_receive, pl011_receive,
-                             pl011_event, NULL, s, NULL, true);
+    pl011_set_handlers(s);
 }
 
 static void pl011_reset(DeviceState *dev)
@@ -665,11 +705,12 @@ static void pl011_reset(DeviceState *dev)
     s->ifl = 0x12;
     s->cr = 0x300;
     s->flags = 0;
+    s->logged_disabled_uart = false;
     pl011_reset_rx_fifo(s);
     pl011_reset_tx_fifo(s);
 }
 
-static void pl011_class_init(ObjectClass *oc, void *data)
+static void pl011_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 

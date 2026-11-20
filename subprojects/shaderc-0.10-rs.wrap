@@ -1,0 +1,6 @@
+[wrap-file]
+directory = shaderc-0.10.1
+source_url = https://crates.io/api/v1/crates/shaderc/0.10.1/download
+source_filename = shaderc-0.10.1.tar.gz
+source_hash = 8ab2a6e36d1c1e2320c87e2b806a3e7b0dffaa67b82c14a39dad6cf7637208ae
+method = cargo

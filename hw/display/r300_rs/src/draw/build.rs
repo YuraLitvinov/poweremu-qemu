@@ -280,15 +280,17 @@ fn core(
     let route = rs_route(st, &mut pkt.warn);
     let mut desc = FsDesc { route: route.route, vs_gpu: None };
 
-    if prim != 8 && !bypass && !pvsrec::wanted(n) && gpu_vs::wanted(st, prim, false, bypass) {
-        if let gpu_vs::Outcome::Built { vs } =
+    if prim != 8
+        && !bypass
+        && !pvsrec::wanted(n)
+        && gpu_vs::wanted(st, prim, false, bypass)
+        && let gpu_vs::Outcome::Built { vs } =
             gpu_vs::build(st, &mut f, &prog, &consts, &lay, &route, &mut pkt, order, prim, fog, fogsel, clip)?
-        {
-            pkt.warn |= f.warn;
-            desc.vs_gpu = Some(&vs);
-            pkt.glsl = to_glsl(st, &desc, st.glsl_flags)?;
-            return Ok(pkt);
-        }
+    {
+        pkt.warn |= f.warn;
+        desc.vs_gpu = Some(&vs);
+        pkt.glsl = to_glsl(st, &desc, st.glsl_flags)?;
+        return Ok(pkt);
     }
 
     // Rectangle lists: three corners a rectangle, the card completes the

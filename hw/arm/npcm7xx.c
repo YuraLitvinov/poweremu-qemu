@@ -19,12 +19,12 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/npcm7xx.h"
 #include "hw/char/serial-mm.h"
-#include "hw/loader.h"
+#include "hw/core/loader.h"
 #include "hw/misc/unimp.h"
-#include "hw/qdev-clock.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
-#include "qemu/bswap.h"
+#include "exec/tswap.h"
 #include "qemu/units.h"
 #include "system/system.h"
 #include "target/arm/cpu-qom.h"
@@ -364,22 +364,20 @@ static void npcm7xx_write_secondary_boot(ARMCPU *cpu,
                        NPCM7XX_SMP_LOADER_START);
 }
 
-static struct arm_boot_info npcm7xx_binfo = {
-    .loader_start           = NPCM7XX_LOADER_START,
-    .smp_loader_start       = NPCM7XX_SMP_LOADER_START,
-    .smp_bootreg_addr       = NPCM7XX_SMP_BOOTREG_ADDR,
-    .gic_cpu_if_addr        = NPCM7XX_GIC_CPU_IF_ADDR,
-    .write_secondary_boot   = npcm7xx_write_secondary_boot,
-    .board_id               = -1,
-    .board_setup_addr       = NPCM7XX_BOARD_SETUP_ADDR,
-    .write_board_setup      = npcm7xx_write_board_setup,
-};
-
-void npcm7xx_load_kernel(MachineState *machine, NPCM7xxState *soc)
+void npcm7xx_load_kernel(MachineState *machine, NPCM7xxState *soc,
+                         struct arm_boot_info *binfo)
 {
-    npcm7xx_binfo.ram_size = machine->ram_size;
+    binfo->loader_start = NPCM7XX_LOADER_START;
+    binfo->smp_loader_start = NPCM7XX_SMP_LOADER_START;
+    binfo->smp_bootreg_addr = NPCM7XX_SMP_BOOTREG_ADDR;
+    binfo->gic_cpu_if_addr = NPCM7XX_GIC_CPU_IF_ADDR;
+    binfo->write_secondary_boot = npcm7xx_write_secondary_boot;
+    binfo->board_id = -1;
+    binfo->board_setup_addr = NPCM7XX_BOARD_SETUP_ADDR;
+    binfo->write_board_setup = npcm7xx_write_board_setup;
+    binfo->ram_size = machine->ram_size;
 
-    arm_load_kernel(&soc->cpu[0], machine, &npcm7xx_binfo);
+    arm_load_kernel(&soc->cpu[0], machine, binfo);
 }
 
 static void npcm7xx_init_fuses(NPCM7xxState *s)
@@ -492,7 +490,7 @@ static void npcm7xx_realize(DeviceState *dev, Error **errp)
     /* CPUs */
     for (i = 0; i < nc->num_cpus; i++) {
         object_property_set_int(OBJECT(&s->cpu[i]), "reset-cbar",
-                                NPCM7XX_GIC_CPU_IF_ADDR, &error_abort);
+                                NPCM7XX_CPUP_BA, &error_abort);
         object_property_set_bool(OBJECT(&s->cpu[i]), "reset-hivecs", true,
                                  &error_abort);
 
@@ -821,7 +819,7 @@ static const Property npcm7xx_properties[] = {
                      MemoryRegion *),
 };
 
-static void npcm7xx_class_init(ObjectClass *oc, void *data)
+static void npcm7xx_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
@@ -830,7 +828,7 @@ static void npcm7xx_class_init(ObjectClass *oc, void *data)
     device_class_set_props(dc, npcm7xx_properties);
 }
 
-static void npcm730_class_init(ObjectClass *oc, void *data)
+static void npcm730_class_init(ObjectClass *oc, const void *data)
 {
     NPCM7xxClass *nc = NPCM7XX_CLASS(oc);
 
@@ -839,7 +837,7 @@ static void npcm730_class_init(ObjectClass *oc, void *data)
     nc->num_cpus = 2;
 }
 
-static void npcm750_class_init(ObjectClass *oc, void *data)
+static void npcm750_class_init(ObjectClass *oc, const void *data)
 {
     NPCM7xxClass *nc = NPCM7XX_CLASS(oc);
 

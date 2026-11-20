@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-#
 # QAPI code generation
 #
 # Copyright (c) 2015-2019 Red Hat Inc.
@@ -302,7 +300,7 @@ class QAPISchemaModularCVisitor(QAPISchemaVisitor):
                 ret += '-' + os.path.splitext(basename)[0]
         else:
             assert QAPISchemaModule.is_system_module(name)
-            ret += re.sub(r'-', '-' + name[2:] + '-', what)
+            ret += re.sub(r'-', '-' + name[2:] + '-', what, count=1)
         return ret
 
     def _module_filename(self, what: str, name: str) -> str:

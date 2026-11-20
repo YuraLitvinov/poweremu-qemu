@@ -10,7 +10,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/virtio/virtio.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
@@ -48,7 +48,7 @@ static const Property virtio_ccw_9p_properties[] = {
                        VIRTIO_CCW_MAX_REV),
 };
 
-static void virtio_ccw_9p_class_init(ObjectClass *klass, void *data)
+static void virtio_ccw_9p_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtIOCCWDeviceClass *k = VIRTIO_CCW_DEVICE_CLASS(klass);
@@ -64,6 +64,7 @@ static const TypeInfo virtio_ccw_9p_info = {
     .instance_size = sizeof(V9fsCCWState),
     .instance_init = virtio_ccw_9p_instance_init,
     .class_init    = virtio_ccw_9p_class_init,
+    .secure        = true,
 };
 
 static void virtio_ccw_9p_register(void)

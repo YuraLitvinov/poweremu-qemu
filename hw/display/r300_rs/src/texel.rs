@@ -85,6 +85,15 @@ impl LevelGeometry {
 }
 
 impl LevelSpec {
+    /// The spec of mip level `level` of the texture `td`; `None` past the last level slot.
+    pub fn for_desc(td: &crate::types::R300TexDesc, level: u32) -> Option<Self> {
+        Some(Self {
+            kind: TexKind::from_raw(td.kind),
+            format: td.format,
+            src_pitch: *td.lvl_pitch.get(level as usize)?,
+        })
+    }
+
     /// Geometry of a `w` x `h` texel level.
     pub fn geometry(&self, w: u32, h: u32) -> Result<LevelGeometry, TexelError> {
         let (w, h) = (w as usize, h as usize);

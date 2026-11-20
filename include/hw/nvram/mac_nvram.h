@@ -26,8 +26,8 @@
 #ifndef MAC_NVRAM_H
 #define MAC_NVRAM_H
 
-#include "exec/memory.h"
-#include "hw/sysbus.h"
+#include "system/memory.h"
+#include "hw/core/sysbus.h"
 
 #define MACIO_NVRAM_SIZE 0x2000
 
@@ -48,12 +48,5 @@ struct MacIONVRAMState {
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
-
-/*
- * A NewWorld Mac's NVRAM: two banks of `bank` bytes, byte-addressed, the
- * first for Open Firmware and the second for Mac OS X.  The device is
- * twice `bank` bytes long.  See the comment on the definition.
- */
-void pmac_format_nvram_banks(MacIONVRAMState *nvr, int bank);
 
 #endif /* MAC_NVRAM_H */

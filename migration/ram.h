@@ -31,6 +31,8 @@
 
 #include "qapi/qapi-types-migration.h"
 #include "exec/cpu-common.h"
+#include "qemu/notify.h"
+#include "system/ram_addr.h"
 #include "io/channel.h"
 
 /*
@@ -86,13 +88,24 @@ void ram_postcopy_migrated_memory_release(MigrationState *ms);
 void ram_postcopy_send_discard_bitmap(MigrationState *ms);
 /* For incoming postcopy discard */
 int ram_discard_range(const char *block_name, uint64_t start, size_t length);
-int ram_postcopy_incoming_init(MigrationIncomingState *mis);
+int ram_postcopy_incoming_init(MigrationIncomingState *mis, Error **errp);
 int ram_load_postcopy(QEMUFile *f, int channel);
 
 void ram_handle_zero(void *host, uint64_t size);
 
 void ram_transferred_add(uint64_t bytes);
 void ram_release_page(const char *rbname, uint64_t offset);
+
+/*
+ * The RAM round notifier is invoked whenever the migration RAM core
+ * completes one full scan of guest memory.
+ */
+typedef struct RAMRoundNotifyData {
+    QEMUFile *file;
+} RAMRoundNotifyData;
+
+void ram_round_add_notifier(NotifierWithReturn *n);
+void ram_round_remove_notifier(NotifierWithReturn *n);
 
 int ramblock_recv_bitmap_test(RAMBlock *rb, void *host_addr);
 bool ramblock_recv_bitmap_test_byte_offset(RAMBlock *rb, uint64_t byte_offset);
@@ -109,7 +122,7 @@ void ramblock_set_file_bmap_atomic(RAMBlock *block, ram_addr_t offset,
                                    bool set);
 
 /* ram cache */
-int colo_init_ram_cache(void);
+int colo_init_ram_cache(Error **errp);
 void colo_flush_ram_cache(void);
 void colo_release_ram_cache(void);
 void colo_incoming_start_dirty_log(void);

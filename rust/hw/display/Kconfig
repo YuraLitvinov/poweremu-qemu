@@ -1,0 +1,2 @@
+config X_PPC_MAC_GPU_RUST
+    bool

@@ -14,7 +14,23 @@
 #ifndef MIGRATION_REGISTER_H
 #define MIGRATION_REGISTER_H
 
-#include "hw/vmstate-if.h"
+#include "hw/core/vmstate-if.h"
+
+typedef struct MigPendingData {
+    /* Amount of pending bytes can be transferred in precopy or stopcopy */
+    uint64_t precopy_bytes;
+    /* Amount of pending bytes can be transferred in postcopy */
+    uint64_t postcopy_bytes;
+    /* Amount of pending bytes can be transferred only in stopcopy */
+    uint64_t stopcopy_bytes;
+    /* Number of new pending switchover ACKs */
+    uint32_t switchover_ack_pending;
+    /*
+     * Total pending data, modules do not need to update this field, it
+     * will be automatically calculated by migration core API.
+     */
+    uint64_t total_bytes;
+} MigPendingData;
 
 /**
  * struct SaveVMHandlers: handler structure to finely control
@@ -78,51 +94,43 @@ typedef struct SaveVMHandlers {
     void (*save_cleanup)(void *opaque);
 
     /**
-     * @save_live_complete_postcopy
-     *
-     * Called at the end of postcopy for all postcopyable devices.
-     *
-     * @f: QEMUFile where to send the data
-     * @opaque: data pointer passed to register_savevm_live()
-     *
-     * Returns zero to indicate success and negative for error
-     */
-    int (*save_live_complete_postcopy)(QEMUFile *f, void *opaque);
-
-    /**
-     * @save_live_complete_precopy
+     * @save_complete
      *
      * Transmits the last section for the device containing any
-     * remaining data at the end of a precopy phase. When postcopy is
-     * enabled, devices that support postcopy will skip this step,
-     * where the final data will be flushed at the end of postcopy via
-     * @save_live_complete_postcopy instead.
+     * remaining data at the end phase of migration.
+     *
+     * For precopy, this will be invoked _during_ the switchover phase
+     * after source VM is stopped.
+     *
+     * For postcopy, this will be invoked _after_ the switchover phase
+     * (except some very unusual cases, like PMEM ramblocks), while
+     * destination VM can be running.
      *
      * @f: QEMUFile where to send the data
      * @opaque: data pointer passed to register_savevm_live()
      *
      * Returns zero to indicate success and negative for error
      */
-    int (*save_live_complete_precopy)(QEMUFile *f, void *opaque);
+    int (*save_complete)(QEMUFile *f, void *opaque);
 
     /**
-     * @save_live_complete_precopy_thread (invoked in a separate thread)
+     * @save_complete_precopy_thread (invoked in a separate thread)
      *
      * Called at the end of a precopy phase from a separate worker thread
      * in configurations where multifd device state transfer is supported
      * in order to perform asynchronous transmission of the remaining data in
-     * parallel with @save_live_complete_precopy handlers.
+     * parallel with @save_complete handlers.
      * When postcopy is enabled, devices that support postcopy will skip this
      * step.
      *
-     * @d: a #SaveLiveCompletePrecopyThreadData containing parameters that the
+     * @d: a #SaveCompletePrecopyThreadData containing parameters that the
      * handler may need, including this device section idstr and instance_id,
      * and opaque data pointer passed to register_savevm_live().
      * @errp: pointer to Error*, to store an error if it happens.
      *
      * Returns true to indicate success and false for errors.
      */
-    SaveLiveCompletePrecopyThreadHandler save_live_complete_precopy_thread;
+    SaveCompletePrecopyThreadHandler save_complete_precopy_thread;
 
     /* This runs both outside and inside the BQL.  */
 
@@ -165,6 +173,28 @@ typedef struct SaveVMHandlers {
      */
     bool (*is_active_iterate)(void *opaque);
 
+    /**
+     * @save_query_pending
+     *
+     * This estimates the remaining data to transfer on the source side.
+     *
+     * When @exact is true, a module must report accurate results.  When
+     * @exact is false, a module may report estimates.
+     *
+     * It's highly recommended that modules implement a faster version of
+     * the query path (for example, by proper caching on the counters) if
+     * an accurate query will be time-consuming.
+     *
+     * @opaque: data pointer passed to register_savevm_live()
+     * @pending: pointer to a MigPendingData struct
+     * @exact: set to true for an accurate (slow) query
+     * @final: set to true for the final query during switchover. When final is
+     * true, the query is called with BQL locked. Otherwise, it's called with
+     * BQL unlocked.
+     */
+    void (*save_query_pending)(void *opaque, MigPendingData *pending,
+                               bool exact, bool final);
+
     /* This runs outside the BQL in the migration case, and
      * within the lock in the savevm case.  The callback had better only
      * use data that is local to the migration thread or protected
@@ -190,46 +220,19 @@ typedef struct SaveVMHandlers {
     /* This runs outside the BQL!  */
 
     /**
-     * @state_pending_estimate
+     * @save_postcopy_prepare
      *
-     * This estimates the remaining data to transfer
+     * This hook will be invoked on the source side right before switching
+     * to postcopy (before VM stopped).
      *
-     * Sum of @can_postcopy and @must_postcopy is the whole amount of
-     * pending data.
+     * @f:      QEMUFile where to send the data
+     * @opaque: Data pointer passed to register_savevm_live()
+     * @errp:   Error** used to report error message
      *
-     * @opaque: data pointer passed to register_savevm_live()
-     * @must_precopy: amount of data that must be migrated in precopy
-     *                or in stopped state, i.e. that must be migrated
-     *                before target start.
-     * @can_postcopy: amount of data that can be migrated in postcopy
-     *                or in stopped state, i.e. after target start.
-     *                Some can also be migrated during precopy (RAM).
-     *                Some must be migrated after source stops
-     *                (block-dirty-bitmap)
+     * Returns: true if succeeded, false if error occured.  When false is
+     * returned, @errp must be set.
      */
-    void (*state_pending_estimate)(void *opaque, uint64_t *must_precopy,
-                                   uint64_t *can_postcopy);
-
-    /**
-     * @state_pending_exact
-     *
-     * This calculates the exact remaining data to transfer
-     *
-     * Sum of @can_postcopy and @must_postcopy is the whole amount of
-     * pending data.
-     *
-     * @opaque: data pointer passed to register_savevm_live()
-     * @must_precopy: amount of data that must be migrated in precopy
-     *                or in stopped state, i.e. that must be migrated
-     *                before target start.
-     * @can_postcopy: amount of data that can be migrated in postcopy
-     *                or in stopped state, i.e. after target start.
-     *                Some can also be migrated during precopy (RAM).
-     *                Some must be migrated after source stops
-     *                (block-dirty-bitmap)
-     */
-    void (*state_pending_exact)(void *opaque, uint64_t *must_precopy,
-                                uint64_t *can_postcopy);
+    bool (*save_postcopy_prepare)(QEMUFile *f, void *opaque, Error **errp);
 
     /**
      * @load_state
@@ -300,19 +303,6 @@ typedef struct SaveVMHandlers {
      * Returns zero to indicate success and negative for error
      */
     int (*resume_prepare)(MigrationState *s, void *opaque);
-
-    /**
-     * @switchover_ack_needed
-     *
-     * Checks if switchover ack should be used. Called only on
-     * destination.
-     *
-     * @opaque: data pointer passed to register_savevm_live()
-     *
-     * Returns true if switchover ack should be used and false
-     * otherwise
-     */
-    bool (*switchover_ack_needed)(void *opaque);
 
     /**
      * @switchover_start

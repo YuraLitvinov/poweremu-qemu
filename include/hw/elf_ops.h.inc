@@ -56,6 +56,13 @@ static void glue(bswap_rela, SZ)(struct elf_rela *rela)
     bswapSZs((elf_word *)&rela->r_addend);
 }
 
+static void glue(bswap_note, SZ)(struct elf_note *note)
+{
+    bswap32s(&note->n_namesz);
+    bswap32s(&note->n_descsz);
+    bswap32s(&note->n_type);
+}
+
 static struct elf_shdr *glue(find_section, SZ)(struct elf_shdr *shdr_table,
                                                int n, int type)
 {
@@ -275,7 +282,8 @@ fail:
 static struct elf_note *glue(get_elf_note_type, SZ)(struct elf_note *nhdr,
                                                     elf_word note_size,
                                                     elf_word phdr_align,
-                                                    elf_word elf_note_type)
+                                                    elf_word elf_note_type,
+                                                    int must_swab)
 {
     elf_word nhdr_size = sizeof(struct elf_note);
     elf_word elf_note_entry_offset = 0;
@@ -285,6 +293,10 @@ static struct elf_note *glue(get_elf_note_type, SZ)(struct elf_note *nhdr,
 
     if (nhdr == NULL) {
         return NULL;
+    }
+
+    if (must_swab) {
+        glue(bswap_note, SZ)(nhdr);
     }
 
     note_type = nhdr->n_type;
@@ -306,6 +318,9 @@ static struct elf_note *glue(get_elf_note_type, SZ)(struct elf_note *nhdr,
 
         /* skip to the next ELF Note entry */
         nhdr = (void *)nhdr + elf_note_entry_offset;
+        if (must_swab) {
+            glue(bswap_note, SZ)(nhdr);
+        }
         note_type = nhdr->n_type;
     }
 
@@ -426,6 +441,11 @@ static ssize_t glue(load_elf, SZ)(const char *name, int fd,
             mem_size = ph->p_memsz; /* Size of the ROM */
             file_size = ph->p_filesz; /* Size of the allocated data */
             data_offset = ph->p_offset; /* Offset where the data is located */
+
+            if (file_size > mem_size) {
+                ret = ELF_LOAD_TOO_BIG;
+                goto fail;
+            }
 
             if (file_size > 0) {
                 if (g_mapped_file_get_length(mapped_file) <
@@ -603,7 +623,8 @@ static ssize_t glue(load_elf, SZ)(const char *name, int fd,
             nhdr = (struct elf_note *)data;
             assert(translate_opaque != NULL);
             nhdr = glue(get_elf_note_type, SZ)(nhdr, file_size, ph->p_align,
-                                               *(uint64_t *)translate_opaque);
+                                               *(uint64_t *)translate_opaque,
+                                               must_swab);
             if (nhdr != NULL) {
                 elf_note_fn((void *)nhdr, (void *)&ph->p_align, SZ == 64);
             }

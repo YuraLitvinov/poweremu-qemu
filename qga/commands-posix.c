@@ -16,6 +16,9 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#if defined(CONFIG_SOLARIS) && defined(CONFIG_GETLOADAVG)
+#include <sys/loadavg.h>
+#endif
 #include "qga-qapi-commands.h"
 #include "qapi/error.h"
 #include "qemu/host-utils.h"
@@ -213,9 +216,14 @@ out:
     return retcode;
 }
 
+#define POWEROFF_CMD_PATH "/sbin/poweroff"
+#define HALT_CMD_PATH "/sbin/halt"
+#define REBOOT_CMD_PATH "/sbin/reboot"
+
 void qmp_guest_shutdown(const char *mode, Error **errp)
 {
     const char *shutdown_flag;
+    const char *shutdown_cmd = NULL;
     Error *local_err = NULL;
 
 #ifdef CONFIG_SOLARIS
@@ -234,10 +242,19 @@ void qmp_guest_shutdown(const char *mode, Error **errp)
 
     slog("guest-shutdown called, mode: %s", mode);
     if (!mode || strcmp(mode, "powerdown") == 0) {
+        if (access(POWEROFF_CMD_PATH, X_OK) == 0) {
+            shutdown_cmd = POWEROFF_CMD_PATH;
+        }
         shutdown_flag = powerdown_flag;
     } else if (strcmp(mode, "halt") == 0) {
+        if (access(HALT_CMD_PATH, X_OK) == 0) {
+            shutdown_cmd = HALT_CMD_PATH;
+        }
         shutdown_flag = halt_flag;
     } else if (strcmp(mode, "reboot") == 0) {
+        if (access(REBOOT_CMD_PATH, X_OK) == 0) {
+            shutdown_cmd = REBOOT_CMD_PATH;
+        }
         shutdown_flag = reboot_flag;
     } else {
         error_setg(errp,
@@ -254,6 +271,15 @@ void qmp_guest_shutdown(const char *mode, Error **errp)
                           "-h", shutdown_flag, "+0",
 #endif
                           "hypervisor initiated shutdown", (char *) NULL};
+
+    /*
+     * If the specific command exists (poweroff, halt or reboot), use it instead
+     * of /sbin/shutdown.
+     */
+    if (shutdown_cmd != NULL) {
+        argv[0] = shutdown_cmd;
+        argv[1] = NULL;
+    }
 
     ga_run_command(argv, NULL, "shutdown", &local_err);
     if (local_err) {
@@ -295,6 +321,20 @@ void qmp_guest_set_time(bool has_time, int64_t time_ns, Error **errp)
             return;
         }
     }
+
+#if !defined(CONFIG_LINUX)
+    /*
+     * BSDs (FreeBSD, OpenBSD, NetBSD) and illumos do not have the
+     * hwclock(8) tool. These systems update hardware clock when
+     * settimeofday() sets system time, so no additional actions
+     * are needed. Setting system time from RTC is not supported.
+     */
+    if (!has_time) {
+        error_setg(errp, "Setting system time from RTC is not supported");
+    }
+
+    return;
+#endif
 
     /* Now, if user has passed a time to set and the system time is set, we
      * just need to synchronize the hardware clock. However, if no time was
@@ -503,9 +543,8 @@ int64_t qmp_guest_file_open(const char *path, const char *mode,
     /* set fd non-blocking to avoid common use cases (like reading from a
      * named pipe) from hanging the agent
      */
-    if (!g_unix_set_fd_nonblocking(fileno(fh), true, NULL)) {
+    if (!qemu_set_blocking(fileno(fh), false, errp)) {
         fclose(fh);
-        error_setg_errno(errp, errno, "Failed to set FD nonblocking");
         return -1;
     }
 
@@ -693,7 +732,7 @@ void qmp_guest_file_flush(int64_t handle, Error **errp)
     }
 }
 
-#if defined(CONFIG_FSFREEZE) || defined(CONFIG_FSTRIM)
+#if defined(CONFIG_FSFREEZE) || defined(CONFIG_FSTRIM) || defined(CONFIG_BSD)
 void free_fs_mount_list(FsMountList *mounts)
 {
      FsMount *mount, *temp;
@@ -706,6 +745,9 @@ void free_fs_mount_list(FsMountList *mounts)
          QTAILQ_REMOVE(mounts, mount, next);
          g_free(mount->dirname);
          g_free(mount->devtype);
+#ifdef CONFIG_BSD
+         g_free(mount->fromname);
+#endif
          g_free(mount);
      }
 }
@@ -1294,7 +1336,7 @@ GuestOSInfo *qmp_guest_get_osinfo(Error **errp)
 
     info = g_new0(GuestOSInfo, 1);
 
-    if (uname(&kinfo) != 0) {
+    if (uname(&kinfo) < 0) {
         error_setg_errno(errp, errno, "uname failed");
     } else {
         info->kernel_version = g_strdup(kinfo.version);

@@ -21,7 +21,7 @@
 #include "block/block_int.h"
 #include "trace.h"
 #include "hw/block/block.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "system/blockdev.h"
 #include "system/block-ram-registrar.h"
 #include "system/system.h"
@@ -37,6 +37,19 @@
 #include "hw/virtio/virtio-access.h"
 #include "hw/virtio/virtio-blk-common.h"
 #include "qemu/coroutine.h"
+
+/* TODO Remove once the Linux headers have caught up */
+#ifndef VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA
+#define VIRTIO_BLK_F_REQ_FLAGS         18      /* Request flags supported */
+#define VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA 19      /* FUA flag supported */
+
+#define VIRTIO_BLK_REQ_FLAG_OUT_FUA    0
+
+#define VIRTIO_BLK_OUTDHR_FLAGS(out) out.ioprio
+#endif
+
+/* Internal buffer size limit for zone report */
+#define VIRTIO_BLK_MAX_ZONES_PER_BATCH 4096
 
 static void virtio_blk_ioeventfd_attach(VirtIOBlock *s);
 
@@ -62,15 +75,11 @@ void virtio_blk_req_complete(VirtIOBlockReq *req, unsigned char status)
     iov_discard_undo(&req->inhdr_undo);
     iov_discard_undo(&req->outhdr_undo);
     virtqueue_push(req->vq, &req->elem, req->in_len);
-    if (qemu_in_iothread()) {
-        virtio_notify_irqfd(vdev, req->vq);
-    } else {
-        virtio_notify(vdev, req->vq);
-    }
+    virtio_notify(vdev, req->vq);
 }
 
 static int virtio_blk_handle_rw_error(VirtIOBlockReq *req, int error,
-    bool is_read, bool acct_failed)
+                                      bool is_read)
 {
     VirtIOBlock *s = req->dev;
     BlockErrorAction action = blk_get_error_action(s->blk, is_read, error);
@@ -86,9 +95,7 @@ static int virtio_blk_handle_rw_error(VirtIOBlockReq *req, int error,
         }
     } else if (action == BLOCK_ERROR_ACTION_REPORT) {
         virtio_blk_req_complete(req, VIRTIO_BLK_S_IOERR);
-        if (acct_failed) {
-            block_acct_failed(blk_get_stats(s->blk), &req->acct);
-        }
+        block_acct_failed(blk_get_stats(s->blk), &req->acct);
         g_free(req);
     }
 
@@ -125,7 +132,7 @@ static void virtio_blk_rw_complete(void *opaque, int ret)
              * the memory until the request is completed (which will
              * happen on the other side of the migration).
              */
-            if (virtio_blk_handle_rw_error(req, -ret, is_read, true)) {
+            if (virtio_blk_handle_rw_error(req, -ret, is_read)) {
                 continue;
             }
         }
@@ -141,7 +148,7 @@ static void virtio_blk_flush_complete(void *opaque, int ret)
     VirtIOBlockReq *req = opaque;
     VirtIOBlock *s = req->dev;
 
-    if (ret && virtio_blk_handle_rw_error(req, -ret, 0, true)) {
+    if (ret && virtio_blk_handle_rw_error(req, -ret, 0)) {
         return;
     }
 
@@ -154,17 +161,13 @@ static void virtio_blk_discard_write_zeroes_complete(void *opaque, int ret)
 {
     VirtIOBlockReq *req = opaque;
     VirtIOBlock *s = req->dev;
-    bool is_write_zeroes = (virtio_ldl_p(VIRTIO_DEVICE(s), &req->out.type) &
-                            ~VIRTIO_BLK_T_BARRIER) == VIRTIO_BLK_T_WRITE_ZEROES;
 
-    if (ret && virtio_blk_handle_rw_error(req, -ret, false, is_write_zeroes)) {
+    if (ret && virtio_blk_handle_rw_error(req, -ret, false)) {
         return;
     }
 
     virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
-    if (is_write_zeroes) {
-        block_acct_done(blk_get_stats(s->blk), &req->acct);
-    }
+    block_acct_done(blk_get_stats(s->blk), &req->acct);
     g_free(req);
 }
 
@@ -200,10 +203,16 @@ static void virtio_blk_handle_scsi(VirtIOBlockReq *req)
 
     /*
      * The scsi inhdr is placed in the second-to-last input segment, just
-     * before the regular inhdr.
+     * before the regular inhdr. VIRTIO implementations normally do not rely on
+     * the precise message framing, but legacy implementations did and so we do
+     * too for the legacy virtio-blk SCSI request type.
      *
      * Just put anything nonzero so that the ioctl fails in the guest.
      */
+    if (elem->in_sg[elem->in_num - 2].iov_len != sizeof(*scsi)) {
+        status = VIRTIO_BLK_S_IOERR;
+        goto fail;
+    }
     scsi = (void *)elem->in_sg[elem->in_num - 2].iov_base;
     virtio_stl_p(vdev, &scsi->errors, 255);
     status = VIRTIO_BLK_S_UNSUPP;
@@ -220,6 +229,7 @@ static inline void submit_requests(VirtIOBlock *s, MultiReqBuffer *mrb,
     QEMUIOVector *qiov = &mrb->reqs[start]->qiov;
     int64_t sector_num = mrb->reqs[start]->sector_num;
     bool is_write = mrb->is_write;
+    bool is_fua = mrb->is_fua;
     BdrvRequestFlags flags = 0;
 
     if (num_reqs > 1) {
@@ -256,6 +266,9 @@ static inline void submit_requests(VirtIOBlock *s, MultiReqBuffer *mrb,
     }
 
     if (is_write) {
+        if (is_fua) {
+            flags |= BDRV_REQ_FUA;
+        }
         blk_aio_pwritev(blk, sector_num << BDRV_SECTOR_BITS, qiov,
                         flags, virtio_blk_rw_complete,
                         mrb->reqs[start]);
@@ -289,6 +302,9 @@ static void virtio_blk_submit_multireq(VirtIOBlock *s, MultiReqBuffer *mrb)
     int i = 0, start = 0, num_reqs = 0, niov = 0, nb_sectors = 0;
     uint32_t max_transfer;
     int64_t sector_num = 0;
+    uint64_t zone_size = blk_get_zone_size(s->blk);
+    bool zone_cross;
+    int64_t zone_nr_sectors, end_sector;
 
     if (mrb->num_reqs == 1) {
         submit_requests(s, mrb, 0, 1, -1);
@@ -305,16 +321,33 @@ static void virtio_blk_submit_multireq(VirtIOBlock *s, MultiReqBuffer *mrb)
         VirtIOBlockReq *req = mrb->reqs[i];
         if (num_reqs > 0) {
             /*
+             * On zoned backends, a single backend write/read must not span
+             * a zone boundary. Bail out of merging if combining req into
+             * the current batch would straddle a zone.
+             */
+            if (zone_size > 0) {
+                zone_nr_sectors = zone_size / BDRV_SECTOR_SIZE;
+                end_sector = req->sector_num
+                                + req->qiov.size / BDRV_SECTOR_SIZE - 1;
+                zone_cross = (sector_num / zone_nr_sectors) !=
+                             (end_sector / zone_nr_sectors);
+            } else {
+                zone_cross = false;
+            }
+
+            /*
              * NOTE: We cannot merge the requests in below situations:
              * 1. requests are not sequential
              * 2. merge would exceed maximum number of IOVs
              * 3. merge would exceed maximum transfer length of backend device
+             * 4. merge would cross a zone boundary on a zoned backend
              */
             if (sector_num + nb_sectors != req->sector_num ||
                 niov > blk_get_max_iov(s->blk) - req->qiov.niov ||
                 req->qiov.size > max_transfer ||
                 nb_sectors > (max_transfer -
-                              req->qiov.size) / BDRV_SECTOR_SIZE) {
+                              req->qiov.size) / BDRV_SECTOR_SIZE ||
+                zone_cross) {
                 submit_requests(s, mrb, start, num_reqs, niov);
                 num_reqs = 0;
             }
@@ -371,6 +404,33 @@ static bool virtio_blk_sect_range_ok(VirtIOBlock *dev,
         return false;
     }
     return true;
+}
+
+/*
+ * Both the offset and the size of a write to a sequential zone must be a
+ * multiple of the write granularity that the device reports. Conventional
+ * zones are not constrained. The zone index is derived from a guest supplied
+ * sector, so this must only be called once virtio_blk_sect_range_ok() has
+ * bounded it.
+ */
+static bool virtio_blk_zone_write_granularity_ok(VirtIOBlock *dev,
+                                                 uint64_t sector, size_t size)
+{
+    BlockDriverState *bs = blk_bs(dev->blk);
+    uint64_t offset = sector << BDRV_SECTOR_BITS;
+    uint32_t wg_mask;
+
+    if (bs->bl.zoned == BLK_Z_NONE) {
+        return true;
+    }
+
+    if (bdrv_zone_is_conv(bs, bdrv_zone_index(bs, offset))) {
+        return true;
+    }
+
+    wg_mask = blkconf_zone_write_granularity(&dev->conf.conf) - 1;
+
+    return !(offset & wg_mask) && !(size & wg_mask);
 }
 
 static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
@@ -438,6 +498,9 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
             goto err;
         }
 
+        block_acct_start(blk_get_stats(s->blk), &req->acct, bytes,
+                         BLOCK_ACCT_UNMAP);
+
         blk_aio_pdiscard(s->blk, sector << BDRV_SECTOR_BITS, bytes,
                          virtio_blk_discard_write_zeroes_complete, req);
     }
@@ -445,26 +508,50 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
     return VIRTIO_BLK_S_OK;
 
 err:
-    if (is_write_zeroes) {
-        block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_WRITE);
-    }
+    block_acct_invalid(blk_get_stats(s->blk),
+                       is_write_zeroes ? BLOCK_ACCT_WRITE : BLOCK_ACCT_UNMAP);
     return err_status;
 }
+
+typedef struct {
+    unsigned int total_nr_zones;    /* max zones to fill in this request */
+    unsigned int nr_zones_done;     /* how many zones have been filled in */
+    int64_t iov_offset;             /* current byte position in in_iov[] */
+    int64_t offset;                 /* current zone report disk offset */
+    unsigned int nr_zones;          /* for zone report calls */
+    unsigned int zones_per_batch;   /* size of zone report buffer */
+    BlockZoneDescriptor *zones;     /* zone report buffer */
+} ZoneReportData;
 
 typedef struct ZoneCmdData {
     VirtIOBlockReq *req;
     struct iovec *in_iov;
     unsigned in_num;
     union {
-        struct {
-            unsigned int nr_zones;
-            BlockZoneDescriptor *zones;
-        } zone_report_data;
+        ZoneReportData zone_report_data;
         struct {
             int64_t offset;
         } zone_append_data;
     };
 } ZoneCmdData;
+
+/*
+ * The maximum zone append size that the device reports to its driver, in 512
+ * byte sectors.
+ *
+ * An append cannot cross a zone boundary, so the configured maximum is capped
+ * by the size of a zone: the specification asks for the largest append that
+ * can be carried out, and a larger one never can be. The zone size is already
+ * reported to the driver as zone_sectors, so this tells it nothing new about
+ * the host.
+ */
+static uint32_t virtio_blk_max_append_sectors(VirtIOBlock *s)
+{
+    BlockDriverState *bs = blk_bs(s->blk);
+
+    return MIN(s->conf.max_append_sectors,
+               bs->bl.zone_size >> BDRV_SECTOR_BITS);
+}
 
 /*
  * check zoned_request: error checking before issuing requests. If all checks
@@ -488,25 +575,26 @@ static bool check_zoned_request(VirtIOBlock *s, int64_t offset, int64_t len,
     }
 
     if (append) {
-        if (bs->bl.write_granularity) {
-            if ((offset % bs->bl.write_granularity) != 0) {
-                *status = VIRTIO_BLK_S_ZONE_UNALIGNED_WP;
-                return false;
-            }
+        uint32_t wg_mask = blkconf_zone_write_granularity(&s->conf.conf) - 1;
+
+        if (offset & wg_mask || len & wg_mask) {
+            *status = VIRTIO_BLK_S_ZONE_UNALIGNED_WP;
+            return false;
         }
 
-        index = offset / bs->bl.zone_size;
-        if (BDRV_ZT_IS_CONV(bs->wps->wp[index])) {
+        index = bdrv_zone_index(bs, offset);
+        if (bdrv_zone_is_conv(bs, index)) {
             *status = VIRTIO_BLK_S_ZONE_INVALID_CMD;
             return false;
         }
 
-        if (len / 512 > bs->bl.max_append_sectors) {
-            if (bs->bl.max_append_sectors == 0) {
-                *status = VIRTIO_BLK_S_UNSUPP;
-            } else {
-                *status = VIRTIO_BLK_S_ZONE_INVALID_CMD;
-            }
+        if (!s->conf.max_append_sectors) {
+            *status = VIRTIO_BLK_S_UNSUPP;
+            return false;
+        }
+
+        if ((len >> BDRV_SECTOR_BITS) > virtio_blk_max_append_sectors(s)) {
+            *status = VIRTIO_BLK_S_ZONE_INVALID_CMD;
             return false;
         }
     }
@@ -516,16 +604,15 @@ static bool check_zoned_request(VirtIOBlock *s, int64_t offset, int64_t len,
 static void virtio_blk_zone_report_complete(void *opaque, int ret)
 {
     ZoneCmdData *data = opaque;
+    ZoneReportData *zrd = &data->zone_report_data;
     VirtIOBlockReq *req = data->req;
     VirtIODevice *vdev = VIRTIO_DEVICE(req->dev);
     struct iovec *in_iov = data->in_iov;
     unsigned in_num = data->in_num;
-    int64_t zrp_size, n, j = 0;
-    int64_t nz = data->zone_report_data.nr_zones;
+    int64_t n;
+    unsigned nz = zrd->nr_zones;
     int8_t err_status = VIRTIO_BLK_S_OK;
-    struct virtio_blk_zone_report zrp_hdr = (struct virtio_blk_zone_report) {
-        .nr_zones = cpu_to_le64(nz),
-    };
+    struct virtio_blk_zone_report zrp_hdr = {};
 
     trace_virtio_blk_zone_report_complete(vdev, req, nz, ret);
     if (ret) {
@@ -533,28 +620,18 @@ static void virtio_blk_zone_report_complete(void *opaque, int ret)
         goto out;
     }
 
-    zrp_size = sizeof(struct virtio_blk_zone_report)
-               + sizeof(struct virtio_blk_zone_descriptor) * nz;
-    n = iov_from_buf(in_iov, in_num, 0, &zrp_hdr, sizeof(zrp_hdr));
-    if (n != sizeof(zrp_hdr)) {
-        virtio_error(vdev, "Driver provided input buffer that is too small!");
-        err_status = VIRTIO_BLK_S_ZONE_INVALID_CMD;
-        goto out;
-    }
-
-    for (size_t i = sizeof(zrp_hdr); i < zrp_size;
-        i += sizeof(struct virtio_blk_zone_descriptor), ++j) {
+    for (unsigned j = 0; j < nz; j++) {
         struct virtio_blk_zone_descriptor desc =
             (struct virtio_blk_zone_descriptor) {
-                .z_start = cpu_to_le64(data->zone_report_data.zones[j].start
+                .z_start = cpu_to_le64(zrd->zones[j].start
                     >> BDRV_SECTOR_BITS),
-                .z_cap = cpu_to_le64(data->zone_report_data.zones[j].cap
+                .z_cap = cpu_to_le64(zrd->zones[j].cap
                     >> BDRV_SECTOR_BITS),
-                .z_wp = cpu_to_le64(data->zone_report_data.zones[j].wp
+                .z_wp = cpu_to_le64(zrd->zones[j].wp
                     >> BDRV_SECTOR_BITS),
         };
 
-        switch (data->zone_report_data.zones[j].type) {
+        switch (zrd->zones[j].type) {
         case BLK_ZT_CONV:
             desc.z_type = VIRTIO_BLK_ZT_CONV;
             break;
@@ -568,7 +645,7 @@ static void virtio_blk_zone_report_complete(void *opaque, int ret)
             g_assert_not_reached();
         }
 
-        switch (data->zone_report_data.zones[j].state) {
+        switch (zrd->zones[j].state) {
         case BLK_ZS_RDONLY:
             desc.z_state = VIRTIO_BLK_ZS_RDONLY;
             break;
@@ -598,18 +675,47 @@ static void virtio_blk_zone_report_complete(void *opaque, int ret)
         }
 
         /* TODO: it takes O(n^2) time complexity. Optimizations required. */
-        n = iov_from_buf(in_iov, in_num, i, &desc, sizeof(desc));
+        n = iov_from_buf(in_iov, in_num, zrd->iov_offset, &desc, sizeof(desc));
         if (n != sizeof(desc)) {
             virtio_error(vdev, "Driver provided input buffer "
                                "for descriptors that is too small!");
             err_status = VIRTIO_BLK_S_ZONE_INVALID_CMD;
+            goto out;
         }
+
+        zrd->iov_offset += sizeof(desc);
+    }
+
+    if (nz > 0) {
+        BlockZoneDescriptor *zone = &zrd->zones[nz - 1];
+        zrd->offset = zone->start + zone->length;
+    }
+
+    zrd->nr_zones_done += nz;
+
+    /* Call zone report again if the end hasn't been reached yet */
+    if (nz == zrd->zones_per_batch &&
+        zrd->nr_zones_done < zrd->total_nr_zones) {
+        zrd->nr_zones = MIN(zrd->zones_per_batch,
+                            zrd->total_nr_zones - zrd->nr_zones_done);
+        blk_aio_zone_report(req->dev->blk, zrd->offset, &zrd->nr_zones,
+                            zrd->zones, virtio_blk_zone_report_complete, data);
+        return;
+    }
+
+    /* Fill in header now that all zones have been reported */
+    zrp_hdr.nr_zones = cpu_to_le64(zrd->nr_zones_done);
+    n = iov_from_buf(in_iov, in_num, 0, &zrp_hdr, sizeof(zrp_hdr));
+    if (n != sizeof(zrp_hdr)) {
+        virtio_error(vdev, "Driver provided input buffer that is too small!");
+        err_status = VIRTIO_BLK_S_ZONE_INVALID_CMD;
+        goto out;
     }
 
 out:
     virtio_blk_req_complete(req, err_status);
     g_free(req);
-    g_free(data->zone_report_data.zones);
+    g_free(zrd->zones);
     g_free(data);
 }
 
@@ -621,7 +727,8 @@ static void virtio_blk_handle_zone_report(VirtIOBlockReq *req,
     VirtIODevice *vdev = VIRTIO_DEVICE(s);
     unsigned int nr_zones;
     ZoneCmdData *data;
-    int64_t zone_size, offset;
+    ZoneReportData *zrd;
+    int64_t offset;
     uint8_t err_status;
 
     if (req->in_len < sizeof(struct virtio_blk_inhdr) +
@@ -643,16 +750,21 @@ static void virtio_blk_handle_zone_report(VirtIOBlockReq *req,
     trace_virtio_blk_handle_zone_report(vdev, req,
                                         offset >> BDRV_SECTOR_BITS, nr_zones);
 
-    zone_size = sizeof(BlockZoneDescriptor) * nr_zones;
     data = g_malloc(sizeof(ZoneCmdData));
     data->req = req;
     data->in_iov = in_iov;
     data->in_num = in_num;
-    data->zone_report_data.nr_zones = nr_zones;
-    data->zone_report_data.zones = g_malloc(zone_size),
 
-    blk_aio_zone_report(s->blk, offset, &data->zone_report_data.nr_zones,
-                        data->zone_report_data.zones,
+    zrd = &data->zone_report_data;
+    zrd->total_nr_zones = nr_zones;
+    zrd->nr_zones_done = 0;
+    zrd->iov_offset = sizeof(struct virtio_blk_zone_report);
+    zrd->offset = offset;
+    zrd->zones_per_batch = MIN(nr_zones, VIRTIO_BLK_MAX_ZONES_PER_BATCH);
+    zrd->zones = g_malloc(zrd->zones_per_batch * sizeof(BlockZoneDescriptor));
+
+    zrd->nr_zones = zrd->zones_per_batch;
+    blk_aio_zone_report(s->blk, offset, &zrd->nr_zones, zrd->zones,
                         virtio_blk_zone_report_complete, data);
     return;
 out:
@@ -723,7 +835,8 @@ static void virtio_blk_zone_append_complete(void *opaque, int ret)
 {
     ZoneCmdData *data = opaque;
     VirtIOBlockReq *req = data->req;
-    VirtIODevice *vdev = VIRTIO_DEVICE(req->dev);
+    VirtIOBlock *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
     int64_t append_sector, n;
     uint8_t err_status = VIRTIO_BLK_S_OK;
 
@@ -746,6 +859,11 @@ static void virtio_blk_zone_append_complete(void *opaque, int ret)
 
 out:
     virtio_blk_req_complete(req, err_status);
+    if (err_status == VIRTIO_BLK_S_OK) {
+        block_acct_done(blk_get_stats(s->blk), &req->acct);
+    } else {
+        block_acct_failed(blk_get_stats(s->blk), &req->acct);
+    }
     g_free(req);
     g_free(data);
 }
@@ -791,6 +909,7 @@ out:
 static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
 {
     uint32_t type;
+    uint32_t flags;
     struct iovec *in_iov = req->elem.in_sg;
     struct iovec *out_iov = req->elem.out_sg;
     unsigned in_num = req->elem.in_num;
@@ -827,6 +946,7 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
                               &req->inhdr_undo);
 
     type = virtio_ldl_p(vdev, &req->out.type);
+    flags = virtio_ldl_p(vdev, &VIRTIO_BLK_OUTDHR_FLAGS(req->out));
 
     /* VIRTIO_BLK_T_OUT defines the command direction. VIRTIO_BLK_T_BARRIER
      * is an optional flag. Although a guest should not send this flag if
@@ -835,6 +955,9 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
     case VIRTIO_BLK_T_IN:
     {
         bool is_write = type & VIRTIO_BLK_T_OUT;
+        bool is_fua = is_write &&
+            virtio_vdev_has_feature(vdev, VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA) &&
+            (flags & (1U << VIRTIO_BLK_REQ_FLAG_OUT_FUA));
         req->sector_num = virtio_ldq_p(vdev, &req->out.sector);
 
         if (is_write) {
@@ -855,6 +978,15 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
             return 0;
         }
 
+        if (is_write &&
+            !virtio_blk_zone_write_granularity_ok(s, req->sector_num,
+                                                  req->qiov.size)) {
+            virtio_blk_req_complete(req, VIRTIO_BLK_S_ZONE_UNALIGNED_WP);
+            block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_WRITE);
+            g_free(req);
+            return 0;
+        }
+
         block_acct_start(blk_get_stats(s->blk), &req->acct, req->qiov.size,
                          is_write ? BLOCK_ACCT_WRITE : BLOCK_ACCT_READ);
 
@@ -862,6 +994,7 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
          * changes */
         if (mrb->num_reqs > 0 && (mrb->num_reqs == VIRTIO_BLK_MAX_MERGE_REQS ||
                                   is_write != mrb->is_write ||
+                                  is_fua != mrb->is_fua ||
                                   !s->conf.request_merging)) {
             virtio_blk_submit_multireq(s, mrb);
         }
@@ -869,6 +1002,7 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
         assert(mrb->num_reqs < VIRTIO_BLK_MAX_MERGE_REQS);
         mrb->reqs[mrb->num_reqs++] = req;
         mrb->is_write = is_write;
+        mrb->is_fua = is_fua;
         break;
     }
     case VIRTIO_BLK_T_FLUSH:
@@ -898,14 +1032,18 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
     case VIRTIO_BLK_T_GET_ID:
     {
         /*
-         * NB: per existing s/n string convention the string is
+         * The spec requires NUL-padding for the output. The string is
          * terminated by '\0' only when shorter than buffer.
          */
         const char *serial = s->conf.serial ? s->conf.serial : "";
-        size_t size = MIN(strlen(serial) + 1,
-                          MIN(iov_size(in_iov, in_num),
-                              VIRTIO_BLK_ID_BYTES));
+        size_t req_size = MIN(iov_size(in_iov, in_num), VIRTIO_BLK_ID_BYTES);
+        size_t size = MIN(strlen(serial), req_size);
+        size_t padding = req_size - size;
+
         iov_from_buf(in_iov, in_num, 0, serial, size);
+        if (padding) {
+            iov_memset(in_iov, in_num, size, 0, padding);
+        }
         virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
         g_free(req);
         break;
@@ -1218,9 +1356,10 @@ static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
                      bs->bl.max_active_zones);
         virtio_stl_p(vdev, &blkcfg.zoned.max_open_zones,
                      bs->bl.max_open_zones);
-        virtio_stl_p(vdev, &blkcfg.zoned.write_granularity, blk_size);
+        virtio_stl_p(vdev, &blkcfg.zoned.write_granularity,
+                     blkconf_zone_write_granularity(conf));
         virtio_stl_p(vdev, &blkcfg.zoned.max_append_sectors,
-                     bs->bl.max_append_sectors);
+                     virtio_blk_max_append_sectors(s));
     } else {
         blkcfg.zoned.model = VIRTIO_BLK_Z_NONE;
     }
@@ -1244,6 +1383,10 @@ static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
 
     /* Firstly sync all virtio-blk possible supported features */
     features |= s->host_features;
+
+    if (virtio_has_feature(features, VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA)) {
+        virtio_add_feature(&features, VIRTIO_BLK_F_REQ_FLAGS);
+    }
 
     virtio_add_feature(&features, VIRTIO_BLK_F_SEG_MAX);
     virtio_add_feature(&features, VIRTIO_BLK_F_GEOMETRY);
@@ -1270,7 +1413,16 @@ static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
     return features;
 }
 
-static void virtio_blk_set_status(VirtIODevice *vdev, uint8_t status)
+static int virtio_blk_validate_features(VirtIODevice *vdev)
+{
+    if (virtio_vdev_has_feature(vdev, VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA) &&
+        !virtio_vdev_has_feature(vdev, VIRTIO_BLK_F_REQ_FLAGS)) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static int virtio_blk_set_status(VirtIODevice *vdev, uint8_t status)
 {
     VirtIOBlock *s = VIRTIO_BLK(vdev);
 
@@ -1279,7 +1431,7 @@ static void virtio_blk_set_status(VirtIODevice *vdev, uint8_t status)
     }
 
     if (!(status & VIRTIO_CONFIG_S_DRIVER_OK)) {
-        return;
+        return 0;
     }
 
     /* A guest that supports VIRTIO_BLK_F_CONFIG_WCE must be able to send
@@ -1302,6 +1454,7 @@ static void virtio_blk_set_status(VirtIODevice *vdev, uint8_t status)
                                    virtio_vdev_has_feature(vdev,
                                                            VIRTIO_BLK_F_WCE));
     }
+    return 0;
 }
 
 static void virtio_blk_save_device(VirtIODevice *vdev, QEMUFile *f)
@@ -1347,6 +1500,10 @@ static int virtio_blk_load_device(VirtIODevice *vdev, QEMUFile *f,
         }
 
         req = qemu_get_virtqueue_element(vdev, f, sizeof(VirtIOBlockReq));
+        if (!req) {
+            error_report("Failed to restore virtio-blk request");
+            return -EINVAL;
+        }
         virtio_blk_init_request(s, virtio_get_queue(vdev, vq_idx), req);
 
         WITH_QEMU_LOCK_GUARD(&s->rq_lock) {
@@ -1726,6 +1883,12 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (conf->serial && strlen(conf->serial) > VIRTIO_BLK_ID_BYTES) {
+        warn_report("serial is longer than %d characters and will be truncated "
+                    "for the guest. This configuration is deprecated.",
+                    VIRTIO_BLK_ID_BYTES);
+    }
+
     if (!blkconf_apply_backend_options(&conf->conf,
                                        !blk_supports_write_perm(conf->conf.blk),
                                        true, errp)) {
@@ -1740,11 +1903,43 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (!blkconf_check_zoned_geometry(&conf->conf, errp)) {
+        return;
+    }
+
     bs = blk_bs(conf->conf.blk);
     if (bs->bl.zoned != BLK_Z_NONE) {
         virtio_add_feature(&s->host_features, VIRTIO_BLK_F_ZONED);
         if (bs->bl.zoned == BLK_Z_HM) {
             virtio_clear_feature(&s->host_features, VIRTIO_BLK_F_DISCARD);
+        }
+    }
+
+    if (virtio_has_feature(s->host_features, VIRTIO_BLK_F_ZONED)) {
+        uint32_t wg = blkconf_zone_write_granularity(&conf->conf);
+
+        /*
+         * Checked before the granularity below, so that a driver can shift the
+         * value that it reads into a byte count without overflowing.
+         */
+        if (conf->max_append_sectors > BDRV_REQUEST_MAX_SECTORS) {
+            error_setg(errp, "invalid max-append-sectors property (%" PRIu32
+                       "), must not exceed %d", conf->max_append_sectors,
+                       (int)BDRV_REQUEST_MAX_SECTORS);
+            return;
+        }
+
+        /*
+         * Zero is allowed, and says that zone append is not supported, which
+         * is what a ZBC or ZAC disk is. Anything else has to be able to
+         * express a single write.
+         */
+        if (conf->max_append_sectors &&
+            (conf->max_append_sectors << BDRV_SECTOR_BITS) < wg) {
+            error_setg(errp, "invalid max-append-sectors property (%" PRIu32
+                       "), must be zero or at least the zone write granularity "
+                       "(%" PRIu32 " bytes)", conf->max_append_sectors, wg);
+            return;
         }
     }
 
@@ -1802,7 +1997,7 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
      * called after ->start_ioeventfd() has already set blk's AioContext.
      */
     s->change =
-        qdev_add_vm_change_state_handler(dev, virtio_blk_dma_restart_cb, s);
+        qdev_add_vm_change_state_handler(dev, virtio_blk_dma_restart_cb, NULL, s);
 
     blk_ram_registrar_init(&s->blk_ram_registrar, s->blk);
     blk_set_dev_ops(s->blk, &virtio_block_ops, s);
@@ -1882,11 +2077,19 @@ static const Property virtio_blk_properties[] = {
                        conf.max_discard_sectors, BDRV_REQUEST_MAX_SECTORS),
     DEFINE_PROP_UINT32("max-write-zeroes-sectors", VirtIOBlock,
                        conf.max_write_zeroes_sectors, BDRV_REQUEST_MAX_SECTORS),
+    DEFINE_PROP_BIT64("fua", VirtIOBlock, host_features,
+                      VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA, true),
+    /*
+     * Zero is valid, and says that the device does not support zone append,
+     * as a ZBC or ZAC disk does not.
+     */
+    DEFINE_PROP_UINT32("max-append-sectors", VirtIOBlock,
+                       conf.max_append_sectors, BDRV_REQUEST_MAX_SECTORS),
     DEFINE_PROP_BOOL("x-enable-wce-if-config-wce", VirtIOBlock,
                      conf.x_enable_wce_if_config_wce, true),
 };
 
-static void virtio_blk_class_init(ObjectClass *klass, void *data)
+static void virtio_blk_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
@@ -1899,6 +2102,7 @@ static void virtio_blk_class_init(ObjectClass *klass, void *data)
     vdc->get_config = virtio_blk_update_config;
     vdc->set_config = virtio_blk_set_config;
     vdc->get_features = virtio_blk_get_features;
+    vdc->validate_features = virtio_blk_validate_features;
     vdc->set_status = virtio_blk_set_status;
     vdc->reset = virtio_blk_reset;
     vdc->save = virtio_blk_save_device;
@@ -1914,6 +2118,7 @@ static const TypeInfo virtio_blk_info = {
     .instance_init = virtio_blk_instance_init,
     .class_init = virtio_blk_class_init,
     .class_size = sizeof(VirtIOBlkClass),
+    .secure = true,
 };
 
 static void virtio_register_types(void)

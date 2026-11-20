@@ -12,9 +12,10 @@
 #include "qemu/error-report.h"
 #include "hw/misc/aspeed_lpc.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 
 #define TO_REG(offset) ((offset) >> 2)
@@ -384,9 +385,9 @@ static const MemoryRegionOps aspeed_lpc_ops = {
     },
 };
 
-static void aspeed_lpc_reset(DeviceState *dev)
+static void aspeed_lpc_reset_hold(Object *obj, ResetType type)
 {
-    struct AspeedLPCState *s = ASPEED_LPC(dev);
+    AspeedLPCState *s = ASPEED_LPC(obj);
 
     s->subdevice_irqs_pending = 0;
 
@@ -417,29 +418,41 @@ static void aspeed_lpc_realize(DeviceState *dev, Error **errp)
 
 static void aspeed_lpc_init(Object *obj)
 {
-    object_property_add(obj, "idr1", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "idr1", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "odr1", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "odr1", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "str1", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "str1", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "idr2", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "idr2", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "odr2", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "odr2", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "str2", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "str2", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "idr3", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "idr3", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "odr3", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "odr3", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "str3", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "str3", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "idr4", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "idr4", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "odr4", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "odr4", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
-    object_property_add(obj, "str4", "uint32", aspeed_kcs_get_register_property,
+    object_property_add(obj, "str4", "uint32", &uint32_type_info,
+                        aspeed_kcs_get_register_property,
                         aspeed_kcs_set_register_property, NULL, NULL);
 }
 
@@ -458,28 +471,26 @@ static const Property aspeed_lpc_properties[] = {
     DEFINE_PROP_UINT32("hicr7", AspeedLPCState, hicr7, 0),
 };
 
-static void aspeed_lpc_class_init(ObjectClass *klass, void *data)
+static void aspeed_lpc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = aspeed_lpc_realize;
-    device_class_set_legacy_reset(dc, aspeed_lpc_reset);
+    rc->phases.hold = aspeed_lpc_reset_hold;
     dc->desc = "Aspeed LPC Controller",
     dc->vmsd = &vmstate_aspeed_lpc;
     device_class_set_props(dc, aspeed_lpc_properties);
 }
 
-static const TypeInfo aspeed_lpc_info = {
-    .name = TYPE_ASPEED_LPC,
-    .parent = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(AspeedLPCState),
-    .class_init = aspeed_lpc_class_init,
-    .instance_init = aspeed_lpc_init,
+static const TypeInfo aspeed_lpc_types[] = {
+    {
+        .name = TYPE_ASPEED_LPC,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AspeedLPCState),
+        .class_init = aspeed_lpc_class_init,
+        .instance_init = aspeed_lpc_init,
+    }
 };
 
-static void aspeed_lpc_register_types(void)
-{
-    type_register_static(&aspeed_lpc_info);
-}
-
-type_init(aspeed_lpc_register_types);
+DEFINE_TYPES(aspeed_lpc_types)

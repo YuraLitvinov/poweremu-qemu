@@ -167,7 +167,8 @@ fn draws_match_c() {
 }
 
 unsafe extern "C" fn c_read(_: *mut c_void, addr: u32, dst: *mut c_void, len: u32) -> bool {
-    read(addr, std::slice::from_raw_parts_mut(dst.cast(), len as usize))
+    // SAFETY: the caller passes a writable buffer of `len` bytes.
+    read(addr, unsafe { std::slice::from_raw_parts_mut(dst.cast(), len as usize) })
 }
 
 /// The C entry points give the same packet (and error) as the Rust API, and

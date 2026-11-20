@@ -11,12 +11,15 @@
  */
 
 #include "qemu/osdep.h"
-#include "exec/ramblock.h"
+#include "system/ramblock.h"
 #include "exec/target_page.h"
 #include "file.h"
 #include "migration-stats.h"
 #include "multifd.h"
+#include "multifd-colo.h"
 #include "options.h"
+#include "migration.h"
+#include "ram.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
@@ -24,6 +27,28 @@
 #include "qemu-file.h"
 
 static MultiFDSendData *multifd_ram_send;
+
+static int multifd_ram_round_notify(NotifierWithReturn *n G_GNUC_UNUSED,
+                                    void *data, Error **errp)
+{
+    RAMRoundNotifyData *round_data = data;
+    QEMUFile *f = round_data->file;
+    int ret;
+
+    if (!multifd_ram_sync_per_round()) {
+        return 0;
+    }
+
+    ret = multifd_ram_flush_and_sync(f);
+    if (ret < 0) {
+        error_setg(errp, "multifd RAM round synchronization failed");
+    }
+    return ret;
+}
+
+static NotifierWithReturn multifd_ram_round_notifier = {
+    .notify = multifd_ram_round_notify,
+};
 
 void multifd_ram_payload_alloc(MultiFDPages_t *pages)
 {
@@ -82,7 +107,6 @@ static void multifd_nocomp_send_cleanup(MultiFDSendParams *p, Error **errp)
 {
     g_free(p->iov);
     p->iov = NULL;
-    return;
 }
 
 static void multifd_ram_prepare_header(MultiFDSendParams *p)
@@ -141,7 +165,7 @@ static int multifd_nocomp_send_prepare(MultiFDSendParams *p, Error **errp)
             return -1;
         }
 
-        stat64_add(&mig_stats.multifd_bytes, p->packet_len);
+        qatomic_add(&mig_stats.multifd_bytes, p->packet_len);
     }
 
     return 0;
@@ -269,7 +293,6 @@ int multifd_ram_unfill_packet(MultiFDRecvParams *p, Error **errp)
         return -1;
     }
 
-    p->host = p->block->host;
     for (i = 0; i < p->normal_num; i++) {
         uint64_t offset = be64_to_cpu(packet->offset[i]);
 
@@ -292,6 +315,14 @@ int multifd_ram_unfill_packet(MultiFDRecvParams *p, Error **errp)
             return -1;
         }
         p->zero[i] = offset;
+    }
+
+    if (migrate_colo()) {
+        multifd_colo_prepare_recv(p);
+        assert(p->block->colo_cache);
+        p->host = p->block->colo_cache;
+    } else {
+        p->host = p->block->host;
     }
 
     return 0;
@@ -399,7 +430,7 @@ int multifd_ram_flush_and_sync(QEMUFile *f)
     MultiFDSyncReq req;
     int ret;
 
-    if (!migrate_multifd()) {
+    if (!migrate_multifd() || migration_in_postcopy()) {
         return 0;
     }
 
@@ -463,6 +494,7 @@ static const MultiFDMethods multifd_nocomp_ops = {
 static void multifd_nocomp_register(void)
 {
     multifd_register_ops(MULTIFD_COMPRESSION_NONE, &multifd_nocomp_ops);
+    ram_round_add_notifier(&multifd_ram_round_notifier);
 }
 
 migration_init(multifd_nocomp_register);

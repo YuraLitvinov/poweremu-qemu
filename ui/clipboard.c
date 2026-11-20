@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "system/runstate.h"
 #include "ui/clipboard.h"
 #include "trace.h"
 
@@ -7,9 +8,86 @@ static NotifierList clipboard_notifiers =
 
 static QemuClipboardInfo *cbinfo[QEMU_CLIPBOARD_SELECTION__COUNT];
 
+static VMChangeStateEntry *cb_change_state_entry = NULL;
+
+static bool cb_reset_serial_on_resume = false;
+
+static int guest_peer_count;
+
+static const VMStateDescription vmstate_cbcontent = {
+    .name = "clipboard/content",
+    .version_id = 0,
+    .minimum_version_id = 0,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(available, QemuClipboardContent),
+        VMSTATE_BOOL(requested, QemuClipboardContent),
+        VMSTATE_UINT32(size, QemuClipboardContent),
+        VMSTATE_VBUFFER_ALLOC_UINT32(data, QemuClipboardContent, 0, 0, size),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+const VMStateDescription vmstate_cbinfo = {
+    .name = "clipboard",
+    .version_id = 0,
+    .minimum_version_id = 0,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT32(selection, QemuClipboardInfo),
+        VMSTATE_BOOL(has_serial, QemuClipboardInfo),
+        VMSTATE_UINT32(serial, QemuClipboardInfo),
+        VMSTATE_STRUCT_ARRAY(types, QemuClipboardInfo, QEMU_CLIPBOARD_TYPE__COUNT, 0, vmstate_cbcontent, QemuClipboardContent),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void qemu_clipboard_change_state(void *opaque, bool running, RunState state)
+{
+    int i;
+
+    if (!running) {
+        return;
+    }
+
+    if (cb_reset_serial_on_resume) {
+        cb_reset_serial_on_resume = false;
+        qemu_clipboard_reset_serial();
+    }
+
+    for (i = 0; i < QEMU_CLIPBOARD_SELECTION__COUNT; i++) {
+        if (cbinfo[i]) {
+            qemu_clipboard_update(cbinfo[i]);
+        }
+    }
+
+}
+
+static void qemu_clipboard_notify_peer_update(QemuClipboardPeer *peer,
+                                              bool registered)
+{
+    QemuClipboardNotify notify = {
+        .type = QEMU_CLIPBOARD_PEER_UPDATE,
+        .peer_update = {
+            .peer = peer,
+            .registered = registered,
+        },
+    };
+
+    trace_clipboard_peer_update(peer->name, registered);
+    notifier_list_notify(&clipboard_notifiers, &notify);
+}
+
 void qemu_clipboard_peer_register(QemuClipboardPeer *peer)
 {
+    if (cb_change_state_entry == NULL) {
+        cb_change_state_entry = qemu_add_vm_change_state_handler(qemu_clipboard_change_state, NULL);
+    }
+
+    if (peer->guest) {
+        guest_peer_count++;
+    }
+
     notifier_list_add(&clipboard_notifiers, &peer->notifier);
+    qemu_clipboard_notify_peer_update(peer, true);
 }
 
 void qemu_clipboard_peer_unregister(QemuClipboardPeer *peer)
@@ -20,6 +98,23 @@ void qemu_clipboard_peer_unregister(QemuClipboardPeer *peer)
         qemu_clipboard_peer_release(peer, i);
     }
     notifier_remove(&peer->notifier);
+
+    if (peer->guest) {
+        assert(guest_peer_count > 0);
+        guest_peer_count--;
+    }
+
+    qemu_clipboard_notify_peer_update(peer, false);
+
+    if (QLIST_EMPTY(&clipboard_notifiers.notifiers)) {
+        g_clear_pointer(&cb_change_state_entry,
+                        qemu_del_vm_change_state_handler);
+    }
+}
+
+bool qemu_clipboard_guest_peer_present(void)
+{
+    return guest_peer_count > 0;
 }
 
 bool qemu_clipboard_peer_owns(QemuClipboardPeer *peer,
@@ -83,7 +178,9 @@ void qemu_clipboard_update(QemuClipboardInfo *info)
         }
     }
 
-    notifier_list_notify(&clipboard_notifiers, &notify);
+    if (runstate_is_running() || runstate_check(RUN_STATE_SUSPENDED)) {
+        notifier_list_notify(&clipboard_notifiers, &notify);
+    }
 
     if (cbinfo[info->selection] != info) {
         qemu_clipboard_info_unref(cbinfo[info->selection]);
@@ -163,7 +260,12 @@ void qemu_clipboard_reset_serial(void)
             info->serial = 0;
         }
     }
-    notifier_list_notify(&clipboard_notifiers, &notify);
+
+    if (runstate_is_running() || runstate_check(RUN_STATE_SUSPENDED)) {
+        notifier_list_notify(&clipboard_notifiers, &notify);
+    } else {
+        cb_reset_serial_on_resume = true;
+    }
 }
 
 void qemu_clipboard_set_data(QemuClipboardPeer *peer,

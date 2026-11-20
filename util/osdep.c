@@ -31,12 +31,6 @@
 #include "qemu/hw-version.h"
 #include "monitor/monitor.h"
 
-#ifdef CONFIG_DARWIN
-#include "tcg/tcg-apple-jit.h"
-#endif
-
-static const char *hw_version = QEMU_HW_VERSION;
-
 int socket_set_cork(int fd, int v)
 {
 #if defined(SOL_TCP) && defined(TCP_CORK)
@@ -119,12 +113,6 @@ int qemu_mprotect_none(void *addr, size_t size)
 #ifdef _WIN32
     return qemu_mprotect__osdep(addr, size, PAGE_NOACCESS);
 #else
-# if defined(__APPLE__) && defined(__arm64__)
-    if (__builtin_available(macOS 11.2, *)) {
-        /* mprotect() in macOS 11.2 can't switch RWX to NONE */
-        return 0;
-    }
-# endif
     return qemu_mprotect__osdep(addr, size, PROT_NONE);
 #endif
 }
@@ -158,17 +146,9 @@ int qemu_dup_flags(int fd, int flags)
         goto fail;
     }
 
-    /*
-     * Set/unset flags that we can with fcntl.  macOS character devices (raw
-     * disks such as /dev/rdisk4) refuse F_SETFL with ENOTTY whatever the
-     * flags; that is harmless when the ones F_SETFL could change already
-     * match.
-     */
+    /* Set/unset flags that we can with fcntl */
     if (fcntl(ret, F_SETFL, flags) == -1) {
-        const int settable = O_APPEND | O_NONBLOCK | O_ASYNC;
-        if (errno != ENOTTY || ((flags ^ dup_flags) & settable)) {
-            goto fail;
-        }
+        goto fail;
     }
 
     /* Truncate the file in the cases that open() would truncate it */
@@ -297,6 +277,24 @@ int qemu_lock_fd_test(int fd, int64_t start, int64_t len, bool exclusive)
     } else {
         return fl.l_type == F_UNLCK ? 0 : -EAGAIN;
     }
+}
+
+/**
+ * Set the given flag(s) (fcntl GETFL/SETFL) on the given FD, while retaining
+ * other flags.
+ */
+int qemu_fcntl_addfl(int fd, int flag)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL);
+    if (flags == -1) {
+        return -errno;
+    }
+    if (fcntl(fd, F_SETFL, flags | flag) == -1) {
+        return -errno;
+    }
+    return 0;
 }
 #endif
 
@@ -531,16 +529,6 @@ ssize_t qemu_send_full(int s, const void *buf, size_t count)
     }
 
     return total;
-}
-
-void qemu_set_hw_version(const char *version)
-{
-    hw_version = version;
-}
-
-const char *qemu_hw_version(void)
-{
-    return hw_version;
 }
 
 #ifdef _WIN32

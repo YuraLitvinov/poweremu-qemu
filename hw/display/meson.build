@@ -3,7 +3,8 @@ hw_display_modules = {}
 system_ss.add(when: 'CONFIG_DDC', if_true: files('i2c-ddc.c'))
 system_ss.add(when: 'CONFIG_EDID', if_true: files('edid-generate.c', 'edid-region.c'))
 
-system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('ramfb.c'), if_false: files('ramfb-stubs.c'))
+system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('ramfb.c'))
+stub_ss.add(files('ramfb-stubs.c'))
 system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('ramfb-standalone.c'))
 
 system_ss.add(when: 'CONFIG_VGA_CIRRUS', if_true: files('cirrus_vga.c'))
@@ -11,6 +12,7 @@ system_ss.add(when: ['CONFIG_VGA_CIRRUS', 'CONFIG_VGA_ISA'], if_true: files('cir
 system_ss.add(when: 'CONFIG_G364FB', if_true: files('g364fb.c'))
 system_ss.add(when: 'CONFIG_JAZZ_LED', if_true: files('jazz_led.c'))
 system_ss.add(when: 'CONFIG_PL110', if_true: files('pl110.c'))
+system_ss.add(when: 'CONFIG_IMX6UL_LCDIF', if_true: files('imx6ul_lcdif.c'))
 system_ss.add(when: 'CONFIG_SII9022', if_true: files('sii9022.c'))
 system_ss.add(when: 'CONFIG_SSD0303', if_true: files('ssd0303.c'))
 system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
@@ -35,22 +37,24 @@ system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-fb.c'))
 system_ss.add(when: 'CONFIG_VGA', if_true: files('vga.c'))
 system_ss.add(when: 'CONFIG_VIRTIO', if_true: files('virtio-dmabuf.c'))
 system_ss.add(when: 'CONFIG_DM163', if_true: files('dm163.c'))
+system_ss.add(when: 'CONFIG_VHOST_USER_MEDIA', if_true: files('vhost-user-media.c'))
+system_ss.add(when: ['CONFIG_VHOST_USER_MEDIA', 'CONFIG_VIRTIO_PCI'],
+  if_true: files('vhost-user-media-pci.c'))
 
+stub_ss.add([files('acpi-vga-stub.c'), pixman])
 if (config_all_devices.has_key('CONFIG_VGA_CIRRUS') or
     config_all_devices.has_key('CONFIG_VGA_PCI') or
     config_all_devices.has_key('CONFIG_VMWARE_VGA') or
     config_all_devices.has_key('CONFIG_ATI_VGA')
    )
-  system_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'),
-                                      if_false: files('acpi-vga-stub.c'))
+  system_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'))
 endif
 
 if config_all_devices.has_key('CONFIG_QXL')
   qxl_ss = ss.source_set()
   qxl_ss.add(when: 'CONFIG_QXL', if_true: [files('qxl.c', 'qxl-logger.c', 'qxl-render.c'),
                                            pixman, spice])
-  qxl_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'),
-                                  if_false: files('acpi-vga-stub.c'))
+  qxl_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'))
   hw_display_modules += {'qxl': qxl_ss}
 endif
 
@@ -93,13 +97,19 @@ else
 endif
 
 ppc_mac_gpu_files = files(
-  'ppc_mac_gpu.c',
   'ppc_mac_gpu_x86_stubs.c',
   'ppc_mac_gpu_scanout_le.c',
   'ppc_mac_gpu_scanout_be.c',
   'r300/r300_spirv.c',
   'ppc_mac_gpu_vp.c',
 )
+if target_dirs.contains('ppc-softmmu')
+  # The big-endian build keeps the C device; every other build runs the Rust
+  # device (ppc_mac_gpu_dev/) and only needs the out-of-line header inlines.
+  ppc_mac_gpu_files += files('ppc_mac_gpu.c')
+else
+  ppc_mac_gpu_files += files('ppc_mac_gpu_inline_shims.c')
+endif
 if target_dirs.contains('ppc-softmmu')
   # The big-endian guest runs the C implementation of the R300 code: the Rust
   # crate (r300_rs/) is little-endian only.
@@ -118,48 +128,19 @@ endif
 # Vulkan crate's static library (below).
 system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [ppc_mac_gpu_byteorder, ppc_mac_gpu_files, pixman] + r300_shader_deps)
 
-# Vulkan backend for the R300 (renderer=vulkan): the Rust/ash crate in
-# ppc_mac_gpu_vulkan/, which implements the interface declared in
-# ppc_mac_gpu_renderer.h (ppc_mac_gpu_renderer_vulkan and the VRAM
-# allocator).  ppc_mac_gpu_vulkan.c is the C backend this crate was ported
-# from, kept as a reference and not built.  It is built by running Cargo
-# (a custom_target re-checked by Cargo's own incremental cache) and linked
-# in as a static library; without Cargo or the Vulkan loader the device
-# refuses renderer=vulkan.
+# The device and its Vulkan renderer (renderer=vulkan) are one Rust crate,
+# ppc_mac_gpu_dev (rust/hw/display/), built by QEMU's own Rust machinery
+# (cargo_ws, like pl011) together with the r300 crate it depends on.  The C
+# side only needs the renderer interface header and the define below.
 if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
-  # Without the C R300 code (everything but the big-endian build) the Rust
-  # crates are the device, so Cargo and Vulkan are required.
-  ppc_rust_r300 = not target_dirs.contains('ppc-softmmu')
-  ppc_vulkan_probe = dependency('vulkan', required: ppc_rust_r300, method: 'pkg-config')
-  ppc_vulkan_cargo = find_program('cargo', required: ppc_rust_r300)
-  if ppc_vulkan_probe.found() and ppc_vulkan_cargo.found()
-    ppc_vulkan_dir = meson.current_source_dir() / 'ppc_mac_gpu_vulkan'
-    ppc_vulkan_target_dir = meson.current_build_dir() / 'ppc_mac_gpu_vulkan_target'
-    ppc_vulkan_lib = custom_target('ppc_mac_gpu_vulkan_rs',
-      output: 'libppc_mac_gpu_vulkan.a',
-      command: [find_program('sh'),
-        files('ppc_mac_gpu_vulkan/build.sh'),
-        ppc_vulkan_dir, ppc_vulkan_target_dir, '@OUTPUT@',
-        ppc_rust_r300 ? 'r300_rs' : ''],
-      build_by_default: true,
-      build_always_stale: true,
-      console: true,
-    )
-    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [
-      declare_dependency(
-        sources: [ppc_vulkan_lib],
-        link_args: [ppc_vulkan_target_dir / 'release' / 'libppc_mac_gpu_vulkan.a'],
-        compile_args: ['-DCONFIG_PPC_MAC_GPU_VULKAN'])])
+  if not have_rust
+    error('the Radeon 9700 device is written in Rust: configure with --enable-rust')
   endif
+  system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [
+    declare_dependency(compile_args: ['-DCONFIG_PPC_MAC_GPU_VULKAN'])])
 endif
 
 
-if host_os == 'darwin'
-  metal_fw = dependency('appleframeworks', modules: ['Metal', 'QuartzCore'], required: false)
-  if metal_fw.found()
-    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files('ppc_mac_gpu_metal.m'), metal_fw])
-  endif
-endif
 
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
@@ -191,16 +172,6 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   endif
 endif
 
-if config_all_devices.has_key('CONFIG_FW_CFG_DMA')
-  virtio_ramfb_ss = ss.source_set()
-  virtio_ramfb_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('virtio-ramfb.c'))
-  hw_display_modules += {'virtio-ramfb': virtio_ramfb_ss}
-  virtio_ramfb_gl_ss = ss.source_set()
-  virtio_ramfb_gl_ss.add(when: ['CONFIG_FW_CFG_DMA', virgl, opengl],
-                       if_true: files('virtio-ramfb-gl.c'))
-  hw_display_modules += {'virtio-ramfb-gl': virtio_ramfb_gl_ss}
-endif
-
 if config_all_devices.has_key('CONFIG_VIRTIO_PCI')
   virtio_gpu_pci_ss = ss.source_set()
   virtio_gpu_pci_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI'],
@@ -229,16 +200,14 @@ if config_all_devices.has_key('CONFIG_VIRTIO_VGA')
                     if_true: [files('virtio-vga.c'), pixman])
   virtio_vga_ss.add(when: 'CONFIG_VHOST_USER_VGA',
                     if_true: files('vhost-user-vga.c'))
-  virtio_vga_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'),
-                                         if_false: files('acpi-vga-stub.c'))
+  virtio_vga_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'))
   hw_display_modules += {'virtio-vga': virtio_vga_ss}
 
   if virgl.found() and opengl.found()
     virtio_vga_gl_ss = ss.source_set()
     virtio_vga_gl_ss.add(when: ['CONFIG_VIRTIO_VGA', virgl, opengl],
                          if_true: [files('virtio-vga-gl.c'), pixman])
-    virtio_vga_gl_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'),
-                                              if_false: files('acpi-vga-stub.c'))
+    virtio_vga_gl_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'))
     hw_display_modules += {'virtio-vga-gl': virtio_vga_gl_ss}
   endif
 
@@ -246,8 +215,7 @@ if config_all_devices.has_key('CONFIG_VIRTIO_VGA')
     virtio_vga_rutabaga_ss = ss.source_set()
     virtio_vga_rutabaga_ss.add(when: ['CONFIG_VIRTIO_VGA', rutabaga],
                                if_true: [files('virtio-vga-rutabaga.c'), pixman])
-    virtio_vga_rutabaga_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'),
-                                                    if_false: files('acpi-vga-stub.c'))
+    virtio_vga_rutabaga_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-vga.c'))
     hw_display_modules += {'virtio-vga-rutabaga': virtio_vga_rutabaga_ss}
   endif
 endif

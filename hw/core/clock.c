@@ -13,9 +13,10 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "system/qtest.h"
-#include "hw/clock.h"
+#include "hw/core/clock.h"
 #include "trace.h"
 
 #define CLOCK_PATH(_clk) (_clk->canonical_path)
@@ -186,6 +187,7 @@ static void clock_initfn(Object *obj)
 
     if (qtest_enabled()) {
         object_property_add(obj, "qtest-clock-period", "uint64",
+                            &uint64_type_info,
                             clock_period_prop_get, NULL, NULL, NULL);
     }
 }
@@ -206,7 +208,7 @@ static void clock_finalizefn(Object *obj)
     g_free(clk->canonical_path);
 }
 
-static void clock_class_init(ObjectClass *klass, void *data)
+static void clock_class_init(ObjectClass *klass, const void *data)
 {
     klass->unparent = clock_unparent;
 }

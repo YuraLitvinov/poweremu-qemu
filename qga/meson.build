@@ -39,6 +39,8 @@ qga_qapi_outputs = [
   'qga-qapi-init-commands.h',
   'qga-qapi-introspect.c',
   'qga-qapi-introspect.h',
+  'qga-qapi-type-infos.c',
+  'qga-qapi-type-infos.h',
   'qga-qapi-types.c',
   'qga-qapi-types.h',
   'qga-qapi-visit.c',
@@ -93,28 +95,29 @@ qga_ss = qga_ss.apply({})
 
 gen_tlb = []
 qga_libs = []
+if host_os == 'freebsd'
+  qga_libs += ['-ldevstat']
+endif
 if host_os == 'windows'
   qga_libs += ['-lws2_32', '-lwinmm', '-lpowrprof', '-lwtsapi32', '-lwininet', '-liphlpapi', '-lnetapi32',
-               '-lsetupapi', '-lcfgmgr32', '-luserenv']
+               '-lsetupapi', '-lcfgmgr32', '-luserenv', '-lpdh' ]
   if have_qga_vss
-    qga_libs += ['-lole32', '-loleaut32', '-lshlwapi', '-lstdc++', '-Wl,--enable-stdcall-fixup']
+    qga_libs += ['-lole32', '-loleaut32', '-lshlwapi', '-Wl,--enable-stdcall-fixup']
     subdir('vss-win32')
   endif
 endif
 
 qga_objs = []
 if host_os == 'windows'
-  windmc = find_program('windmc', required: true)
-  windres = find_program('windres', required: true)
+  windmc = find_program('windmc', 'mc', required: true)
 
   msgrc = custom_target('messages-win32.rc',
                         input: 'messages-win32.mc',
                         output: ['messages-win32.rc', 'MSG00409.bin', 'messages-win32.h'],
                         command: [windmc, '-h', '@OUTDIR@', '-r', '@OUTDIR@', '@INPUT@'])
-  msgobj = custom_target('messages-win32.o',
-                         input: msgrc[0],
-                         output: 'messages-win32.o',
-                         command: [windres, '-I', '@OUTDIR@', '-o', '@OUTPUT@', '@INPUT@'])
+
+  windows = import('windows')
+  msgobj = windows.compile_resources(msgrc[0])
 
   qga_objs = [msgobj]
 endif

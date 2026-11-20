@@ -1,0 +1,6 @@
+[wrap-file]
+directory = cfg-if-1.0.5
+source_url = https://crates.io/api/v1/crates/cfg-if/1.0.5/download
+source_filename = cfg-if-1.0.5.tar.gz
+source_hash = 4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600
+method = cargo

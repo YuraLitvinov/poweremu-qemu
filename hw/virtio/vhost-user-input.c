@@ -30,7 +30,7 @@ static const VMStateDescription vmstate_vhost_input = {
     .unmigratable = 1,
 };
 
-static void vhost_input_class_init(ObjectClass *klass, void *data)
+static void vhost_input_class_init(ObjectClass *klass, const void *data)
 {
     VHostUserBaseClass *vubc = VHOST_USER_BASE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -47,6 +47,7 @@ static const TypeInfo vhost_input_info = {
     .parent        = TYPE_VHOST_USER_BASE,
     .instance_size = sizeof(VHostUserInput),
     .class_init    = vhost_input_class_init,
+    .secure        = true,
 };
 
 static void vhost_input_register_types(void)

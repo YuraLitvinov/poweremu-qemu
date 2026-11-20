@@ -19,6 +19,23 @@ const char *si_prefix(unsigned int exp10);
  */
 const char *iec_binary_prefix(unsigned int exp2);
 
+const char *str_array_elem_or_null(const char *const *array,
+                                   size_t nelem, uint64_t index);
+
+/**
+ * STR_ARRAY_ELEM_OR_NULL() - Return a string array element, or NULL if
+ *                            out of bounds
+ * @array: array of strings to index
+ * @index: index of the element to return
+ *
+ * Return @array[@index] if @index is a valid index, otherwise return
+ * NULL. @index is converted to uint64_t, so negative values of signed
+ * types are out of bounds and also yield NULL. Useful to look up entries
+ * in enum-indexed string tables without a prior bounds check.
+ */
+#define STR_ARRAY_ELEM_OR_NULL(array, index) \
+    str_array_elem_or_null(array, ARRAY_SIZE(array), index)
+
 /**
  * pstrcpy:
  * @buf: buffer to copy string into
@@ -101,22 +118,7 @@ int strstart(const char *str, const char *val, const char **ptr);
  *          false otherwise.
  */
 int stristart(const char *str, const char *val, const char **ptr);
-/**
- * qemu_strnlen:
- * @s: string
- * @max_len: maximum number of bytes in @s to scan
- *
- * Return the length of the string @s, like strlen(), but do not
- * examine more than @max_len bytes of the memory pointed to by @s.
- * If no NUL terminator is found within @max_len bytes, then return
- * @max_len instead.
- *
- * This function has the same behaviour as the POSIX strnlen()
- * function.
- *
- * Returns: length of @s in bytes, or @max_len, whichever is smaller.
- */
-int qemu_strnlen(const char *s, int max_len);
+
 /**
  * qemu_strsep:
  * @input: pointer to string to parse

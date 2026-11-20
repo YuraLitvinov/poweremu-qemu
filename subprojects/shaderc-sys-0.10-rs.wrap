@@ -1,0 +1,7 @@
+[wrap-file]
+directory = shaderc-sys-0.10.1
+source_url = https://crates.io/api/v1/crates/shaderc-sys/0.10.1/download
+source_filename = shaderc-sys-0.10.1.tar.gz
+source_hash = bdceb85b2c6d2c27b95ffe2d341063dfded0aca8046f7f60c544bbeaeaf8bcae
+method = cargo
+patch_directory = shaderc-sys-0.10-rs

@@ -166,6 +166,8 @@ static void raspi_peripherals_base_init(Object *obj)
     /* SPI */
     object_initialize_child(obj, "bcm2835-spi0", &s->spi[0],
                             TYPE_BCM2835_SPI);
+    object_initialize_child(obj, "spi-irq-splitter",
+                            &s->spi_irq_splitter, TYPE_SPLIT_IRQ);
 
     /* I2C */
     object_initialize_child(obj, "bcm2835-i2c0", &s->i2c[0],
@@ -179,6 +181,8 @@ static void raspi_peripherals_base_init(Object *obj)
                             &s->orgated_i2c_irq, TYPE_OR_IRQ);
     object_property_set_int(OBJECT(&s->orgated_i2c_irq), "num-lines",
                             ORGATED_I2C_IRQ_COUNT, &error_abort);
+    object_initialize_child(obj, "orgated-i2c-irq-splitter",
+                            &s->orgated_i2c_irq_splitter, TYPE_SPLIT_IRQ);
 }
 
 static void bcm2835_peripherals_realize(DeviceState *dev, Error **errp)
@@ -478,10 +482,16 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
 
     memory_region_add_subregion(&s->peri_mr, SPI0_OFFSET,
                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->spi[0]), 0));
+    qdev_prop_set_uint32(DEVICE(&s->spi_irq_splitter), "num-lines", 2);
+    if (!qdev_realize(DEVICE(&s->spi_irq_splitter), NULL, errp)) {
+        return;
+    }
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi[0]), 0,
-                       qdev_get_gpio_in_named(DEVICE(&s->ic),
-                                              BCM2835_IC_GPU_IRQ,
-                                              INTERRUPT_SPI));
+                       qdev_get_gpio_in(DEVICE(&s->spi_irq_splitter), 0));
+    qdev_connect_gpio_out(DEVICE(&s->spi_irq_splitter), 0,
+                          qdev_get_gpio_in_named(DEVICE(&s->ic),
+                                                 BCM2835_IC_GPU_IRQ,
+                                                 INTERRUPT_SPI));
 
     /* I2C */
     for (n = 0; n < 3; n++) {
@@ -504,7 +514,14 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[n]), 0,
                            qdev_get_gpio_in(DEVICE(&s->orgated_i2c_irq), n));
     }
+
+    qdev_prop_set_uint32(DEVICE(&s->orgated_i2c_irq_splitter), "num-lines", 2);
+    if (!qdev_realize(DEVICE(&s->orgated_i2c_irq_splitter), NULL, errp)) {
+        return;
+    }
     qdev_connect_gpio_out(DEVICE(&s->orgated_i2c_irq), 0,
+                          qdev_get_gpio_in(DEVICE(&s->orgated_i2c_irq_splitter), 0));
+    qdev_connect_gpio_out(DEVICE(&s->orgated_i2c_irq_splitter), 0,
                           qdev_get_gpio_in_named(DEVICE(&s->ic),
                                                  BCM2835_IC_GPU_IRQ,
                                                  INTERRUPT_I2C));
@@ -520,7 +537,7 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
     create_unimp(s, &s->sdramc, "bcm2835-sdramc", SDRAMC_OFFSET, 0x100);
 }
 
-static void bcm2835_peripherals_class_init(ObjectClass *oc, void *data)
+static void bcm2835_peripherals_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     BCMSocPeripheralBaseClass *bc = BCM_SOC_PERIPHERALS_BASE_CLASS(oc);

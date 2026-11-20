@@ -35,11 +35,13 @@ static bool virtio_add_resource(QemuUUID *uuid, VirtioSharedObject *value)
     if (resource_uuids == NULL) {
         resource_uuids = g_hash_table_new_full(qemu_uuid_hash,
                                                uuid_equal_func,
-                                               NULL,
+                                               g_free,
                                                g_free);
     }
     if (g_hash_table_lookup(resource_uuids, uuid) == NULL) {
-        g_hash_table_insert(resource_uuids, uuid, value);
+        g_hash_table_insert(resource_uuids,
+                            g_memdup2(uuid, sizeof(*uuid)),
+                            value);
     } else {
         result = false;
     }
@@ -92,6 +94,24 @@ bool virtio_remove_resource(const QemuUUID *uuid)
     g_mutex_unlock(&lock);
 
     return result;
+}
+
+static gboolean virtio_vhost_device_match(gpointer key, gpointer value,
+                                         gpointer dev)
+{
+    VirtioSharedObject *vso = value;
+
+    return vso->type == TYPE_VHOST_DEV && vso->value == dev;
+}
+
+void virtio_remove_vhost_device(struct vhost_dev *dev)
+{
+    g_mutex_lock(&lock);
+    if (resource_uuids != NULL) {
+        g_hash_table_foreach_remove(resource_uuids, virtio_vhost_device_match,
+                                    dev);
+    }
+    g_mutex_unlock(&lock);
 }
 
 static VirtioSharedObject *get_shared_object(const QemuUUID *uuid)

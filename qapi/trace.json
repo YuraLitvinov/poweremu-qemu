@@ -7,15 +7,14 @@
 # See the COPYING file in the top-level directory.
 
 ##
-# = Tracing
+# *******
+# Tracing
+# *******
 ##
 
 ##
 # @TraceEventState:
-#
-# State of a tracing event.
-#
-# @unavailable: The event is statically disabled.
+#     State of a tracing event.
 #
 # @disabled: The event is dynamically disabled.
 #
@@ -24,12 +23,11 @@
 # Since: 2.2
 ##
 { 'enum': 'TraceEventState',
-  'data': ['unavailable', 'disabled', 'enabled'] }
+  'data': ['disabled', 'enabled'] }
 
 ##
 # @TraceEventInfo:
-#
-# Information of a tracing event.
+#     Information of a tracing event.
 #
 # @name: Event name.
 #
@@ -42,12 +40,11 @@
 
 ##
 # @trace-event-get-state:
-#
-# Query the state of events.
+#     Query the state of events.
 #
 # @name: Event name pattern (case-sensitive glob).
 #
-# Returns: a list of @TraceEventInfo for the matching events
+# Returns: a list of info for the matching events
 #
 # Since: 2.2
 #
@@ -63,14 +60,14 @@
 
 ##
 # @trace-event-set-state:
-#
-# Set the dynamic tracing state of events.
+#     Set the dynamic tracing state of events.
 #
 # @name: Event name pattern (case-sensitive glob).
 #
 # @enable: Whether to enable tracing.
 #
 # @ignore-unavailable: Do not match unavailable events with @name.
+#      Deprecated: since 11.2
 #
 # Since: 2.2
 #

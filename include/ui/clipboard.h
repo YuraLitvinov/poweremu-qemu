@@ -2,6 +2,7 @@
 #define QEMU_CLIPBOARD_H
 
 #include "qemu/notify.h"
+#include "migration/vmstate.h"
 
 /**
  * DOC: Introduction
@@ -24,7 +25,11 @@ typedef enum QemuClipboardNotifyType QemuClipboardNotifyType;
 typedef enum QemuClipboardSelection QemuClipboardSelection;
 typedef struct QemuClipboardPeer QemuClipboardPeer;
 typedef struct QemuClipboardNotify QemuClipboardNotify;
+typedef struct QemuClipboardPeerUpdate QemuClipboardPeerUpdate;
 typedef struct QemuClipboardInfo QemuClipboardInfo;
+typedef struct QemuClipboardContent QemuClipboardContent;
+
+extern const VMStateDescription vmstate_cbinfo;
 
 /**
  * enum QemuClipboardType
@@ -57,6 +62,7 @@ enum QemuClipboardSelection {
  * struct QemuClipboardPeer
  *
  * @name: peer name.
+ * @guest: is peer guest side.
  * @notifier: notifier for clipboard updates.
  * @request: callback for clipboard data requests.
  *
@@ -64,6 +70,7 @@ enum QemuClipboardSelection {
  */
 struct QemuClipboardPeer {
     const char *name;
+    bool guest;
     Notifier notifier;
     void (*request)(QemuClipboardInfo *info,
                     QemuClipboardType type);
@@ -74,12 +81,27 @@ struct QemuClipboardPeer {
  *
  * @QEMU_CLIPBOARD_UPDATE_INFO: clipboard info update
  * @QEMU_CLIPBOARD_RESET_SERIAL: reset clipboard serial
+ * @QEMU_CLIPBOARD_PEER_UPDATE: peer registered/unregistered
  *
  * Clipboard notify type.
  */
 enum QemuClipboardNotifyType {
     QEMU_CLIPBOARD_UPDATE_INFO,
     QEMU_CLIPBOARD_RESET_SERIAL,
+    QEMU_CLIPBOARD_PEER_UPDATE,
+};
+
+/**
+ * struct QemuClipboardPeerUpdate
+ *
+ * @peer: the peer affected by this event
+ * @registered: whether @peer registered or unregistered.
+ *
+ * Clipboard peer update event data.
+ */
+struct QemuClipboardPeerUpdate {
+    QemuClipboardPeer *peer;
+    bool registered;
 };
 
 /**
@@ -87,6 +109,8 @@ enum QemuClipboardNotifyType {
  *
  * @type: the type of event.
  * @info: a QemuClipboardInfo event.
+ * @peer_update: a peer register/unregister event
+ *               (valid for QEMU_CLIPBOARD_PEER_UPDATE).
  *
  * Clipboard notify data.
  */
@@ -94,7 +118,26 @@ struct QemuClipboardNotify {
     QemuClipboardNotifyType type;
     union {
         QemuClipboardInfo *info;
+        QemuClipboardPeerUpdate peer_update;
     };
+};
+
+
+/**
+ * struct QemuClipboardContent
+ *
+ * @available: whether the data is available
+ * @requested: whether the data was requested
+ * @size: the size of the @data
+ * @data: the clipboard data
+ *
+ * Clipboard content.
+ */
+struct QemuClipboardContent {
+    bool available;
+    bool requested;
+    uint32_t size;
+    void *data;
 };
 
 /**
@@ -112,15 +155,10 @@ struct QemuClipboardNotify {
 struct QemuClipboardInfo {
     uint32_t refcount;
     QemuClipboardPeer *owner;
-    QemuClipboardSelection selection;
+    int selection; /* QemuClipboardSelection */
     bool has_serial;
     uint32_t serial;
-    struct {
-        bool available;
-        bool requested;
-        size_t size;
-        void *data;
-    } types[QEMU_CLIPBOARD_TYPE__COUNT];
+    QemuClipboardContent types[QEMU_CLIPBOARD_TYPE__COUNT];
 };
 
 /**
@@ -142,6 +180,13 @@ void qemu_clipboard_peer_register(QemuClipboardPeer *peer);
  * Unregister clipboard peer.
  */
 void qemu_clipboard_peer_unregister(QemuClipboardPeer *peer);
+
+/**
+ * qemu_clipboard_guest_peer_present
+ *
+ * Return TRUE if a guest side clipboard peer is currently registered.
+ */
+bool qemu_clipboard_guest_peer_present(void);
 
 /**
  * qemu_clipboard_peer_owns

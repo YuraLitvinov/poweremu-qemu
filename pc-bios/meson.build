@@ -2,14 +2,9 @@ roms = []
 if unpack_edk2_blobs
   fds = [
     'edk2-aarch64-code.fd',
-    'edk2-aarch64-secure-code.fd',
-    'edk2-arm-code.fd',
-    'edk2-arm-vars.fd',
-    'edk2-riscv-code.fd',
-    'edk2-riscv-vars.fd',
-    'edk2-i386-code.fd',
-    'edk2-i386-secure-code.fd',
-    'edk2-i386-vars.fd',
+    'edk2-aarch64-vars.fd',
+    'edk2-riscv64-code.fd',
+    'edk2-riscv64-vars.fd',
     'edk2-x86_64-code.fd',
     'edk2-x86_64-secure-code.fd',
     'edk2-loongarch64-code.fd',
@@ -29,6 +24,7 @@ if unpack_edk2_blobs
 endif
 
 blobs = [
+  'ast27x0_bootrom.bin',
   'bios.bin',
   'bios-256k.bin',
   'bios-microvm.bin',
@@ -62,9 +58,7 @@ blobs = [
   'efi-e1000e.rom',
   'efi-vmxnet3.rom',
   'qemu-nsis.bmp',
-  'multiboot.bin',
   'multiboot_dma.bin',
-  'linuxboot.bin',
   'linuxboot_dma.bin',
   'kvmvapic.bin',
   'pvh.bin',
@@ -74,11 +68,22 @@ blobs = [
   'pnv-pnor.bin',
   'palcode-clipper',
   'u-boot.e500',
-  'u-boot-sam460-20100605.bin',
+  'u-boot-sam460.bin',
   'qemu_vga.ndrv',
   'edk2-licenses.txt',
   'hppa-firmware.img',
   'hppa-firmware64.img',
+  'hexagon_booter_qcs6490_cdsp',
+  'hexagon_loadlinux_qcs6490_cdsp',
+  'hexagon_booter_sm8975_nsp',
+  'hexagon_loadlinux_sm8975_nsp',
+  'hexagon_booter_sa8775p_cdsp',
+  'hexagon_loadlinux_sa8775p_cdsp',
+  'hexagon_booter_sc8480xp_nsp0',
+  'hexagon_loadlinux_sc8480xp_nsp0',
+  'hexagon_booter_sa8797p_nsp0',
+  'hexagon_loadlinux_sa8797p_nsp0',
+  'hexagon-hypervisor-license.txt',
   'opensbi-riscv32-generic-fw_dynamic.bin',
   'opensbi-riscv64-generic-fw_dynamic.bin',
   'npcm7xx_bootrom.bin',
@@ -87,31 +92,10 @@ blobs = [
   'vof-nvram.bin',
 ]
 
-dtc = find_program('dtc', required: false)
-foreach f : [
-  'bamboo.dts',
-  'canyonlands.dts',
-  'petalogix-s3adsp1800.dts',
-  'petalogix-ml605.dts',
-]
-  out = fs.replace_suffix(f, '.dtb')
-  if dtc.found()
-    custom_target(f,
-        build_by_default: have_system,
-        input: files(f),
-        output: out,
-        install: get_option('install_blobs'),
-        install_dir: qemu_datadir,
-        command: [ dtc, '-q', '-I', 'dts', '-O', 'dtb',
-                        '-o', '@OUTPUT@', '@INPUT0@' ])
-  else
-    blobs += out
-  endif
-endforeach
-
 if get_option('install_blobs')
-  install_data(blobs, install_dir: qemu_datadir)
+  install_data(blobs, install_dir: qemu_datadir, install_mode: 'rw-r--r--')
 endif
 
 subdir('descriptors')
+subdir('dtb')
 subdir('keymaps')

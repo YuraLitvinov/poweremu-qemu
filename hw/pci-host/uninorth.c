@@ -23,81 +23,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/module.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci-host/uninorth.h"
-#include "qemu/range.h"
 #include "trace.h"
-
-/*
- * UniNorth AGP GART table base.
- *
- * Mac OS X's AGP driver programs the physical address of the GART page
- * table into the AGP bridge's PCI config space at UNI_N_CFG_GART_BASE.
- * The ppc-mac-gpu device needs it to translate AGP aperture addresses,
- * because the bridge's GART is often programmed to a different table than
- * the GPU's own AIC_PT_BASE.
- */
-#define UNI_N_CFG_GART_BASE 0x8c
-
-/*
- * Real Uni-North AGP bridge layout (see Linux drivers/char/agp/uninorth-agp.c):
- * the AGP capability sits at 0x80 and fills 0x80-0x8b, and the GART
- * registers follow immediately after it.
- */
-#define UNI_N_AGP_CAP_OFFSET   0x80
-#define UNI_N_CFG_AGP_BASE     0x90
-#define UNI_N_CFG_GART_CTRL    0x94
-#define UNI_N_CFG_INTERNAL_STATUS 0x98
-
-/*
- * Advertise an AGP capability on a host bridge and make its GART registers
- * writable.  Apple's AppleMacRiscAGP::configure() looks for capability 2 on
- * the host bridge itself and refuses the whole bus without it; only then
- * will it create IOAGPDevice nubs for AGP-capable cards behind it.
- *
- * QEMU drops config writes outside the write mask, so the command and GART
- * registers must be marked writable or the guest's programming is lost.
- */
-static void unin_add_agp_capability(PCIDevice *d, Error **errp)
-{
-    int cap = pci_add_capability(d, PCI_CAP_ID_AGP, UNI_N_AGP_CAP_OFFSET,
-                                 12, errp);
-    if (cap < 0) {
-        return;
-    }
-    d->config[cap + 2] = 0x20;                      /* AGP revision 2.0 */
-    /* Status: RQ depth 0x1f, sideband addressing, 4x/2x/1x rates. */
-    pci_set_long(d->config + cap + 4, 0x1f000207);
-    pci_set_long(d->wmask + cap + 8, 0xffffffff);   /* AGP command */
-    pci_set_long(d->wmask + UNI_N_CFG_GART_BASE, 0xffffffff);
-    pci_set_long(d->wmask + UNI_N_CFG_AGP_BASE, 0xffffffff);
-    pci_set_long(d->wmask + UNI_N_CFG_GART_CTRL, 0xffffffff);
-
-    /*
-     * Internal status, bit 0: AGP state machine idle/ready.  After enabling
-     * AGP, AppleMacRiscAGP::setAGPEnable() spins on this bit with no
-     * timeout; left at 0 it hangs the boot in a tight config-read loop.
-     * An emulated link is always ready, so report it permanently set.
-     */
-    pci_set_long(d->config + UNI_N_CFG_INTERNAL_STATUS, 0x00000001);
-}
-
-static hwaddr unin_agp_gart_base;
-static uint32_t unin_agp_gart_gen;     /* bumped on any GART register write */
-
-uint32_t uninorth_get_agp_gart_gen(void)
-{
-    return qatomic_read(&unin_agp_gart_gen);
-}
-
-hwaddr uninorth_get_agp_gart_base(void)
-{
-    return unin_agp_gart_base;
-}
 
 static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
 {
@@ -220,16 +152,9 @@ static void pci_unin_main_init(Object *obj)
     memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
                           "unin-pci-isa-mmio", 0x00800000);
 
-    /*
-     * 1 GB (0x80000000-0xbfffffff) rather than the 256 MB of the stock
-     * machine: a graphics card's VRAM BAR is aligned to its size, so 128 MB
-     * pushes the register BAR to 0x90000000 and 256 MB further still, where
-     * the CPU could not reach it through a 256 MB hole.  Nothing else lives
-     * at 0x9xxxxxxx-0xbxxxxxxx on mac99.
-     */
     memory_region_init_alias(&s->pci_hole, OBJECT(s),
                              "unin-pci-hole", &s->pci_mmio,
-                             0x80000000ULL, 0x40000000ULL);
+                             0x80000000ULL, 0x10000000ULL);
 
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
@@ -349,16 +274,6 @@ static void pci_unin_internal_init(Object *obj)
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }
 
-/*
- * The main PCI host bridge (0xf2000000) carries the boot disk, USB and
- * mac-io, so presenting it as AGP-capable is opt-in:
- *   -global uni-north-pci.agp-capable=on
- */
-typedef struct UNINMainPCIHost {
-    PCIDevice parent_obj;
-    bool agp_capable;
-} UNINMainPCIHost;
-
 static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
@@ -367,18 +282,13 @@ static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
 
     /*
      * Set kMacRISCPCIAddressSelect (0x48) register to indicate PCI
-     * memory space for Apple's AppleMacRiscPCI/AGP driver: the upper 16
-     * bits select 256 MB regions, bit n for n * 256 MB.  Bits 8-11:
-     * 0x80000000-0xbfffffff, matching the 1 GB hole above.
+     * memory space with base 0x80000000, size 0x10000000 for Apple's
+     * AppleMacRiscPCI driver
      */
     d->config[0x48] = 0x0;
     d->config[0x49] = 0x0;
     d->config[0x4a] = 0x0;
-    d->config[0x4b] = 0xf;
-
-    if (((UNINMainPCIHost *)d)->agp_capable) {
-        unin_add_agp_capability(d, errp);
-    }
+    d->config[0x4b] = 0x1;
 }
 
 static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
@@ -386,25 +296,6 @@ static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
     d->config[PCI_LATENCY_TIMER] = 0x10;
     /* d->config[PCI_CAPABILITY_LIST] = 0x80; */
-}
-
-static void unin_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
-                                           uint32_t val, int len)
-{
-    pci_default_write_config(d, addr, val, len);
-
-    /* GART base / aperture / control (invalidate) - drop cached translations */
-    if (ranges_overlap(addr, len, UNI_N_CFG_GART_BASE, 12)) {
-        qatomic_inc(&unin_agp_gart_gen);
-    }
-    if (ranges_overlap(addr, len, UNI_N_CFG_GART_BASE, 4)) {
-        uint32_t base = pci_get_long(d->config + UNI_N_CFG_GART_BASE);
-        /*
-         * The low bits carry control flags (bit 0 enables the GART); the
-         * table itself is page aligned.
-         */
-        unin_agp_gart_base = (hwaddr)(base & ~0xFFFU);
-    }
 }
 
 static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
@@ -420,20 +311,14 @@ static void unin_internal_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[PCI_CAPABILITY_LIST] = 0x00;
 }
 
-static const Property unin_main_pci_host_props[] = {
-    DEFINE_PROP_BOOL("agp-capable", UNINMainPCIHost, agp_capable, false),
-};
-
-static void unin_main_pci_host_class_init(ObjectClass *klass, void *data)
+static void unin_main_pci_host_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->realize   = unin_main_pci_host_realize;
-    k->config_write = unin_agp_pci_host_config_write;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_PCI;
-    device_class_set_props(dc, unin_main_pci_host_props);
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
     /*
@@ -446,15 +331,15 @@ static void unin_main_pci_host_class_init(ObjectClass *klass, void *data)
 static const TypeInfo unin_main_pci_host_info = {
     .name = "uni-north-pci",
     .parent = TYPE_PCI_DEVICE,
-    .instance_size = sizeof(UNINMainPCIHost),
+    .instance_size = sizeof(PCIDevice),
     .class_init = unin_main_pci_host_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },
 };
 
-static void u3_agp_pci_host_class_init(ObjectClass *klass, void *data)
+static void u3_agp_pci_host_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -476,19 +361,18 @@ static const TypeInfo u3_agp_pci_host_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCIDevice),
     .class_init = u3_agp_pci_host_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },
 };
 
-static void unin_agp_pci_host_class_init(ObjectClass *klass, void *data)
+static void unin_agp_pci_host_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->realize   = unin_agp_pci_host_realize;
-    k->config_write = unin_agp_pci_host_config_write;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_AGP;
     k->revision  = 0x00;
@@ -505,13 +389,14 @@ static const TypeInfo unin_agp_pci_host_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCIDevice),
     .class_init = unin_agp_pci_host_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },
 };
 
-static void unin_internal_pci_host_class_init(ObjectClass *klass, void *data)
+static void unin_internal_pci_host_class_init(ObjectClass *klass,
+                                              const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -533,7 +418,7 @@ static const TypeInfo unin_internal_pci_host_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCIDevice),
     .class_init = unin_internal_pci_host_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },
@@ -543,14 +428,13 @@ static const Property pci_unin_main_pci_host_props[] = {
     DEFINE_PROP_UINT32("ofw-addr", UNINHostState, ofw_addr, -1),
 };
 
-static void pci_unin_main_class_init(ObjectClass *klass, void *data)
+static void pci_unin_main_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SysBusDeviceClass *sbc = SYS_BUS_DEVICE_CLASS(klass);
 
     dc->realize = pci_unin_main_realize;
     device_class_set_props(dc, pci_unin_main_pci_host_props);
-    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
     dc->fw_name = "pci";
     sbc->explicit_ofw_unit_address = pci_unin_main_ofw_unit_address;
 }
@@ -563,12 +447,11 @@ static const TypeInfo pci_unin_main_info = {
     .class_init    = pci_unin_main_class_init,
 };
 
-static void pci_u3_agp_class_init(ObjectClass *klass, void *data)
+static void pci_u3_agp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = pci_u3_agp_realize;
-    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
 }
 
 static const TypeInfo pci_u3_agp_info = {
@@ -579,12 +462,11 @@ static const TypeInfo pci_u3_agp_info = {
     .class_init    = pci_u3_agp_class_init,
 };
 
-static void pci_unin_agp_class_init(ObjectClass *klass, void *data)
+static void pci_unin_agp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = pci_unin_agp_realize;
-    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
 }
 
 static const TypeInfo pci_unin_agp_info = {
@@ -595,12 +477,11 @@ static const TypeInfo pci_unin_agp_info = {
     .class_init    = pci_unin_agp_class_init,
 };
 
-static void pci_unin_internal_class_init(ObjectClass *klass, void *data)
+static void pci_unin_internal_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = pci_unin_internal_realize;
-    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
 }
 
 static const TypeInfo pci_unin_internal_info = {
@@ -651,7 +532,7 @@ static void unin_init(Object *obj)
     sysbus_init_mmio(sbd, &s->mem);
 }
 
-static void unin_class_init(ObjectClass *klass, void *data)
+static void unin_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

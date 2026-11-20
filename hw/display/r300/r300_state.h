@@ -63,7 +63,11 @@ static inline bool r300_state_owns(uint32_t addr)
 
 /* Print every non-zero register (with names where known) and the live
  * part of PVS memory, for reverse-engineering what a driver programs. */
-void r300_state_dump(const R300State *st, FILE *f);
+typedef void (*R300WriteFn)(void *ctx, const uint8_t *text, size_t len);
+
+/* Same text as the C dump wrote to a FILE; the Rust implementation hands it
+ * to write(ctx, ...) in pieces. */
+void r300_state_dump(const R300State *st, R300WriteFn write, void *ctx);
 
 /* Register name for traces, or NULL. */
 const char *r300_reg_name(uint32_t addr);

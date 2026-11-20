@@ -1,3 +1,5 @@
+.. _confidential-guest-support:
+
 Confidential Guest Support
 ==========================
 
@@ -38,7 +40,9 @@ Supported mechanisms
 Currently supported confidential guest mechanisms are:
 
 * AMD Secure Encrypted Virtualization (SEV) (see :doc:`i386/amd-memory-encryption`)
+* Intel Trust Domain Extension (TDX) (see :doc:`i386/tdx`)
 * POWER Protected Execution Facility (PEF) (see :ref:`power-papr-protected-execution-facility-pef`)
 * s390x Protected Virtualization (PV) (see :doc:`s390x/protvirt`)
+* AWS Nitro Enclaves (see :doc:`nitro`)
 
 Other mechanisms may be supported in future.

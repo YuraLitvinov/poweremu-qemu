@@ -12,9 +12,10 @@
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "hw/misc/aspeed_sdmc.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "trace.h"
 #include "qemu/units.h"
 #include "qemu/cutils.h"
@@ -199,9 +200,9 @@ static const MemoryRegionOps aspeed_sdmc_ops = {
     .valid.max_access_size = 4,
 };
 
-static void aspeed_sdmc_reset(DeviceState *dev)
+static void aspeed_sdmc_reset_hold(Object *obj, ResetType type)
 {
-    AspeedSDMCState *s = ASPEED_SDMC(dev);
+    AspeedSDMCState *s = ASPEED_SDMC(obj);
     AspeedSDMCClass *asc = ASPEED_SDMC_GET_CLASS(s);
 
     memset(s->regs, 0, sizeof(s->regs));
@@ -259,7 +260,7 @@ static void aspeed_sdmc_set_ram_size(Object *obj, Visitor *v, const char *name,
 
 static void aspeed_sdmc_initfn(Object *obj)
 {
-    object_property_add(obj, "ram-size", "int",
+    object_property_add(obj, "ram-size", "int", &int_type_info,
                         aspeed_sdmc_get_ram_size, aspeed_sdmc_set_ram_size,
                         NULL, NULL);
 }
@@ -299,25 +300,16 @@ static const Property aspeed_sdmc_properties[] = {
     DEFINE_PROP_BOOL("unlocked", AspeedSDMCState, unlocked, false),
 };
 
-static void aspeed_sdmc_class_init(ObjectClass *klass, void *data)
+static void aspeed_sdmc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
     dc->realize = aspeed_sdmc_realize;
-    device_class_set_legacy_reset(dc, aspeed_sdmc_reset);
+    rc->phases.hold = aspeed_sdmc_reset_hold;
     dc->desc = "ASPEED SDRAM Memory Controller";
     dc->vmsd = &vmstate_aspeed_sdmc;
     device_class_set_props(dc, aspeed_sdmc_properties);
 }
-
-static const TypeInfo aspeed_sdmc_info = {
-    .name = TYPE_ASPEED_SDMC,
-    .parent = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(AspeedSDMCState),
-    .instance_init = aspeed_sdmc_initfn,
-    .class_init = aspeed_sdmc_class_init,
-    .class_size = sizeof(AspeedSDMCClass),
-    .abstract   = true,
-};
 
 static int aspeed_sdmc_get_ram_bits(AspeedSDMCState *s)
 {
@@ -380,7 +372,7 @@ static void aspeed_2400_sdmc_write(AspeedSDMCState *s, uint32_t reg,
 static const uint64_t
 aspeed_2400_ram_sizes[] = { 64 * MiB, 128 * MiB, 256 * MiB, 512 * MiB, 0};
 
-static void aspeed_2400_sdmc_class_init(ObjectClass *klass, void *data)
+static void aspeed_2400_sdmc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     AspeedSDMCClass *asc = ASPEED_SDMC_CLASS(klass);
@@ -391,12 +383,6 @@ static void aspeed_2400_sdmc_class_init(ObjectClass *klass, void *data)
     asc->write = aspeed_2400_sdmc_write;
     asc->valid_ram_sizes = aspeed_2400_ram_sizes;
 }
-
-static const TypeInfo aspeed_2400_sdmc_info = {
-    .name = TYPE_ASPEED_2400_SDMC,
-    .parent = TYPE_ASPEED_SDMC,
-    .class_init = aspeed_2400_sdmc_class_init,
-};
 
 static uint32_t aspeed_2500_sdmc_compute_conf(AspeedSDMCState *s, uint32_t data)
 {
@@ -448,7 +434,7 @@ static void aspeed_2500_sdmc_write(AspeedSDMCState *s, uint32_t reg,
 static const uint64_t
 aspeed_2500_ram_sizes[] = { 128 * MiB, 256 * MiB, 512 * MiB, 1024 * MiB, 0};
 
-static void aspeed_2500_sdmc_class_init(ObjectClass *klass, void *data)
+static void aspeed_2500_sdmc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     AspeedSDMCClass *asc = ASPEED_SDMC_CLASS(klass);
@@ -459,12 +445,6 @@ static void aspeed_2500_sdmc_class_init(ObjectClass *klass, void *data)
     asc->write = aspeed_2500_sdmc_write;
     asc->valid_ram_sizes = aspeed_2500_ram_sizes;
 }
-
-static const TypeInfo aspeed_2500_sdmc_info = {
-    .name = TYPE_ASPEED_2500_SDMC,
-    .parent = TYPE_ASPEED_SDMC,
-    .class_init = aspeed_2500_sdmc_class_init,
-};
 
 static uint32_t aspeed_2600_sdmc_compute_conf(AspeedSDMCState *s, uint32_t data)
 {
@@ -542,7 +522,7 @@ static void aspeed_2600_sdmc_write(AspeedSDMCState *s, uint32_t reg,
 static const uint64_t
 aspeed_2600_ram_sizes[] = { 256 * MiB, 512 * MiB, 1024 * MiB, 2048 * MiB, 0};
 
-static void aspeed_2600_sdmc_class_init(ObjectClass *klass, void *data)
+static void aspeed_2600_sdmc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     AspeedSDMCClass *asc = ASPEED_SDMC_CLASS(klass);
@@ -554,21 +534,18 @@ static void aspeed_2600_sdmc_class_init(ObjectClass *klass, void *data)
     asc->valid_ram_sizes = aspeed_2600_ram_sizes;
 }
 
-static const TypeInfo aspeed_2600_sdmc_info = {
-    .name = TYPE_ASPEED_2600_SDMC,
-    .parent = TYPE_ASPEED_SDMC,
-    .class_init = aspeed_2600_sdmc_class_init,
-};
-
-static void aspeed_2700_sdmc_reset(DeviceState *dev)
+static void aspeed_2700_sdmc_reset_hold(Object *obj, ResetType type)
 {
-    AspeedSDMCState *s = ASPEED_SDMC(dev);
+    AspeedSDMCState *s = ASPEED_SDMC(obj);
     AspeedSDMCClass *asc = ASPEED_SDMC_GET_CLASS(s);
 
     memset(s->regs, 0, sizeof(s->regs));
 
     /* Set ram size bit and defaults values */
     s->regs[R_MAIN_CONF] = asc->compute_conf(s, 0);
+
+    /* Skipping dram init */
+    s->regs[R_MAIN_CONTROL] = BIT(16);
 
     if (s->unlocked) {
         s->regs[R_2700_PROT] = PROT_UNLOCKED;
@@ -670,13 +647,14 @@ static const uint64_t
     aspeed_2700_ram_sizes[] = { 256 * MiB, 512 * MiB, 1024 * MiB,
                                 2048 * MiB, 4096 * MiB, 8192 * MiB, 0};
 
-static void aspeed_2700_sdmc_class_init(ObjectClass *klass, void *data)
+static void aspeed_2700_sdmc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
     AspeedSDMCClass *asc = ASPEED_SDMC_CLASS(klass);
 
     dc->desc = "ASPEED 2700 SDRAM Memory Controller";
-    device_class_set_legacy_reset(dc, aspeed_2700_sdmc_reset);
+    rc->phases.hold = aspeed_2700_sdmc_reset_hold;
 
     asc->is_bus64bit = true;
     asc->max_ram_size = 8 * GiB;
@@ -685,19 +663,36 @@ static void aspeed_2700_sdmc_class_init(ObjectClass *klass, void *data)
     asc->valid_ram_sizes = aspeed_2700_ram_sizes;
 }
 
-static const TypeInfo aspeed_2700_sdmc_info = {
-    .name = TYPE_ASPEED_2700_SDMC,
-    .parent = TYPE_ASPEED_SDMC,
-    .class_init = aspeed_2700_sdmc_class_init,
+static const TypeInfo aspeed_sdmc_types[] = {
+    {
+        .name = TYPE_ASPEED_SDMC,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AspeedSDMCState),
+        .instance_init = aspeed_sdmc_initfn,
+        .class_init = aspeed_sdmc_class_init,
+        .class_size = sizeof(AspeedSDMCClass),
+        .abstract   = true,
+    },
+    {
+        .name = TYPE_ASPEED_2400_SDMC,
+        .parent = TYPE_ASPEED_SDMC,
+        .class_init = aspeed_2400_sdmc_class_init,
+    },
+    {
+        .name = TYPE_ASPEED_2500_SDMC,
+        .parent = TYPE_ASPEED_SDMC,
+        .class_init = aspeed_2500_sdmc_class_init,
+    },
+    {
+        .name = TYPE_ASPEED_2600_SDMC,
+        .parent = TYPE_ASPEED_SDMC,
+        .class_init = aspeed_2600_sdmc_class_init,
+    },
+    {
+        .name = TYPE_ASPEED_2700_SDMC,
+        .parent = TYPE_ASPEED_SDMC,
+        .class_init = aspeed_2700_sdmc_class_init,
+    }
 };
 
-static void aspeed_sdmc_register_types(void)
-{
-    type_register_static(&aspeed_sdmc_info);
-    type_register_static(&aspeed_2400_sdmc_info);
-    type_register_static(&aspeed_2500_sdmc_info);
-    type_register_static(&aspeed_2600_sdmc_info);
-    type_register_static(&aspeed_2700_sdmc_info);
-}
-
-type_init(aspeed_sdmc_register_types);
+DEFINE_TYPES(aspeed_sdmc_types)

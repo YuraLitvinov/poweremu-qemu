@@ -1,10 +1,12 @@
 //! R300 shader compilation: the GLSL from `r300_us_to_glsl()` to SPIR-V
-//! (`r300_spirv.c`, the shaderc half).
+//! (`r300_spirv.c`, the shaderc half), through the safe `shaderc` crate.
 //!
 //! The SPIR-V to MSL half of the C file serves the Metal backend and is not
 //! ported.
 
-use crate::ffi::{compile_glsl, ShaderKind};
+use std::sync::Mutex;
+
+use shaderc::{CompileOptions, Compiler, EnvVersion, ShaderKind, SpirvVersion, TargetEnv};
 
 /// The stage of a GLSL source that holds all of them behind macros.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,18 +28,12 @@ impl Stage {
             Stage::FsZ => "r300_fs_z",
         }
     }
-
-    fn entry_c(self) -> &'static core::ffi::CStr {
-        match self {
-            Stage::Vs => c"r300_vs",
-            Stage::Fs => c"r300_fs",
-            Stage::FsZ => c"r300_fs_z",
-        }
-    }
 }
 
-/// Compiles one stage of an `r300_us_to_glsl()` source to SPIR-V.  The error
-/// is the compiler's message.
+static COMPILER: Mutex<Option<Compiler>> = Mutex::new(None);
+
+/// Compiles one stage of an `r300_us_to_glsl()` source to SPIR-V 1.3 for Vulkan
+/// 1.1.  The error is the compiler's message.
 pub fn glsl_to_spirv(glsl: &str, stage: Stage) -> Result<Vec<u32>, String> {
     let (kind, defines): (_, &[&str]) = match stage {
         Stage::Vs => (ShaderKind::Vertex, &["R300_VS"]),
@@ -45,5 +41,20 @@ pub fn glsl_to_spirv(glsl: &str, stage: Stage) -> Result<Vec<u32>, String> {
         // The Z-pass shader is the fragment shader plus the Z export.
         Stage::FsZ => (ShaderKind::Fragment, &["R300_FS_Z", "R300_FS"]),
     };
-    compile_glsl(glsl, kind, stage.entry_c(), defines)
+    let mut guard = COMPILER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(Compiler::new().map_err(|_| "shaderc: cannot initialise the compiler".to_string())?);
+    }
+    let compiler = guard.as_ref().expect("initialised above");
+    let mut options = CompileOptions::new().map_err(|_| "shaderc: out of memory".to_string())?;
+    options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_1 as u32);
+    options.set_target_spirv(SpirvVersion::V1_3);
+    for name in defines {
+        options.add_macro_definition(name, Some("1"));
+    }
+    match compiler.compile_into_spirv(glsl, kind, stage.entry(), "main", Some(&options)) {
+        Ok(artifact) => Ok(artifact.as_binary().to_vec()),
+        Err(shaderc::Error::CompilationError(_, msg)) => Err(format!("GLSL: {msg}")),
+        Err(e) => Err(format!("GLSL: {e}")),
+    }
 }

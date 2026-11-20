@@ -1,0 +1,6 @@
+[wrap-file]
+directory = c2rust-bitfields-0.22.1
+source_url = https://crates.io/api/v1/crates/c2rust-bitfields/0.22.1/download
+source_filename = c2rust-bitfields-0.22.1.tar.gz
+source_hash = e91b9a85391b09c224053f3c45344f0639822e641f9d2b4f351bb3152600742d
+method = cargo

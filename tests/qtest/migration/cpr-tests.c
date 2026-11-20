@@ -15,7 +15,17 @@
 #include "migration/framework.h"
 #include "migration/migration-qmp.h"
 #include "migration/migration-util.h"
+#include "qapi/error.h"
+#include "qobject/qjson.h"
+#include "qobject/qlist.h"
 
+#ifdef CONFIG_LINUX
+#include <sys/ioctl.h>
+#include <linux/vhost.h>
+#endif
+
+/* We expect this CID to be unassigned on the host */
+#define VHOST_VSOCK_TEST_DEV "vhost-vsock-pci,guest-cid=4000000000"
 
 static char *tmpfs;
 
@@ -24,30 +34,73 @@ static void *migrate_hook_start_mode_reboot(QTestState *from, QTestState *to)
     migrate_set_parameter_str(from, "mode", "cpr-reboot");
     migrate_set_parameter_str(to, "mode", "cpr-reboot");
 
-    migrate_set_capability(from, "x-ignore-shared", true);
-    migrate_set_capability(to, "x-ignore-shared", true);
-
     return NULL;
 }
 
-static void test_mode_reboot(void)
+static void test_mode_reboot(char *name, MigrateCommon *args)
 {
     g_autofree char *uri = g_strdup_printf("file:%s/%s", tmpfs,
                                            FILE_TEST_FILENAME);
-    MigrateCommon args = {
-        .start.use_shmem = true,
-        .connect_uri = uri,
-        .listen_uri = "defer",
-        .start_hook = migrate_hook_start_mode_reboot,
-    };
 
-    test_file_common(&args, true);
+    args->uri = uri;
+    args->start_hook = migrate_hook_start_mode_reboot;
+
+    args->start.mem_type = MEM_TYPE_SHMEM;
+    args->start.caps[MIGRATION_CAPABILITY_X_IGNORE_SHARED] = true;
+
+    test_file_common(args, true);
 }
 
-static void *test_mode_transfer_start(QTestState *from, QTestState *to)
+static int test_transfer(MigrateCommon *args, const char *cpr_channel,
+                         bool incoming_defer)
 {
+    QTestState *from, *to;
+    QObject *obj, *out_channels = qobject_from_json(args->connect_channels,
+                                                    &error_abort);
+    QList *channels_list;
+
+    /*
+     * The cpr channel must be included in outgoing channels, but not in
+     * migrate-incoming channels.
+     */
+    channels_list = qobject_to(QList, out_channels);
+    obj = migrate_str_to_channel(cpr_channel);
+    qlist_append(channels_list, obj);
+
+    if (migrate_start(&from, &to, &args->start)) {
+        return -1;
+    }
+
     migrate_set_parameter_str(from, "mode", "cpr-transfer");
-    return NULL;
+
+    wait_for_serial("src_serial");
+
+    qtest_qmp_assert_success(from, "{ 'execute' : 'stop'}");
+    wait_for_stop(from, get_src());
+    migrate_ensure_converge(from);
+
+    migrate_qmp(from, to, NULL, out_channels, "{}");
+
+    qtest_connect(to);
+    qtest_qmp_handshake(to, NULL);
+    if (incoming_defer) {
+        QObject *in_channels = qobject_from_json(args->connect_channels,
+                                                 &error_abort);
+
+        migrate_incoming_qmp(to, NULL, in_channels, "{}");
+    }
+
+    wait_for_migration_complete(from);
+    wait_for_migration_complete(to);
+
+    qtest_qmp_assert_success(to, "{ 'execute' : 'cont'}");
+
+    wait_for_resume(to, get_dst());
+    wait_for_serial("dest_serial");
+
+    migrate_end(from, to, true);
+
+    return 0;
 }
 
 /*
@@ -55,18 +108,20 @@ static void *test_mode_transfer_start(QTestState *from, QTestState *to)
  * migration, and cannot connect synchronously to the monitor, so defer
  * the target connection.
  */
-static void test_mode_transfer_common(bool incoming_defer)
+static void test_mode_transfer_common(MigrateCommon *args, bool incoming_defer,
+                                      const char *dev_opts)
 {
     g_autofree char *cpr_path = g_strdup_printf("%s/cpr.sock", tmpfs);
     g_autofree char *mig_path = g_strdup_printf("%s/migsocket", tmpfs);
     g_autofree char *uri = g_strdup_printf("unix:%s", mig_path);
+    g_autofree char *opts_target = NULL;
 
-    const char *opts = "-machine aux-ram-share=on -nodefaults";
+    g_autofree char *opts = g_strdup_printf("-machine aux-ram-share=on "
+                                            "-nodefaults %s",
+                                            dev_opts ? dev_opts : "");
     g_autofree const char *cpr_channel = g_strdup_printf(
         "cpr,addr.transport=socket,addr.type=unix,addr.path=%s",
         cpr_path);
-    g_autofree char *opts_target = g_strdup_printf("-incoming %s %s",
-                                                   cpr_channel, opts);
 
     g_autofree char *connect_channels = g_strdup_printf(
         "[ { 'channel-type': 'main',"
@@ -75,29 +130,277 @@ static void test_mode_transfer_common(bool incoming_defer)
         "              'path': '%s' } } ]",
         mig_path);
 
-    MigrateCommon args = {
-        .start.opts_source = opts,
-        .start.opts_target = opts_target,
-        .start.defer_target_connect = true,
-        .start.memory_backend = "-object memory-backend-memfd,id=pc.ram,size=%s"
-                                " -machine memory-backend=pc.ram",
-        .listen_uri = incoming_defer ? "defer" : uri,
-        .connect_channels = connect_channels,
-        .cpr_channel = cpr_channel,
-        .start_hook = test_mode_transfer_start,
+    /*
+     * Set up a UNIX domain socket for the CPR channel before
+     * launching the destination VM, to avoid timing issues
+     * during connection setup.
+     */
+    int cpr_sockfd = qtest_socket_server(cpr_path);
+    g_assert(cpr_sockfd >= 0);
+
+    if (incoming_defer) {
+        opts_target = g_strdup_printf("-incoming cpr,addr.transport=socket,"
+                                      "addr.type=fd,addr.str=%d %s",
+                                      cpr_sockfd, opts);
+    } else {
+        opts_target = g_strdup_printf("-incoming %s "
+                                      "-incoming cpr,addr.transport=socket,"
+                                      "addr.type=fd,addr.str=%d %s",
+                                      uri, cpr_sockfd, opts);
+    }
+
+    args->connect_channels = connect_channels;
+
+    args->start.opts_source = opts;
+    args->start.opts_target = opts_target;
+    args->start.defer_target_connect = true;
+    args->start.mem_type = MEM_TYPE_MEMFD;
+
+    if (test_transfer(args, cpr_channel, incoming_defer) < 0) {
+        close(cpr_sockfd);
+        unlink(cpr_path);
+    }
+}
+
+static void test_mode_transfer(char *name, MigrateCommon *args)
+{
+    test_mode_transfer_common(args, false, NULL);
+}
+
+static void test_mode_transfer_defer(char *name, MigrateCommon *args)
+{
+    test_mode_transfer_common(args, true, NULL);
+}
+
+static void set_cpr_exec_args(QTestState *who, MigrateCommon *args)
+{
+    g_autofree char *qtest_from_args = NULL;
+    g_autofree char *from_args = NULL;
+    g_autofree char *to_args = NULL;
+    g_autofree char *exec_args = NULL;
+    g_auto(GStrv) argv = NULL;
+    char *from_str, *src, *dst;
+    int ret;
+
+    /*
+     * hide_stderr appends "2>/dev/null" to the command line, but cpr-exec
+     * passes the command-line words to execv, not to the shell, so suppress it
+     * here.  fd 2 was already bound in the source VM, and execv preserves it.
+     */
+    g_assert(args->start.hide_stderr == false);
+
+    ret = migrate_args(&from_args, &to_args, &args->start);
+    g_assert(!ret);
+    qtest_from_args = qtest_qemu_args(from_args);
+
+    /*
+     * The generated args may have been formatted using "%s %s" with empty
+     * strings, which can produce consecutive spaces, which g_strsplit would
+     * convert into empty strings.  Ditto for leading and trailing space.
+     * De-dup spaces to avoid that.
+     */
+
+    from_str = src = dst = g_strstrip(qtest_from_args);
+    do {
+        if (*src != ' ' || src[-1] != ' ') {
+            *dst++ = *src;
+        }
+    } while (*src++);
+
+    exec_args = g_strconcat(qtest_qemu_binary(migration_get_env()->qemu_dst),
+                            " -incoming defer ", from_str, NULL);
+    argv = g_strsplit(exec_args, " ", -1);
+    migrate_set_parameter_strv(who, "cpr-exec-command", argv);
+}
+
+static void wait_for_migration_event(QTestState *who, const char *waitfor)
+{
+    QDict *rsp, *data;
+    bool done = false;
+
+    while (!done) {
+        const char *status;
+
+        rsp = qtest_qmp_eventwait_ref(who, "MIGRATION");
+        g_assert(qdict_haskey(rsp, "data"));
+        data = qdict_get_qdict(rsp, "data");
+        g_assert(qdict_haskey(data, "status"));
+        status = qdict_get_str(data, "status");
+        g_assert(strcmp(status, "failed"));
+        done = !strcmp(status, waitfor);
+        qobject_unref(rsp);
+    }
+}
+
+static void test_cpr_exec(MigrateCommon *args)
+{
+    QTestState *from, *to;
+    void *data_hook = NULL;
+    g_autofree char *connect_uri = g_strdup(args->uri);
+    g_autofree char *filename = g_strdup_printf("%s/%s", tmpfs,
+                                                FILE_TEST_FILENAME);
+
+    if (migrate_start(&from, NULL, &args->start)) {
+        return;
+    }
+
+    /* Source and dest never run concurrently */
+    g_assert_false(args->live);
+
+    if (args->start_hook) {
+        data_hook = args->start_hook(from, NULL);
+    }
+
+    wait_for_serial("src_serial");
+    set_cpr_exec_args(from, args);
+    migrate_set_capability(from, "events", true);
+    migrate_qmp(from, NULL, connect_uri, NULL, "{}");
+    wait_for_migration_event(from, "completed");
+
+    to = qtest_init_after_exec(from);
+
+    qtest_qmp_assert_success(to, "{ 'execute': 'migrate-incoming',"
+                             "  'arguments': { "
+                             "      'channels': [ { 'channel-type': 'main',"
+                             "      'addr': { 'transport': 'file',"
+                             "                'filename': %s,"
+                             "                'offset': 0  } } ] } }",
+                             filename);
+    wait_for_migration_complete(to);
+
+    wait_for_resume(to, get_dst());
+    /* Device on target is still named src_serial because args do not change */
+    wait_for_serial("src_serial");
+
+    if (args->end_hook) {
+        args->end_hook(from, to, data_hook);
+    }
+
+    migrate_end(from, to, args->result == MIG_TEST_SUCCEED);
+}
+
+static void *test_mode_exec_start(QTestState *from, QTestState *to)
+{
+    assert(!to);
+    migrate_set_parameter_str(from, "mode", "cpr-exec");
+    return NULL;
+}
+
+static void test_mode_exec_common(MigrateCommon *args, const char *dev_opts)
+{
+    g_autofree char *uri = g_strdup_printf("file:%s/%s", tmpfs,
+                                           FILE_TEST_FILENAME);
+    g_autofree char *opts = g_strdup_printf("-machine aux-ram-share=on "
+                                            "-nodefaults %s",
+                                            dev_opts ? dev_opts : "");
+    args->uri = uri;
+    args->start_hook = test_mode_exec_start;
+
+    args->start.only_source = true;
+    args->start.opts_source = opts;
+    args->start.mem_type = MEM_TYPE_MEMFD;
+
+    test_cpr_exec(args);
+}
+
+static void test_mode_exec(char *name, MigrateCommon *args)
+{
+    test_mode_exec_common(args, NULL);
+}
+
+/*
+ * A vhost-vsock device can be handed over across CPR only if the host
+ * exposes /dev/vhost-vsock and its kernel supports VHOST_RESET_OWNER
+ * for it.  Skip the test otherwise.
+ */
+static bool vhost_vsock_cpr_check(void)
+{
+#ifdef CONFIG_LINUX
+    bool set_owner, reset_owner;
+    int fd;
+
+    if (!qtest_has_device("vhost-vsock-pci")) {
+        g_test_skip("vhost-vsock-pci device is not available");
+        return false;
+    }
+
+    fd = open("/dev/vhost-vsock", O_RDWR);
+    if (fd < 0) {
+        g_test_skip("/dev/vhost-vsock is not available");
+        return false;
+    }
+
+    set_owner = ioctl(fd, VHOST_SET_OWNER) == 0;
+    reset_owner = ioctl(fd, VHOST_RESET_OWNER) == 0;
+    close(fd);
+
+    if (!set_owner) {
+        g_test_skip("VHOST_SET_OWNER is not supported for vhost-vsock");
+        return false;
+    }
+
+    if (!reset_owner) {
+        g_test_skip("VHOST_RESET_OWNER is not supported for vhost-vsock");
+        return false;
+    }
+
+    return true;
+#else
+    g_test_skip("vhost-vsock is Linux only");
+    return false;
+#endif
+}
+
+static void test_mode_transfer_vhost_vsock(char *name, MigrateCommon *args)
+{
+    if (vhost_vsock_cpr_check()) {
+        test_mode_transfer_common(args, false, "-device " VHOST_VSOCK_TEST_DEV);
+    }
+}
+
+static void test_mode_exec_vhost_vsock(char *name, MigrateCommon *args)
+{
+    if (vhost_vsock_cpr_check()) {
+        test_mode_exec_common(args, "-device " VHOST_VSOCK_TEST_DEV);
+    }
+}
+
+/* Snapshots must be refused while a CPR migration mode is set */
+static void test_mode_no_snapshot(char *name, MigrateCommon *args)
+{
+    static const char *const modes[] = {
+        "cpr-reboot", "cpr-transfer", "cpr-exec",
     };
+    QTestState *vm = qtest_init("-nodefaults -machine none");
+    char *out;
+    int i;
 
-    test_precopy_common(&args);
-}
+    for (i = 0; i < ARRAY_SIZE(modes); i++) {
+        g_autofree char *expected = g_strdup_printf(
+            "Snapshots are not compatible with migration mode %s", modes[i]);
 
-static void test_mode_transfer(void)
-{
-    test_mode_transfer_common(NULL);
-}
+        migrate_set_parameter_str(vm, "mode", modes[i]);
 
-static void test_mode_transfer_defer(void)
-{
-    test_mode_transfer_common(true);
+        out = qtest_hmp(vm, "savevm snap");
+        g_assert_nonnull(strstr(out, expected));
+        g_free(out);
+
+        out = qtest_hmp(vm, "loadvm snap");
+        g_assert_nonnull(strstr(out, expected));
+        g_free(out);
+    }
+
+    /*
+     * The check should no longer fire in normal mode.  savevm still fails
+     * (there's no block device for storing the snapshot).  We just check
+     * that it's not the mode error any more.
+     */
+    migrate_set_parameter_str(vm, "mode", "normal");
+    out = qtest_hmp(vm, "savevm snap");
+    g_assert_null(strstr(out, "not compatible with migration mode"));
+    g_free(out);
+
+    qtest_quit(vm);
 }
 
 void migration_test_add_cpr(MigrationTestEnv *env)
@@ -109,6 +412,8 @@ void migration_test_add_cpr(MigrationTestEnv *env)
     if (!env->full_set) {
         return;
     }
+
+    migration_test_add("/migration/mode/no-snapshot", test_mode_no_snapshot);
 
     /*
      * Our CI system has problems with shared memory.
@@ -122,5 +427,12 @@ void migration_test_add_cpr(MigrationTestEnv *env)
         migration_test_add("/migration/mode/transfer", test_mode_transfer);
         migration_test_add("/migration/mode/transfer/defer",
                            test_mode_transfer_defer);
+        migration_test_add("/migration/mode/exec", test_mode_exec);
     }
+
+    /* The vhost-vsock handoff doesn't need KVM */
+    migration_test_add("/migration/mode/transfer/vhost-vsock",
+                       test_mode_transfer_vhost_vsock);
+    migration_test_add("/migration/mode/exec/vhost-vsock",
+                       test_mode_exec_vhost_vsock);
 }

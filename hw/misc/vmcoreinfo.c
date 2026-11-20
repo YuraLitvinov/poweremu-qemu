@@ -83,7 +83,7 @@ static const VMStateDescription vmstate_vmcoreinfo = {
     },
 };
 
-static void vmcoreinfo_device_class_init(ObjectClass *klass, void *data)
+static void vmcoreinfo_device_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
@@ -101,6 +101,7 @@ static const TypeInfo vmcoreinfo_types[] = {
         .parent         = TYPE_DEVICE,
         .instance_size  = sizeof(VMCoreInfoState),
         .class_init     = vmcoreinfo_device_class_init,
+        .secure         = true,
     }
 };
 

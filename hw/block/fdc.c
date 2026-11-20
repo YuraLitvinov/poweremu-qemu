@@ -33,10 +33,10 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/memalign.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/isa/isa.h"
-#include "hw/qdev-properties.h"
-#include "hw/qdev-properties-system.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "hw/block/block.h"
 #include "system/block-backend.h"
@@ -196,6 +196,12 @@ static void fd_init(FDrive *drv)
 
 #define NUM_SIDES(drv) ((drv)->flags & FDISK_DBL_SIDES ? 2 : 1)
 
+/* Is a diskette present in the drive? */
+static bool fd_media_present(FDrive *drv)
+{
+    return drv->blk != NULL && blk_is_inserted(drv->blk);
+}
+
 static int fd_sector_calc(uint8_t head, uint8_t track, uint8_t sect,
                           uint8_t last_sect, uint8_t num_sides)
 {
@@ -216,12 +222,49 @@ static int fd_offset(FDrive *drv)
     return fd_sector(drv) << BDRV_SECTOR_BITS;
 }
 
+/* Reads the sector at the current position and accounts for the request */
+static int fd_read_sector(FDrive *drv, uint8_t *buf)
+{
+    BlockAcctStats *stats = blk_get_stats(drv->blk);
+    BlockAcctCookie acct;
+    int ret;
+
+    block_acct_start(stats, &acct, BDRV_SECTOR_SIZE, BLOCK_ACCT_READ);
+    ret = blk_pread(drv->blk, fd_offset(drv), BDRV_SECTOR_SIZE, buf, 0);
+    if (ret < 0) {
+        block_acct_failed(stats, &acct);
+    } else {
+        block_acct_done(stats, &acct);
+    }
+
+    return ret;
+}
+
+/* Writes the sector at the current position and accounts for the request */
+static int fd_write_sector(FDrive *drv, const uint8_t *buf)
+{
+    BlockAcctStats *stats = blk_get_stats(drv->blk);
+    BlockAcctCookie acct;
+    int ret;
+
+    block_acct_start(stats, &acct, BDRV_SECTOR_SIZE, BLOCK_ACCT_WRITE);
+    ret = blk_pwrite(drv->blk, fd_offset(drv), BDRV_SECTOR_SIZE, buf, 0);
+    if (ret < 0) {
+        block_acct_failed(stats, &acct);
+    } else {
+        block_acct_done(stats, &acct);
+    }
+
+    return ret;
+}
+
 /* Seek to a new position:
  * returns 0 if already on right track
  * returns 1 if track changed
  * returns 2 if track is invalid
  * returns 3 if sector is invalid
  * returns 4 if seek is disabled
+ * returns 5 if no floppy is inserted
  */
 static int fd_seek(FDrive *drv, uint8_t head, uint8_t track, uint8_t sect,
                    int enable_seek)
@@ -258,7 +301,7 @@ static int fd_seek(FDrive *drv, uint8_t head, uint8_t track, uint8_t sect,
 #endif
         drv->head = head;
         if (drv->track != track) {
-            if (drv->blk != NULL && blk_is_inserted(drv->blk)) {
+            if (fd_media_present(drv)) {
                 drv->media_changed = 0;
             }
             ret = 1;
@@ -267,8 +310,8 @@ static int fd_seek(FDrive *drv, uint8_t head, uint8_t track, uint8_t sect,
         drv->sect = sect;
     }
 
-    if (drv->blk == NULL || !blk_is_inserted(drv->blk)) {
-        ret = 2;
+    if (!fd_media_present(drv)) {
+        ret = 5;
     }
 
     return ret;
@@ -553,7 +596,7 @@ static void floppy_drive_realize(DeviceState *qdev, Error **errp)
     fd_revalidate(drive);
 }
 
-static void floppy_drive_class_init(ObjectClass *klass, void *data)
+static void floppy_drive_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *k = DEVICE_CLASS(klass);
     k->realize = floppy_drive_realize;
@@ -1051,7 +1094,7 @@ const VMStateDescription vmstate_fdc = {
         VMSTATE_UINT8(config, FDCtrl),
         VMSTATE_UINT8(lock, FDCtrl),
         VMSTATE_UINT8(pwrd, FDCtrl),
-        VMSTATE_UINT8_EQUAL(num_floppies, FDCtrl, NULL),
+        VMSTATE_UINT8_EQUAL(num_floppies, FDCtrl),
         VMSTATE_STRUCT_ARRAY(drives, FDCtrl, MAX_FD, 1,
                              vmstate_fdrive, FDrive),
         VMSTATE_END_OF_LIST()
@@ -1476,14 +1519,24 @@ static void fdctrl_start_transfer(FDCtrl *fdctrl, int direction)
                                   NUM_SIDES(cur_drv)));
     switch (fd_seek(cur_drv, kh, kt, ks, fdctrl->config & FD_CONFIG_EIS)) {
     case 2:
-        /* sect too big */
+        /* track/head out of range */
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, 0x00, 0x00);
         fdctrl->fifo[3] = kt;
         fdctrl->fifo[4] = kh;
         fdctrl->fifo[5] = ks;
         return;
+    case 5:
+        /*
+         * No medium: there is no address mark to be found.  Guests that tell
+         * an absent diskette from an unreadable one rely on ST1.MA.
+         */
+        fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_MA, 0x00);
+        fdctrl->fifo[3] = kt;
+        fdctrl->fifo[4] = kh;
+        fdctrl->fifo[5] = ks;
+        return;
     case 3:
-        /* track too big */
+        /* sector too big */
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_EC, 0x00);
         fdctrl->fifo[3] = kt;
         fdctrl->fifo[4] = kh;
@@ -1627,8 +1680,7 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
         if (fdctrl->data_dir != FD_DIR_WRITE ||
             len < FD_SECTOR_LEN || rel_pos != 0) {
             /* READ & SCAN commands and realign to a sector for WRITE */
-            if (blk_pread(cur_drv->blk, fd_offset(cur_drv), BDRV_SECTOR_SIZE,
-                          fdctrl->fifo, 0) < 0) {
+            if (fd_read_sector(cur_drv, fdctrl->fifo) < 0) {
                 FLOPPY_DPRINTF("Floppy: error getting sector %d\n",
                                fd_sector(cur_drv));
                 /* Sure, image size is too small... */
@@ -1655,8 +1707,7 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
 
             k->read_memory(fdctrl->dma, nchan, fdctrl->fifo + rel_pos,
                            fdctrl->data_pos, len);
-            if (blk_pwrite(cur_drv->blk, fd_offset(cur_drv), BDRV_SECTOR_SIZE,
-                           fdctrl->fifo, 0) < 0) {
+            if (fd_write_sector(cur_drv, fdctrl->fifo) < 0) {
                 FLOPPY_DPRINTF("error writing sector %d\n",
                                fd_sector(cur_drv));
                 fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM | FD_SR0_SEEK, 0x00, 0x00);
@@ -1739,9 +1790,7 @@ static uint32_t fdctrl_read_data(FDCtrl *fdctrl)
                                    fd_sector(cur_drv));
                     return 0;
                 }
-            if (blk_pread(cur_drv->blk, fd_offset(cur_drv), BDRV_SECTOR_SIZE,
-                          fdctrl->fifo, 0)
-                < 0) {
+            if (fd_read_sector(cur_drv, fdctrl->fifo) < 0) {
                 FLOPPY_DPRINTF("error getting sector %d\n",
                                fd_sector(cur_drv));
                 /* Sure, image size is too small... */
@@ -1791,14 +1840,21 @@ static void fdctrl_format_sector(FDCtrl *fdctrl)
                                   NUM_SIDES(cur_drv)));
     switch (fd_seek(cur_drv, kh, kt, ks, fdctrl->config & FD_CONFIG_EIS)) {
     case 2:
-        /* sect too big */
+        /* track/head out of range */
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, 0x00, 0x00);
         fdctrl->fifo[3] = kt;
         fdctrl->fifo[4] = kh;
         fdctrl->fifo[5] = ks;
         return;
+    case 5:
+        /* no medium */
+        fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_MA, 0x00);
+        fdctrl->fifo[3] = kt;
+        fdctrl->fifo[4] = kh;
+        fdctrl->fifo[5] = ks;
+        return;
     case 3:
-        /* track too big */
+        /* sector too big */
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_EC, 0x00);
         fdctrl->fifo[3] = kt;
         fdctrl->fifo[4] = kh;
@@ -1819,8 +1875,7 @@ static void fdctrl_format_sector(FDCtrl *fdctrl)
     }
     memset(fdctrl->fifo, 0, FD_SECTOR_LEN);
     if (cur_drv->blk == NULL ||
-        blk_pwrite(cur_drv->blk, fd_offset(cur_drv), BDRV_SECTOR_SIZE,
-                   fdctrl->fifo, 0) < 0) {
+        fd_write_sector(cur_drv, fdctrl->fifo) < 0) {
         FLOPPY_DPRINTF("error formatting sector %d\n", fd_sector(cur_drv));
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM | FD_SR0_SEEK, 0x00, 0x00);
     } else {
@@ -1936,7 +1991,10 @@ static void fdctrl_handle_save(FDCtrl *fdctrl, int direction)
 
 static void fdctrl_handle_readid(FDCtrl *fdctrl, int direction)
 {
-    FDrive *cur_drv = get_cur_drv(fdctrl);
+    FDrive *cur_drv;
+
+    SET_CUR_DRV(fdctrl, fdctrl->fifo[1] & FD_DOR_SELMASK);
+    cur_drv = get_cur_drv(fdctrl);
 
     cur_drv->head = (fdctrl->fifo[1] >> 2) & 1;
     timer_mod(fdctrl->result_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -2243,8 +2301,7 @@ static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
         if (pos == FD_SECTOR_LEN - 1 ||
             fdctrl->data_pos == fdctrl->data_len) {
             cur_drv = get_cur_drv(fdctrl);
-            if (blk_pwrite(cur_drv->blk, fd_offset(cur_drv), BDRV_SECTOR_SIZE,
-                           fdctrl->fifo, 0) < 0) {
+            if (fd_write_sector(cur_drv, fdctrl->fifo) < 0) {
                 FLOPPY_DPRINTF("error writing sector %d\n",
                                fd_sector(cur_drv));
                 break;
@@ -2303,6 +2360,18 @@ static void fdctrl_result_timer(void *opaque)
     FDCtrl *fdctrl = opaque;
     FDrive *cur_drv = get_cur_drv(fdctrl);
 
+    /*
+     * An empty drive has no address marks to read.  Completing READ ID
+     * successfully, with the made-up sector ID left over from the "spinning"
+     * emulation below, tells the guest that a diskette is still present after
+     * it has been ejected.  The only error path left was a data rate mismatch,
+     * and media_rate is never reset when the medium is removed.
+     */
+    if (!fd_media_present(cur_drv)) {
+        FLOPPY_DPRINTF("read id on empty drive\n");
+        fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_MA, 0x00);
+        return;
+    }
     /* Pretend we are spinning.
      * This is needed for Coherent, which uses READ ID to check for
      * sector interleaving.

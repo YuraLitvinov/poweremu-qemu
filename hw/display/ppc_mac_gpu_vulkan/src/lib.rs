@@ -7,6 +7,9 @@
 //! `ppc_mac_gpu_vulkan.c` (kept beside it, unbuilt, as the reference) and
 //! uses `ash`.  Every C type comes from bindgen over QEMU's own headers.
 
+#[cfg(feature = "device_rs")]
+extern crate ppc_mac_gpu_dev;
+
 // #![allow(unknown_lints, non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, unnecessary_transmutes, clippy::all)]
 
 mod batch;

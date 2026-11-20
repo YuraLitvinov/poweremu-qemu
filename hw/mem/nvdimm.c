@@ -26,9 +26,10 @@
 #include "qemu/module.h"
 #include "qemu/pmem.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "hw/mem/nvdimm.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/mem/memory-device.h"
 #include "system/hostmem.h"
 
@@ -99,11 +100,12 @@ static void nvdimm_set_uuid(Object *obj, Visitor *v, const char *name,
 
 static void nvdimm_init(Object *obj)
 {
-    object_property_add(obj, NVDIMM_LABEL_SIZE_PROP, "int",
+    object_property_add(obj, NVDIMM_LABEL_SIZE_PROP, "size", &size_type_info,
                         nvdimm_get_label_size, nvdimm_set_label_size, NULL,
                         NULL);
 
-    object_property_add(obj, NVDIMM_UUID_PROP, "QemuUUID", nvdimm_get_uuid,
+    object_property_add(obj, NVDIMM_UUID_PROP, "QemuUUID", &str_type_info,
+                        nvdimm_get_uuid,
                         nvdimm_set_uuid, NULL, NULL);
 }
 
@@ -250,7 +252,7 @@ static const Property nvdimm_properties[] = {
     DEFINE_PROP_BOOL(NVDIMM_UNARMED_PROP, NVDIMMDevice, unarmed, false),
 };
 
-static void nvdimm_class_init(ObjectClass *oc, void *data)
+static void nvdimm_class_init(ObjectClass *oc, const void *data)
 {
     PCDIMMDeviceClass *ddc = PC_DIMM_CLASS(oc);
     MemoryDeviceClass *mdc = MEMORY_DEVICE_CLASS(oc);
@@ -275,6 +277,7 @@ static const TypeInfo nvdimm_info = {
     .instance_size = sizeof(NVDIMMDevice),
     .instance_init = nvdimm_init,
     .instance_finalize = nvdimm_finalize,
+    .secure        = true,
 };
 
 static void nvdimm_register_types(void)

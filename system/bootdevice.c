@@ -24,12 +24,13 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "system/system.h"
 #include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "system/reset.h"
-#include "hw/qdev-core.h"
-#include "hw/boards.h"
+#include "hw/core/qdev.h"
+#include "hw/core/boards.h"
 
 typedef struct FWBootEntry FWBootEntry;
 
@@ -336,7 +337,7 @@ void device_add_bootindex_property(Object *obj, int32_t *bootindex,
     prop->suffix = suffix;
     prop->dev = dev;
 
-    object_property_add(obj, name, "int32",
+    object_property_add(obj, name, "int32", &int32_type_info,
                         device_get_bootindex,
                         device_set_bootindex,
                         property_release_bootindex,

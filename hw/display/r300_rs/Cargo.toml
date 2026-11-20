@@ -1,7 +1,7 @@
 [package]
 name = "r300"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 description = "Idiomatic Rust port of the R300 (Radeon 9700) draw-side helpers from QEMU hw/display/r300"
 
@@ -10,9 +10,13 @@ name = "r300"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+shaderc = "0.10.1"
 
 [profile.release]
 panic = "abort"
 
 [profile.test]
 opt-level = 2
+
+# Keep out of QEMU's own Cargo workspace (the root Cargo.toml).
+[workspace]

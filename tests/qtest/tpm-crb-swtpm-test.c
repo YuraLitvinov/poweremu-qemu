@@ -19,8 +19,6 @@
 #include "tpm-tests.h"
 #include "hw/acpi/tpm.h"
 
-uint64_t tpm_device_base_addr = TPM_CRB_ADDR_BASE;
-
 typedef struct TestState {
     char *src_tpm_path;
     char *dst_tpm_path;
@@ -32,6 +30,22 @@ static void tpm_crb_swtpm_test(const void *data)
     const TestState *ts = data;
 
     tpm_test_swtpm_test(ts->src_tpm_path, tpm_util_crb_transfer,
+                        "tpm-crb", NULL);
+}
+
+static void tpm_crb_short_write_swtpm_test(const void *data)
+{
+    const TestState *ts = data;
+
+    tpm_test_short_write_swtpm_test(ts->src_tpm_path, tpm_util_crb_transfer,
+                                    "tpm-crb", NULL);
+}
+
+static void tpm_crb_chunk_swtpm_test(const void *data)
+{
+    const TestState *ts = data;
+
+    tpm_test_swtpm_test(ts->src_tpm_path, tpm_util_crb_chunk_transfer,
                         "tpm-crb", NULL);
 }
 
@@ -56,6 +70,10 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_data_func("/tpm/crb-swtpm/test", &ts, tpm_crb_swtpm_test);
+    qtest_add_data_func("/tpm/crb-short-write-swtpm/test", &ts,
+                        tpm_crb_short_write_swtpm_test);
+    qtest_add_data_func("/tpm/crb-chunk-swtpm/test", &ts,
+                        tpm_crb_chunk_swtpm_test);
     qtest_add_data_func("/tpm/crb-swtpm-migration/test", &ts,
                         tpm_crb_swtpm_migration_test);
     ret = g_test_run();

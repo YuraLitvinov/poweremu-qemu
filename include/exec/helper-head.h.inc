@@ -8,7 +8,13 @@
 
 #include "fpu/softfloat-types.h"
 
-#define HELPER(name) glue(helper_, name)
+#ifdef TARGET_ARCH_PREFIX
+ #define HELPER_PREFIX glue(TARGET_ARCH_PREFIX, _)
+#else
+ #define HELPER_PREFIX
+#endif
+#define HELPER(name) glue(HELPER_PREFIX, glue(helper_, name))
+#define HELPER_INFO(name) glue(HELPER_PREFIX, glue(helper_info_, name))
 
 /* Some types that make sense in C, but not for TCG.  */
 #define dh_alias_i32 i32
@@ -46,17 +52,27 @@
 #define dh_ctype(t) dh_ctype_##t
 
 #ifdef COMPILING_PER_TARGET
-# ifdef TARGET_LONG_BITS
-#  if TARGET_LONG_BITS == 32
-#   define dh_alias_tl i32
-#   define dh_typecode_tl dh_typecode_i32
-#  else
-#   define dh_alias_tl i64
-#   define dh_typecode_tl dh_typecode_i64
-#  endif
+# include "exec/target_long.h"
+# if TARGET_LONG_BITS == 32
+#  define dh_alias_tl i32
+#  define dh_typecode_tl dh_typecode_i32
+# else
+#  define dh_alias_tl i64
+#  define dh_typecode_tl dh_typecode_i64
 # endif
 # define dh_ctype_tl target_ulong
 #endif /* COMPILING_PER_TARGET */
+
+#if __SIZEOF_POINTER__ == 4
+# define dh_alias_vaddr i32
+# define dh_typecode_vaddr dh_typecode_i32
+#elif __SIZEOF_POINTER__ == 8
+# define dh_alias_vaddr i64
+# define dh_typecode_vaddr dh_typecode_i64
+#else
+# error "sizeof pointer is different from {4,8}"
+#endif /* __SIZEOF_POINTER__ */
+# define dh_ctype_vaddr uintptr_t
 
 /* We can't use glue() here because it falls foul of C preprocessor
    recursive expansion rules.  */

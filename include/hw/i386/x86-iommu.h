@@ -20,7 +20,7 @@
 #ifndef HW_I386_X86_IOMMU_H
 #define HW_I386_X86_IOMMU_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/pci/msi.h"
 #include "qom/object.h"
 
@@ -63,7 +63,7 @@ struct X86IOMMUState {
     SysBusDevice busdev;
     OnOffAuto intr_supported;   /* Whether vIOMMU supports IR */
     bool dt_supported;          /* Whether vIOMMU supports DT */
-    bool pt_supported;          /* Whether vIOMMU supports pass-through */
+    bool dma_translation;       /* Whether vIOMMU supports DMA translation */
     QLIST_HEAD(, IEC_Notifier) iec_notifiers; /* IEC notify list */
 };
 
@@ -133,6 +133,12 @@ struct X86IOMMU_MSIMessage {
  * @return: pointer to default IOMMU device
  */
 X86IOMMUState *x86_iommu_get_default(void);
+
+/**
+ * x86_iommu_device_get - get IOMMU device for given PCI device
+ * @return: pointer to default IOMMU device
+ */
+X86IOMMUState *x86_iommu_device_get(PCIDevice *dev);
 
 /**
  * x86_iommu_iec_register_notifier - register IEC (Interrupt Entry

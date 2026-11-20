@@ -35,8 +35,8 @@
 #include "qemu/osdep.h"
 #include "hw/block/block.h"
 #include "hw/block/flash.h"
-#include "hw/qdev-properties.h"
-#include "hw/qdev-properties-system.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/bitmap.h"
@@ -44,8 +44,9 @@
 #include "system/block-backend.h"
 #include "qemu/host-utils.h"
 #include "qemu/module.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
+#include "system/runstate.h"
 #include "trace.h"
 
 #define PFLASH_LAZY_ROMD_THRESHOLD 42
@@ -71,7 +72,7 @@ struct PFlashCFI02 {
     BlockBackend *blk;
     uint32_t uniform_nb_blocs;
     uint32_t uniform_sector_len;
-    uint32_t total_sectors;
+    int32_t total_sectors;
     uint32_t nb_blocs[PFLASH_MAX_ERASE_REGIONS];
     uint32_t sector_len[PFLASH_MAX_ERASE_REGIONS];
     uint32_t chip_len;
@@ -107,6 +108,29 @@ struct PFlashCFI02 {
     unsigned long *sector_erase_map;
     char *name;
     void *storage;
+    VMChangeStateEntry *vmstate;
+};
+
+static int pflash_post_load(void *opaque, int version_id);
+
+static const VMStateDescription vmstate_pflash = {
+    .name = "pflash_cfi02",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = pflash_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT32(wcycle, PFlashCFI02),
+        VMSTATE_INT32(bypass, PFlashCFI02),
+        VMSTATE_UINT8(cmd, PFlashCFI02),
+        VMSTATE_UINT8(status, PFlashCFI02),
+        VMSTATE_TIMER(timer, PFlashCFI02),
+        VMSTATE_BOOL(rom_mode, PFlashCFI02),
+        VMSTATE_INT32(read_counter, PFlashCFI02),
+        VMSTATE_INT32(sectors_to_erase, PFlashCFI02),
+        VMSTATE_UINT64(erase_time_remaining, PFlashCFI02),
+        VMSTATE_BITMAP(sector_erase_map, PFlashCFI02, 1, total_sectors),
+        VMSTATE_END_OF_LIST()
+    }
 };
 
 /*
@@ -968,7 +992,7 @@ static void pflash_cfi02_unrealize(DeviceState *dev)
     g_free(pfl->sector_erase_map);
 }
 
-static void pflash_cfi02_class_init(ObjectClass *klass, void *data)
+static void pflash_cfi02_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -976,6 +1000,7 @@ static void pflash_cfi02_class_init(ObjectClass *klass, void *data)
     device_class_set_legacy_reset(dc, pflash_cfi02_reset);
     dc->unrealize = pflash_cfi02_unrealize;
     device_class_set_props(dc, pflash_cfi02_properties);
+    dc->vmsd = &vmstate_pflash;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }
 
@@ -1027,4 +1052,29 @@ PFlashCFI02 *pflash_cfi02_register(hwaddr base,
 
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base);
     return PFLASH_CFI02(dev);
+}
+
+static void postload_update_cb(void *opaque, bool running, RunState state)
+{
+    PFlashCFI02 *pfl = opaque;
+
+    /* This is called after bdrv_activate_all.  */
+    qemu_del_vm_change_state_handler(pfl->vmstate);
+    pfl->vmstate = NULL;
+
+    trace_pflash_postload_cb(pfl->name);
+    pflash_update(pfl, 0, pfl->chip_len);
+}
+
+static int pflash_post_load(void *opaque, int version_id)
+{
+    PFlashCFI02 *pfl = opaque;
+
+    if (!pfl->ro) {
+        pfl->vmstate = qemu_add_vm_change_state_handler(postload_update_cb, pfl);
+    }
+
+    memory_region_rom_device_set_romd(&pfl->orig_mem, pfl->rom_mode);
+
+    return 0;
 }

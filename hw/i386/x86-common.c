@@ -36,14 +36,16 @@
 #include "hw/rtc/mc146818rtc.h"
 #include "target/i386/sev.h"
 
-#include "hw/acpi/cpu_hotplug.h"
-#include "hw/irq.h"
-#include "hw/loader.h"
+#include "hw/core/irq.h"
+#include "hw/core/loader.h"
 #include "multiboot.h"
 #include "elf.h"
 #include "standard-headers/asm-x86/bootparam.h"
 #include CONFIG_DEVICES
 #include "kvm/kvm_i386.h"
+#include "kvm/tdx.h"
+
+#include "exec/tswap.h"
 
 #ifdef CONFIG_XEN_EMU
 #include "hw/xen/xen.h"
@@ -158,7 +160,7 @@ static CPUArchId *x86_find_cpu_slot(MachineState *ms, uint32_t id, int *idx)
     return found_cpu;
 }
 
-void x86_cpu_plug(HotplugHandler *hotplug_dev,
+void x86_cpu_plug(const HotplugHandler *hotplug_dev,
                   DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
@@ -182,13 +184,24 @@ void x86_cpu_plug(HotplugHandler *hotplug_dev,
         fw_cfg_modify_i16(x86ms->fw_cfg, FW_CFG_NB_CPUS, x86ms->boot_cpus);
     }
 
+    /*
+     * Non-hotplugged CPUs get their SMM cpu address space initialized in
+     * machine init done notifier: register_smram_listener().
+     *
+     * We need initialize the SMM cpu address space for the hotplugged CPU
+     * specifically.
+     */
+    if (kvm_enabled() && dev->hotplugged && x86_machine_is_smm_enabled(x86ms)) {
+        kvm_smm_cpu_address_space_init(cpu);
+    }
+
     found_cpu = x86_find_cpu_slot(MACHINE(x86ms), cpu->apic_id, NULL);
     found_cpu->cpu = CPU(dev);
 out:
     error_propagate(errp, local_err);
 }
 
-void x86_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
+void x86_cpu_unplug_request_cb(const HotplugHandler *hotplug_dev,
                                DeviceState *dev, Error **errp)
 {
     int idx = -1;
@@ -211,7 +224,7 @@ void x86_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
                                    errp);
 }
 
-void x86_cpu_unplug_cb(HotplugHandler *hotplug_dev,
+void x86_cpu_unplug_cb(const HotplugHandler *hotplug_dev,
                        DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
@@ -237,7 +250,7 @@ void x86_cpu_unplug_cb(HotplugHandler *hotplug_dev,
     error_propagate(errp, local_err);
 }
 
-void x86_cpu_pre_plug(HotplugHandler *hotplug_dev,
+void x86_cpu_pre_plug(const HotplugHandler *hotplug_dev,
                       DeviceState *dev, Error **errp)
 {
     int idx;
@@ -562,7 +575,7 @@ static uint64_t read_pvh_start_addr(void *arg1, void *arg2, bool is64)
             ((void *)nhdr64) + nhdr_size64 +
             QEMU_ALIGN_UP(nhdr_namesz, phdr_align);
 
-        pvh_start_addr = *elf_note_data_addr;
+        pvh_start_addr = tswap64(*elf_note_data_addr);
     } else {
         struct elf32_note *nhdr32 = (struct elf32_note *)arg1;
         uint32_t nhdr_size32 = sizeof(struct elf32_note);
@@ -573,7 +586,7 @@ static uint64_t read_pvh_start_addr(void *arg1, void *arg2, bool is64)
             ((void *)nhdr32) + nhdr_size32 +
             QEMU_ALIGN_UP(nhdr_namesz, phdr_align);
 
-        pvh_start_addr = *(uint32_t *)elf_note_data_addr;
+        pvh_start_addr = tswap32(*(uint32_t *)elf_note_data_addr);
     }
 
     return pvh_start_addr;
@@ -631,10 +644,8 @@ static bool load_elfboot(const char *kernel_filename,
 
 void x86_load_linux(X86MachineState *x86ms,
                     FWCfgState *fw_cfg,
-                    int acpi_data_size,
-                    bool pvh_enabled)
+                    int acpi_data_size)
 {
-    bool linuxboot_dma_enabled = X86_MACHINE_GET_CLASS(x86ms)->fwcfg_dma_enabled;
     uint16_t protocol;
     int setup_size, kernel_size, cmdline_size;
     int dtb_size, setup_data_offset;
@@ -642,7 +653,7 @@ void x86_load_linux(X86MachineState *x86ms,
     uint8_t header[8192], *setup, *kernel;
     hwaddr real_addr, prot_addr, cmdline_addr, initrd_addr = 0;
     FILE *f;
-    char *vmode;
+    const char *vmode;
     MachineState *machine = MACHINE(x86ms);
     struct setup_data *setup_data;
     const char *kernel_filename = machine->kernel_filename;
@@ -694,8 +705,7 @@ void x86_load_linux(X86MachineState *x86ms,
          * saving the PVH entry point used by the x86/HVM direct boot ABI.
          * If load_elfboot() is successful, populate the fw_cfg info.
          */
-        if (pvh_enabled &&
-            load_elfboot(kernel_filename, kernel_size,
+        if (load_elfboot(kernel_filename, kernel_size,
                          header, pvh_start_addr, fw_cfg)) {
             fclose(f);
 
@@ -923,7 +933,7 @@ void x86_load_linux(X86MachineState *x86ms,
             exit(1);
         }
 
-        dtb_size = get_image_size(dtb_filename);
+        dtb_size = get_image_size(dtb_filename, NULL);
         if (dtb_size <= 0) {
             fprintf(stderr, "qemu: error reading dtb %s: %s\n",
                     dtb_filename, strerror(errno));
@@ -951,7 +961,7 @@ void x86_load_linux(X86MachineState *x86ms,
      * kernel on the other side of the fw_cfg interface matches the hash of the
      * file the user passed in.
      */
-    if (!sev_enabled() && protocol > 0) {
+    if (!MACHINE(x86ms)->cgs && protocol > 0) {
         memcpy(setup, header, MIN(sizeof(header), setup_size));
     }
 
@@ -972,19 +982,8 @@ void x86_load_linux(X86MachineState *x86ms,
     fw_cfg_add_file(fw_cfg, "etc/boot/kernel", kernel, kernel_size);
 
     if (machine->shim_filename) {
-        GMappedFile *mapped_file;
-        GError *gerr = NULL;
-
-        mapped_file = g_mapped_file_new(machine->shim_filename, false, &gerr);
-        if (!mapped_file) {
-            fprintf(stderr, "qemu: error reading shim %s: %s\n",
-                    machine->shim_filename, gerr->message);
-            exit(1);
-        }
-
-        fw_cfg_add_file(fw_cfg, "etc/boot/shim",
-                        g_mapped_file_get_contents(mapped_file),
-                        g_mapped_file_get_length(mapped_file));
+        load_image_to_fw_cfg_file(fw_cfg, "etc/boot/shim",
+                                  machine->shim_filename);
     }
 
     if (sev_enabled()) {
@@ -992,86 +991,7 @@ void x86_load_linux(X86MachineState *x86ms,
     }
 
     option_rom[nb_option_roms].bootindex = 0;
-    option_rom[nb_option_roms].name = "linuxboot.bin";
-    if (linuxboot_dma_enabled && fw_cfg_dma_enabled(fw_cfg)) {
-        option_rom[nb_option_roms].name = "linuxboot_dma.bin";
-    }
+    assert(fw_cfg_dma_enabled(fw_cfg));
+    option_rom[nb_option_roms].name = "linuxboot_dma.bin";
     nb_option_roms++;
-}
-
-void x86_isa_bios_init(MemoryRegion *isa_bios, MemoryRegion *isa_memory,
-                       MemoryRegion *bios, bool read_only)
-{
-    uint64_t bios_size = memory_region_size(bios);
-    uint64_t isa_bios_size = MIN(bios_size, 128 * KiB);
-
-    memory_region_init_alias(isa_bios, NULL, "isa-bios", bios,
-                             bios_size - isa_bios_size, isa_bios_size);
-    memory_region_add_subregion_overlap(isa_memory, 1 * MiB - isa_bios_size,
-                                        isa_bios, 1);
-    memory_region_set_readonly(isa_bios, read_only);
-}
-
-void x86_bios_rom_init(X86MachineState *x86ms, const char *default_firmware,
-                       MemoryRegion *rom_memory, bool isapc_ram_fw)
-{
-    const char *bios_name;
-    char *filename;
-    int bios_size;
-    ssize_t ret;
-
-    /* BIOS load */
-    bios_name = MACHINE(x86ms)->firmware ?: default_firmware;
-    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
-    if (filename) {
-        bios_size = get_image_size(filename);
-    } else {
-        bios_size = -1;
-    }
-    if (bios_size <= 0 ||
-        (bios_size % 65536) != 0) {
-        goto bios_error;
-    }
-    if (machine_require_guest_memfd(MACHINE(x86ms))) {
-        memory_region_init_ram_guest_memfd(&x86ms->bios, NULL, "pc.bios",
-                                           bios_size, &error_fatal);
-    } else {
-        memory_region_init_ram(&x86ms->bios, NULL, "pc.bios",
-                               bios_size, &error_fatal);
-    }
-    if (sev_enabled()) {
-        /*
-         * The concept of a "reset" simply doesn't exist for
-         * confidential computing guests, we have to destroy and
-         * re-launch them instead.  So there is no need to register
-         * the firmware as rom to properly re-initialize on reset.
-         * Just go for a straight file load instead.
-         */
-        void *ptr = memory_region_get_ram_ptr(&x86ms->bios);
-        load_image_size(filename, ptr, bios_size);
-        x86_firmware_configure(0x100000000ULL - bios_size, ptr, bios_size);
-    } else {
-        memory_region_set_readonly(&x86ms->bios, !isapc_ram_fw);
-        ret = rom_add_file_fixed(bios_name, (uint32_t)(-bios_size), -1);
-        if (ret != 0) {
-            goto bios_error;
-        }
-    }
-    g_free(filename);
-
-    if (!machine_require_guest_memfd(MACHINE(x86ms))) {
-        /* map the last 128KB of the BIOS in ISA space */
-        x86_isa_bios_init(&x86ms->isa_bios, rom_memory, &x86ms->bios,
-                          !isapc_ram_fw);
-    }
-
-    /* map all the bios at the top of memory */
-    memory_region_add_subregion(rom_memory,
-                                (uint32_t)(-bios_size),
-                                &x86ms->bios);
-    return;
-
-bios_error:
-    fprintf(stderr, "qemu: could not load PC BIOS '%s'\n", bios_name);
-    exit(1);
 }

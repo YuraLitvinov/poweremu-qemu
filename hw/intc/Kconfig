@@ -5,7 +5,16 @@ config I8259
     bool
     select ISA_BUS
 
+config IMX_AVIC
+    bool
+
+config IMX_GPCV2
+    bool
+
 config PL190
+    bool
+
+config HEX_L2VIC
     bool
 
 config IOAPIC
@@ -23,7 +32,7 @@ config APIC
 
 config ARM_GIC
     bool
-    select ARM_GICV3 if TCG
+    select ARM_GICV3 if TCG || HVF || WHPX
     select ARM_GIC_KVM if KVM
     select MSI_NONBROKEN
 
@@ -34,6 +43,11 @@ config ARM_GICV3
 config ARM_GIC_KVM
     bool
     depends on ARM_GIC && KVM
+
+config ARM_GICV5
+    bool
+    depends on TCG
+    select MSI_NONBROKEN
 
 config XICS
     bool
@@ -108,4 +122,7 @@ config LOONGARCH_PCH_MSI
     select UNIMP
 
 config LOONGARCH_EXTIOI
+    bool
+
+config LOONGARCH_DINTC
     bool

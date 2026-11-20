@@ -82,7 +82,6 @@ static uint64_t stm32f2xx_spi_read(void *opaque, hwaddr addr,
     case STM_SPI_SR:
         return s->spi_sr;
     case STM_SPI_DR:
-        stm32f2xx_spi_transfer(s);
         s->spi_sr &= ~STM_SPI_SR_RXNE;
         return s->spi_dr;
     case STM_SPI_CRCPR:
@@ -202,7 +201,7 @@ static void stm32f2xx_spi_init(Object *obj)
     s->ssi = ssi_create_bus(dev, "ssi");
 }
 
-static void stm32f2xx_spi_class_init(ObjectClass *klass, void *data)
+static void stm32f2xx_spi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

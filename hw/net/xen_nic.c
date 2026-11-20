@@ -37,8 +37,8 @@
 
 #include "hw/xen/xen-backend.h"
 #include "hw/xen/xen-bus-helper.h"
-#include "hw/qdev-properties.h"
-#include "hw/qdev-properties-system.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 
 #include "hw/xen/interface/io/netif.h"
 #include "hw/xen/interface/io/xs_wire.h"
@@ -61,8 +61,6 @@ struct XenNetDev {
     NICConf               conf;
     NICState              *nic;
 };
-
-typedef struct XenNetDev XenNetDev;
 
 #define TYPE_XEN_NET_DEVICE "xen-net-device"
 OBJECT_DECLARE_SIMPLE_TYPE(XenNetDev, XEN_NET_DEVICE)
@@ -559,7 +557,7 @@ static const Property xen_netdev_properties[] = {
     DEFINE_PROP_INT32("idx", XenNetDev, dev, -1),
 };
 
-static void xen_netdev_class_init(ObjectClass *class, void *data)
+static void xen_netdev_class_init(ObjectClass *class, const void *data)
 {
     DeviceClass *dev_class = DEVICE_CLASS(class);
     XenDeviceClass *xendev_class = XEN_DEVICE_CLASS(class);
@@ -581,6 +579,7 @@ static const TypeInfo xen_net_type_info = {
     .parent = TYPE_XEN_DEVICE,
     .instance_size = sizeof(XenNetDev),
     .class_init = xen_netdev_class_init,
+    .secure = true,
 };
 
 static void xen_net_register_types(void)

@@ -12,21 +12,25 @@
 
 #include "qemu/osdep.h"
 #include "exec/hwaddr.h"
+#include "exec/cpu-common.h"
+#include "exec/cpu-interrupt.h"
+#include "system/physmem.h"
 #include "system/system.h"
 #include "system/qtest.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/m68k/next-cube.h"
-#include "hw/boards.h"
-#include "hw/loader.h"
+#include "hw/core/boards.h"
+#include "hw/core/loader.h"
 #include "hw/scsi/esp.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 #include "hw/char/escc.h" /* ZILOG 8530 Serial Emulation */
 #include "hw/block/fdc.h"
 #include "hw/misc/empty_slot.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "ui/console.h"
 #include "target/m68k/cpu.h"
 #include "migration/vmstate.h"
@@ -583,7 +587,7 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
         base_addr = next_state->dma[type].next_initbuf;
     }
 
-    cpu_physical_memory_write(base_addr, buf, size);
+    physical_memory_write(base_addr, buf, size);
 
     next_state->dma[type].next_initbuf = 0;
 
@@ -617,8 +621,7 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
 
 static void nextscsi_read(void *opaque, uint8_t *buf, int len)
 {
-    DPRINTF("SCSI READ: %x\n", len);
-    abort();
+    qemu_log_mask(LOG_UNIMP, "nextscsi_read with len = %d\n", len);
 }
 
 static void nextscsi_write(void *opaque, uint8_t *buf, int size)
@@ -793,7 +796,7 @@ static const VMStateDescription next_scsi_vmstate = {
     },
 };
 
-static void next_scsi_class_init(ObjectClass *klass, void *data)
+static void next_scsi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -822,13 +825,14 @@ static void next_floppy_write(void *opaque, hwaddr addr, uint64_t val,
         break;
 
     default:
-        g_assert_not_reached();
+        qemu_log_mask(LOG_UNIMP, "next_floppy_write at addr 0x%"HWADDR_PRIx"\n",
+                      addr);
     }
 }
 
 static uint64_t next_floppy_read(void *opaque, hwaddr addr, unsigned size)
 {
-    uint64_t val;
+    uint64_t val = 0;
 
     switch (addr) {
     case 0:
@@ -837,7 +841,8 @@ static uint64_t next_floppy_read(void *opaque, hwaddr addr, unsigned size)
         break;
 
     default:
-        g_assert_not_reached();
+        qemu_log_mask(LOG_UNIMP, "next_floppy_read at addr 0x%"HWADDR_PRIx"\n",
+                      addr);
     }
 
     return val;
@@ -899,7 +904,6 @@ static void next_dummy_en_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
     /* Do nothing */
-    return;
 }
 
 static uint64_t next_dummy_en_read(void *opaque, hwaddr addr, unsigned size)
@@ -1064,7 +1068,7 @@ static const VMStateDescription next_rtc_vmstate = {
     },
 };
 
-static void next_rtc_class_init(ObjectClass *klass, void *data)
+static void next_rtc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
@@ -1228,7 +1232,7 @@ static const VMStateDescription next_pc_vmstate = {
     },
 };
 
-static void next_pc_class_init(ObjectClass *klass, void *data)
+static void next_pc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
@@ -1325,9 +1329,16 @@ static void next_cube_init(MachineState *machine)
     memory_region_init_alias(&m->rom2, NULL, "next.rom2", &m->rom, 0x0,
                              0x20000);
     memory_region_add_subregion(sysmem, 0x0, &m->rom2);
-    if (load_image_targphys(bios_name, 0x01000000, 0x20000) < 8) {
+    Error *local_err = NULL;
+    if (load_image_targphys(bios_name, 0x01000000, 0x20000, &local_err) < 8) {
         if (!qtest_enabled()) {
-            error_report("Failed to load firmware '%s'.", bios_name);
+            if (local_err) {
+                error_report_err(local_err);
+            } else {
+                error_report("Firmware image '%s' is too short.", bios_name);
+            }
+        } else {
+            error_free(local_err);
         }
     } else {
         uint8_t *ptr;
@@ -1348,7 +1359,7 @@ static void next_cube_init(MachineState *machine)
     memory_region_add_subregion(sysmem, 0x02000000, &m->dmamem);
 }
 
-static void next_machine_class_init(ObjectClass *oc, void *data)
+static void next_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
@@ -1359,6 +1370,7 @@ static void next_machine_class_init(ObjectClass *oc, void *data)
     mc->default_ram_id = "next.ram";
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
     mc->no_cdrom = true;
+    mc->deprecation_reason = "machine is incomplete and cannot boot a kernel";
 }
 
 static const TypeInfo next_typeinfo = {

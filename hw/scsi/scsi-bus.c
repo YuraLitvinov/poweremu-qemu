@@ -4,7 +4,7 @@
 #include "qemu/module.h"
 #include "qemu/option.h"
 #include "qemu/hw-version.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/scsi/scsi.h"
 #include "migration/qemu-file-types.h"
 #include "migration/vmstate.h"
@@ -393,6 +393,7 @@ static void scsi_qdev_realize(DeviceState *qdev, Error **errp)
     }
 
     qemu_mutex_init(&dev->requests_lock);
+    qemu_mutex_init(&dev->pr_state.mutex);
     QTAILQ_INIT(&dev->requests);
     scsi_device_realize(dev, &local_err);
     if (local_err) {
@@ -400,7 +401,7 @@ static void scsi_qdev_realize(DeviceState *qdev, Error **errp)
         return;
     }
     dev->vmsentry = qdev_add_vm_change_state_handler(DEVICE(dev),
-            scsi_dma_restart_cb, dev);
+            scsi_dma_restart_cb, NULL, dev);
 }
 
 static void scsi_qdev_unrealize(DeviceState *qdev)
@@ -416,6 +417,8 @@ static void scsi_qdev_unrealize(DeviceState *qdev)
     qemu_mutex_destroy(&dev->requests_lock);
 
     scsi_device_unrealize(dev);
+
+    qemu_mutex_destroy(&dev->pr_state.mutex);
 
     blockdev_mark_auto_del(dev->conf.blk);
 }
@@ -482,12 +485,7 @@ void scsi_bus_legacy_handle_cmdline(SCSIBus *bus)
     Location loc;
     DriveInfo *dinfo;
     int unit;
-    BlockConf conf = {
-        .bootindex = -1,
-        .share_rw = false,
-        .rerror = BLOCKDEV_ON_ERROR_AUTO,
-        .werror = BLOCKDEV_ON_ERROR_AUTO,
-    };
+    BlockConf conf = DEFAULT_BLOCK_CONF;
 
     loc_push_none(&loc);
     for (unit = 0; unit <= bus->info->max_target; unit++) {
@@ -700,7 +698,7 @@ static bool scsi_target_emulate_inquiry(SCSITargetReq *r)
         r->buf[7] = 0x10 | (r->req.bus->info->tcq ? 0x02 : 0); /* Sync, TCQ.  */
         memcpy(&r->buf[8], "QEMU    ", 8);
         memcpy(&r->buf[16], "QEMU TARGET     ", 16);
-        pstrcpy((char *) &r->buf[32], 4, qemu_hw_version());
+        pstrcpy((char *) &r->buf[32], 4, QEMU_HW_VERSION);
     }
     return true;
 }
@@ -823,7 +821,6 @@ SCSIRequest *scsi_req_alloc(const SCSIReqOps *reqops, SCSIDevice *d,
 {
     SCSIRequest *req;
     SCSIBus *bus = scsi_bus_from_device(d);
-    BusState *qbus = BUS(bus);
     const int memset_off = offsetof(SCSIRequest, sense)
                            + sizeof(req->sense);
 
@@ -838,8 +835,6 @@ SCSIRequest *scsi_req_alloc(const SCSIReqOps *reqops, SCSIDevice *d,
     req->status = -1;
     req->host_status = -1;
     req->ops = reqops;
-    object_ref(OBJECT(d));
-    object_ref(OBJECT(qbus->parent));
     notifier_list_init(&req->cancel_notifiers);
 
     if (reqops->init_req) {
@@ -878,6 +873,16 @@ SCSIRequest *scsi_req_new(SCSIDevice *d, uint32_t tag, uint32_t lun,
           */
          !(buf[0] == REQUEST_SENSE && d->sense_is_ua))) {
         ops = &reqops_unit_attention;
+    } else if (buf[0] == PR_HELPER_CLEANUP) {
+        /*
+         * This is a QEMU-internal vendor-specific SCSI command that must only
+         * be submitted directly via blk_aio_ioctl() and not through SCSI
+         * emulation. Reject the command explicitly to guarantee a guest cannot
+         * execute it, although vendor-specific commands are not supported by
+         * SCSI emulation (including passthrough) anyway.
+         */
+        trace_scsi_req_parse_bad(d->id, lun, tag, buf[0]);
+        goto invalid_opcode;
     } else if (lun != d->lun ||
                buf[0] == REPORT_LUNS ||
                (buf[0] == REQUEST_SENSE && d->sense_len)) {
@@ -1496,15 +1501,15 @@ void scsi_device_report_change(SCSIDevice *dev, SCSISense sense)
 
 SCSIRequest *scsi_req_ref(SCSIRequest *req)
 {
-    assert(req->refcount > 0);
-    req->refcount++;
+    assert(qatomic_read(&req->refcount) > 0);
+    qatomic_inc(&req->refcount);
     return req;
 }
 
 void scsi_req_unref(SCSIRequest *req)
 {
-    assert(req->refcount > 0);
-    if (--req->refcount == 0) {
+    assert(qatomic_read(&req->refcount) > 0);
+    if (qatomic_fetch_dec(&req->refcount) == 1) {
         BusState *qbus = req->dev->qdev.parent_bus;
         SCSIBus *bus = DO_UPCAST(SCSIBus, qbus, qbus);
 
@@ -1514,10 +1519,15 @@ void scsi_req_unref(SCSIRequest *req)
         if (req->ops->free_req) {
             req->ops->free_req(req);
         }
-        object_unref(OBJECT(req->dev));
-        object_unref(OBJECT(qbus->parent));
         g_free(req);
     }
+}
+
+void scsi_req_unref_detach_hba(SCSIRequest *req)
+{
+    /* Unref when the HBA frees hba_private separately (e.g. virtio_scsi_free_req) */
+    req->hba_private = NULL;
+    scsi_req_unref(req);
 }
 
 /* Tell the device that we finished processing this chunk of I/O.  It
@@ -1980,12 +1990,8 @@ const VMStateDescription vmstate_scsi_device = {
         VMSTATE_UINT32(sense_len, SCSIDevice),
         {
             .name         = "requests",
-            .version_id   = 0,
-            .field_exists = NULL,
-            .size         = 0,   /* ouch */
             .info         = &vmstate_info_scsi_requests,
-            .flags        = VMS_SINGLE,
-            .offset       = 0,
+            .flags        = VMS_SINGLE | VMS_NO_STATE,
         },
         VMSTATE_END_OF_LIST()
     },
@@ -2001,7 +2007,7 @@ static const Property scsi_props[] = {
     DEFINE_PROP_UINT32("lun", SCSIDevice, lun, -1),
 };
 
-static void scsi_device_class_init(ObjectClass *klass, void *data)
+static void scsi_device_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *k = DEVICE_CLASS(klass);
     set_bit(DEVICE_CATEGORY_STORAGE, k->categories);
@@ -2030,7 +2036,7 @@ static const TypeInfo scsi_device_type_info = {
     .instance_init = scsi_dev_instance_init,
 };
 
-static void scsi_bus_class_init(ObjectClass *klass, void *data)
+static void scsi_bus_class_init(ObjectClass *klass, const void *data)
 {
     BusClass *k = BUS_CLASS(klass);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(klass);
@@ -2046,7 +2052,7 @@ static const TypeInfo scsi_bus_info = {
     .parent = TYPE_BUS,
     .instance_size = sizeof(SCSIBus),
     .class_init = scsi_bus_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_HOTPLUG_HANDLER },
         { }
     }

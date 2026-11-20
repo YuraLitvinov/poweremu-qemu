@@ -19,8 +19,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-# creator
-owner=nirsof@gmail.com
 
 seq=`basename $0`
 echo "QA output created by $seq"
@@ -77,6 +75,7 @@ _supported_os Linux
 
 _default_cache_mode none
 _supported_cache_modes none directsync
+_require_disk_usage
 
 size=$((1 * 1024 * 1024))
 

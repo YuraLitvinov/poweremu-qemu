@@ -14,6 +14,7 @@
 #include "qemu/osdep.h"
 #include "qom/object_interfaces.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "block/thread-pool.h"
 #include "system/event-loop-base.h"
 
@@ -73,8 +74,6 @@ static void event_loop_base_set_param(Object *obj, Visitor *v,
     if (bc->update_params) {
         bc->update_params(base, errp);
     }
-
-    return;
 }
 
 static void event_loop_base_complete(UserCreatable *uc, Error **errp)
@@ -87,33 +86,37 @@ static void event_loop_base_complete(UserCreatable *uc, Error **errp)
     }
 }
 
-static bool event_loop_base_can_be_deleted(UserCreatable *uc)
+static bool event_loop_base_prepare_delete(UserCreatable *uc, Error **errp)
 {
     EventLoopBaseClass *bc = EVENT_LOOP_BASE_GET_CLASS(uc);
     EventLoopBase *backend = EVENT_LOOP_BASE(uc);
 
-    if (bc->can_be_deleted) {
-        return bc->can_be_deleted(backend);
+    if (bc->prepare_delete) {
+        return bc->prepare_delete(backend, errp);
     }
 
     return true;
 }
 
-static void event_loop_base_class_init(ObjectClass *klass, void *class_data)
+static void event_loop_base_class_init(ObjectClass *klass,
+                                       const void *class_data)
 {
     UserCreatableClass *ucc = USER_CREATABLE_CLASS(klass);
     ucc->complete = event_loop_base_complete;
-    ucc->can_be_deleted = event_loop_base_can_be_deleted;
+    ucc->prepare_delete = event_loop_base_prepare_delete;
 
-    object_class_property_add(klass, "aio-max-batch", "int",
+    object_class_property_add(klass, "aio-max-batch", "int64",
+                              &int64_type_info,
                               event_loop_base_get_param,
                               event_loop_base_set_param,
                               NULL, &aio_max_batch_info);
-    object_class_property_add(klass, "thread-pool-min", "int",
+    object_class_property_add(klass, "thread-pool-min", "int64",
+                              &int64_type_info,
                               event_loop_base_get_param,
                               event_loop_base_set_param,
                               NULL, &thread_pool_min_info);
-    object_class_property_add(klass, "thread-pool-max", "int",
+    object_class_property_add(klass, "thread-pool-max", "int64",
+                              &int64_type_info,
                               event_loop_base_get_param,
                               event_loop_base_set_param,
                               NULL, &thread_pool_max_info);
@@ -127,7 +130,7 @@ static const TypeInfo event_loop_base_info = {
     .class_size = sizeof(EventLoopBaseClass),
     .class_init = event_loop_base_class_init,
     .abstract = true,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_USER_CREATABLE },
         { }
     }

@@ -24,9 +24,9 @@
 
 #include "qemu/osdep.h"
 
-#include "hw/sysbus.h"
-#include "hw/boards.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/boards.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "hw/xen/xen-legacy-backend.h"
@@ -635,11 +635,18 @@ int xen_be_bind_evtchn(struct XenLegacyDevice *xendev)
 }
 
 
-static void xendev_class_init(ObjectClass *klass, void *data)
+static void xendev_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+    /*
+     * Legacy Xen backends are created and destroyed dynamically from
+     * xenstore at runtime, after the machine has been initialized.
+     * TYPE_DYNAMIC_SYS_BUS_DEVICE marks devices as not hotpluggable,
+     * so override that here.
+     */
+    dc->hotpluggable = true;
     dc->bus_type = TYPE_XENSYSBUS;
 }
 
@@ -648,9 +655,10 @@ static const TypeInfo xendev_type_info = {
     .parent        = TYPE_DYNAMIC_SYS_BUS_DEVICE,
     .class_init    = xendev_class_init,
     .instance_size = sizeof(XenLegacyDevice),
+    .secure        = true,
 };
 
-static void xen_sysbus_class_init(ObjectClass *klass, void *data)
+static void xen_sysbus_class_init(ObjectClass *klass, const void *data)
 {
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(klass);
 
@@ -661,7 +669,8 @@ static const TypeInfo xensysbus_info = {
     .name       = TYPE_XENSYSBUS,
     .parent     = TYPE_BUS,
     .class_init = xen_sysbus_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .secure     = true,
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_HOTPLUG_HANDLER },
         { }
     }
@@ -670,6 +679,7 @@ static const TypeInfo xensysbus_info = {
 static const TypeInfo xensysdev_info = {
     .name          = TYPE_XENSYSDEV,
     .parent        = TYPE_SYS_BUS_DEVICE,
+    .secure        = true,
 };
 
 static void xenbe_register_types(void)

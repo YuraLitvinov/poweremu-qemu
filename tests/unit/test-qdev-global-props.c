@@ -24,9 +24,10 @@
 
 #include "qemu/osdep.h"
 
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "qom/object.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 
 
@@ -51,7 +52,7 @@ static const Property static_props[] = {
     DEFINE_PROP_UINT32("prop2", MyType, prop2, PROP_DEFAULT),
 };
 
-static void static_prop_class_init(ObjectClass *oc, void *data)
+static void static_prop_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
@@ -171,13 +172,15 @@ static void prop2_accessor(Object *obj, Visitor *v, const char *name,
 
 static void dynamic_instance_init(Object *obj)
 {
-    object_property_add(obj, "prop1", "uint32", prop1_accessor, prop1_accessor,
+    object_property_add(obj, "prop1", "uint32", &uint32_type_info,
+                        prop1_accessor, prop1_accessor,
                         NULL, NULL);
-    object_property_add(obj, "prop2", "uint32", prop2_accessor, prop2_accessor,
+    object_property_add(obj, "prop2", "uint32", &uint32_type_info,
+                        prop2_accessor, prop2_accessor,
                         NULL, NULL);
 }
 
-static void dynamic_class_init(ObjectClass *oc, void *data)
+static void dynamic_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
@@ -193,7 +196,7 @@ static const TypeInfo dynamic_prop_type = {
     .class_init = dynamic_class_init,
 };
 
-static void hotplug_class_init(ObjectClass *oc, void *data)
+static void hotplug_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
@@ -209,7 +212,7 @@ static const TypeInfo hotplug_type = {
     .class_init = hotplug_class_init,
 };
 
-static void nohotplug_class_init(ObjectClass *oc, void *data)
+static void nohotplug_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 

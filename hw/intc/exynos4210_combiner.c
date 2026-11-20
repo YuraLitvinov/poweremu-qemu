@@ -28,14 +28,14 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "qemu/log.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "hw/intc/exynos4210_combiner.h"
 #include "hw/arm/exynos4210.h"
-#include "hw/hw.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "qom/object.h"
 
 //#define DEBUG_COMBINER
@@ -91,8 +91,9 @@ exynos4210_combiner_read(void *opaque, hwaddr offset, unsigned size)
     grp_quad_base_n = req_quad_base_n << 2;
     reg_n = (offset - (req_quad_base_n << 4)) >> 2;
 
-    if (req_quad_base_n >= IIC_NGRP) {
-        /* Read of ICIPSR register */
+    if (grp_quad_base_n >= IIC_NGRP) {
+        /* Read of ICIPSR register. MR size ensures this must be in bounds */
+        assert(reg_n < ARRAY_SIZE(s->icipsr));
         return s->icipsr[reg_n];
     }
 
@@ -118,10 +119,7 @@ exynos4210_combiner_read(void *opaque, hwaddr offset, unsigned size)
                 s->group[grp_quad_base_n + 3].src_pending) << 24;
         break;
     default:
-        if (offset >> 2 >= IIC_REGSET_SIZE) {
-            hw_error("exynos4210.combiner: overflow of reg_set by 0x"
-                    HWADDR_FMT_plx "offset\n", offset);
-        }
+        assert((offset >> 2) < ARRAY_SIZE(s->reg_set));
         val = s->reg_set[offset >> 2];
     }
     return val;
@@ -182,22 +180,21 @@ static void exynos4210_combiner_write(void *opaque, hwaddr offset,
     grp_quad_base_n = req_quad_base_n << 2;
     reg_n = (offset - (req_quad_base_n << 4)) >> 2;
 
-    if (req_quad_base_n >= IIC_NGRP) {
-        hw_error("exynos4210.combiner: unallowed write access at offset 0x"
-                HWADDR_FMT_plx "\n", offset);
+    if (grp_quad_base_n >= IIC_NGRP) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "exynos4210.combiner: unallowed write access at offset 0x"
+                      HWADDR_FMT_plx "\n", offset);
         return;
     }
 
     if (reg_n > 1) {
-        hw_error("exynos4210.combiner: unallowed write access at offset 0x"
-                HWADDR_FMT_plx "\n", offset);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "exynos4210.combiner: unallowed write access at offset 0x"
+                      HWADDR_FMT_plx "\n", offset);
         return;
     }
 
-    if (offset >> 2 >= IIC_REGSET_SIZE) {
-        hw_error("exynos4210.combiner: overflow of reg_set by 0x"
-                HWADDR_FMT_plx "offset\n", offset);
-    }
+    assert((offset >> 2) < ARRAY_SIZE(s->reg_set));
     s->reg_set[offset >> 2] = val;
 
     switch (reg_n) {
@@ -245,9 +242,7 @@ static void exynos4210_combiner_write(void *opaque, hwaddr offset,
         exynos4210_combiner_update(s, grp_quad_base_n + 3);
         break;
     default:
-        hw_error("exynos4210.combiner: unallowed write access at offset 0x"
-                HWADDR_FMT_plx "\n", offset);
-        break;
+        g_assert_not_reached();
     }
 }
 
@@ -329,7 +324,7 @@ static const Property exynos4210_combiner_properties[] = {
     DEFINE_PROP_UINT32("external", Exynos4210CombinerState, external, 0),
 };
 
-static void exynos4210_combiner_class_init(ObjectClass *klass, void *data)
+static void exynos4210_combiner_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

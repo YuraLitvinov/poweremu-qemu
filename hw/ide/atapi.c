@@ -88,46 +88,14 @@ static void cd_data_to_raw(uint8_t *buf, int lba)
     memset(buf, 0, 288);
 }
 
-static int
-cd_read_sector_sync(IDEState *s)
-{
-    int ret;
-    block_acct_start(blk_get_stats(s->blk), &s->acct,
-                     ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
-
-    trace_cd_read_sector_sync(s->lba);
-
-    switch (s->cd_sector_size) {
-    case 2048:
-        ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
-                        ATAPI_SECTOR_SIZE, s->io_buffer, 0);
-        break;
-    case 2352:
-        ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
-                        ATAPI_SECTOR_SIZE, s->io_buffer + 16, 0);
-        if (ret >= 0) {
-            cd_data_to_raw(s->io_buffer, s->lba);
-        }
-        break;
-    default:
-        block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_READ);
-        return -EIO;
-    }
-
-    if (ret < 0) {
-        block_acct_failed(blk_get_stats(s->blk), &s->acct);
-    } else {
-        block_acct_done(blk_get_stats(s->blk), &s->acct);
-        s->lba++;
-        s->io_buffer_index = 0;
-    }
-
-    return ret;
-}
-
 static void cd_read_sector_cb(void *opaque, int ret)
 {
     IDEState *s = opaque;
+    int et = s->elementary_transfer_size;
+    int skip = s->io_buffer_index;
+    int nsec = DIV_ROUND_UP(skip + et, s->cd_sector_size);
+    uint8_t *buf;
+    int i;
 
     trace_cd_read_sector_cb(s->lba, ret);
 
@@ -140,34 +108,64 @@ static void cd_read_sector_cb(void *opaque, int ret)
     block_acct_done(blk_get_stats(s->blk), &s->acct);
 
     if (s->cd_sector_size == 2352) {
-        cd_data_to_raw(s->io_buffer, s->lba);
+        /* unpack back-to-front so a sector never clobbers an unmoved one */
+        for (i = nsec - 1; i >= 0; i--) {
+            memmove(s->io_buffer + i * 2352 + 16, s->io_buffer + i * 2048,
+                    ATAPI_SECTOR_SIZE);
+            cd_data_to_raw(s->io_buffer + i * 2352, s->lba + i);
+        }
     }
 
-    s->lba++;
-    s->io_buffer_index = 0;
     s->status &= ~BUSY_STAT;
 
-    ide_atapi_cmd_reply_end(s);
+    s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO;
+    s->lcyl = et & 0xff;
+    s->hcyl = (et >> 8) & 0xff;
+    ide_bus_set_irq(s->bus);
+
+    /* a boundary sector shared with the next burst is re-read there */
+    buf = s->io_buffer + skip;
+    s->packet_transfer_size -= et;
+    s->lba += (skip + et) / s->cd_sector_size;
+    s->io_buffer_index = (skip + et) % s->cd_sector_size;
+    s->elementary_transfer_size = 0;
+
+    if (ide_transfer_start_norecurse(s, buf, et, ide_atapi_cmd_reply_end)) {
+        ide_atapi_cmd_reply_end(s);
+    }
 }
 
+/*
+ * Read the whole elementary transfer (one DRQ burst) in a single async
+ * request. No read is issued mid-burst, so unlike the old synchronous
+ * rebuffer it cannot deadlock against a concurrent drain.
+ */
 static int cd_read_sector(IDEState *s)
 {
-    void *buf;
+    int et = s->elementary_transfer_size;
+    int skip = s->io_buffer_index;
+    int nsec = DIV_ROUND_UP(skip + et, s->cd_sector_size);
 
     if (s->cd_sector_size != 2048 && s->cd_sector_size != 2352) {
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_READ);
         return -EINVAL;
     }
 
-    buf = (s->cd_sector_size == 2352) ? s->io_buffer + 16 : s->io_buffer;
-    qemu_iovec_init_buf(&s->qiov, buf, ATAPI_SECTOR_SIZE);
+    /* a burst is bounded by the byte count limit, so it fits io_buffer */
+    assert(nsec * s->cd_sector_size <= s->io_buffer_total_len);
+
+    /*
+     * Read the payload packed at the front of io_buffer; the 2352 raw case is
+     * unpacked into place on completion.
+     */
+    qemu_iovec_init_buf(&s->qiov, s->io_buffer, nsec * ATAPI_SECTOR_SIZE);
 
     trace_cd_read_sector(s->lba);
 
     block_acct_start(blk_get_stats(s->blk), &s->acct,
-                     ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
+                     nsec * ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
 
-    ide_buffered_readv(s, (int64_t)s->lba << 2, &s->qiov, 4,
+    ide_buffered_readv(s, (int64_t)s->lba << 2, &s->qiov, nsec * 4,
                        cd_read_sector_cb, s);
 
     s->status |= BUSY_STAT;
@@ -222,59 +220,49 @@ static uint16_t atapi_byte_count_limit(IDEState *s)
 void ide_atapi_cmd_reply_end(IDEState *s)
 {
     int byte_count_limit, size, ret;
-    while (s->packet_transfer_size > 0) {
-        trace_ide_atapi_cmd_reply_end(s, s->packet_transfer_size,
-                                      s->elementary_transfer_size,
-                                      s->io_buffer_index);
 
-        /* see if a new sector must be read */
-        if (s->lba != -1 && s->io_buffer_index >= s->cd_sector_size) {
-            if (!s->elementary_transfer_size) {
-                ret = cd_read_sector(s);
-                if (ret < 0) {
-                    ide_atapi_io_error(s, ret);
-                }
-                return;
-            } else {
-                /* rebuffering within an elementary transfer is
-                 * only possible with a sync request because we
-                 * end up with a race condition otherwise */
-                ret = cd_read_sector_sync(s);
-                if (ret < 0) {
-                    ide_atapi_io_error(s, ret);
-                    return;
-                }
+    trace_ide_atapi_cmd_reply_end(s, s->packet_transfer_size,
+                                  s->elementary_transfer_size,
+                                  s->io_buffer_index);
+
+    if (s->lba != -1 && s->packet_transfer_size > 0) {
+        byte_count_limit = atapi_byte_count_limit(s);
+        trace_ide_atapi_cmd_reply_end_bcl(s, byte_count_limit);
+        size = s->packet_transfer_size;
+        if (size > byte_count_limit) {
+            /* byte count limit must be even if this case */
+            if (byte_count_limit & 1) {
+                byte_count_limit--;
             }
+            size = byte_count_limit;
         }
-        if (s->elementary_transfer_size > 0) {
-            /* there are some data left to transmit in this elementary
-               transfer */
-            size = s->cd_sector_size - s->io_buffer_index;
-            if (size > s->elementary_transfer_size)
-                size = s->elementary_transfer_size;
-        } else {
-            /* a new transfer is needed */
-            s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO;
-            ide_bus_set_irq(s->bus);
-            byte_count_limit = atapi_byte_count_limit(s);
-            trace_ide_atapi_cmd_reply_end_bcl(s, byte_count_limit);
-            size = s->packet_transfer_size;
-            if (size > byte_count_limit) {
-                /* byte count limit must be even if this case */
-                if (byte_count_limit & 1)
-                    byte_count_limit--;
-                size = byte_count_limit;
-            }
-            s->lcyl = size & 0xff;
-            s->hcyl = size >> 8;
-            s->elementary_transfer_size = size;
-            /* we cannot transmit more than one sector at a time */
-            if (s->lba != -1) {
-                if (size > (s->cd_sector_size - s->io_buffer_index))
-                    size = (s->cd_sector_size - s->io_buffer_index);
-            }
-            trace_ide_atapi_cmd_reply_end_new(s, s->status);
+        s->elementary_transfer_size = size;
+        ret = cd_read_sector(s);
+        if (ret < 0) {
+            ide_atapi_io_error(s, ret);
         }
+        return;
+    }
+
+    while (s->packet_transfer_size > 0) {
+        /* a new transfer is needed */
+        s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO;
+        ide_bus_set_irq(s->bus);
+        byte_count_limit = atapi_byte_count_limit(s);
+        trace_ide_atapi_cmd_reply_end_bcl(s, byte_count_limit);
+        size = s->packet_transfer_size;
+        if (size > byte_count_limit) {
+            /* byte count limit must be even if this case */
+            if (byte_count_limit & 1) {
+                byte_count_limit--;
+            }
+            size = byte_count_limit;
+        }
+        s->lcyl = size & 0xff;
+        s->hcyl = size >> 8;
+        s->elementary_transfer_size = size;
+        trace_ide_atapi_cmd_reply_end_new(s, s->status);
+
         s->packet_transfer_size -= size;
         s->elementary_transfer_size -= size;
         s->io_buffer_index += size;
@@ -329,7 +317,7 @@ static void ide_atapi_cmd_read_pio(IDEState *s, int lba, int nb_sectors,
     s->lba = lba;
     s->packet_transfer_size = nb_sectors * sector_size;
     s->elementary_transfer_size = 0;
-    s->io_buffer_index = sector_size;
+    s->io_buffer_index = 0;
     s->cd_sector_size = sector_size;
 
     ide_atapi_cmd_reply_end(s);
@@ -463,6 +451,21 @@ void ide_atapi_dma_restart(IDEState *s)
     ide_atapi_cmd(s);
 }
 
+static inline uint8_t ide_atapi_set_profile(uint8_t *buf, uint8_t *index,
+                                            uint16_t profile)
+{
+    uint8_t *buf_profile = buf + 12; /* start of profiles */
+
+    buf_profile += ((*index) * 4); /* start of indexed profile */
+    stw_be_p(buf_profile, profile);
+    buf_profile[2] = ((buf_profile[0] == buf[6]) && (buf_profile[1] == buf[7]));
+
+    /* each profile adds 4 bytes to the response */
+    (*index)++;
+    buf[11] += 4; /* Additional Length */
+
+    return 4;
+}
 
 static int ide_dvd_read_structure(IDEState *s, int format,
                                   const uint8_t *packet, uint8_t *buf)
@@ -794,210 +797,158 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
     ide_atapi_cmd_reply(s, idx, max_len);
 }
 
-/*
- * One feature descriptor at `p`, or 0 if this drive has no such feature.
- * `current` says whether it applies to what is in the drive now.
- */
-static int atapi_feature(IDEState *s, uint16_t feature, uint8_t *p, bool *current)
-{
-    switch (feature) {
-    case 0x0000:                /* Profile List */
-        stw_be_p(p, 0x0000);
-        p[2] = 0x03;            /* version 0, persistent, current */
-        p[3] = 0;
-        stw_be_p(p + 4, MMC_PROFILE_DVD_ROM);
-        p[6] = media_is_dvd(s);
-        p[7] = 0;
-        stw_be_p(p + 8, MMC_PROFILE_CD_ROM);
-        p[10] = media_is_cd(s);
-        p[11] = 0;
-        p[3] = 8;               /* additional length */
-        *current = true;
-        return 12;
-
-    case 0x0001:                /* Core: what the drive is plugged into */
-        stw_be_p(p, 0x0001);
-        p[2] = 0x0b;            /* version 2, persistent, current */
-        p[3] = 8;
-        stl_be_p(p + 4, 0x00000002);    /* physical interface: ATAPI */
-        p[8] = 0x01;            /* DBE: the tray can be opened */
-        p[9] = p[10] = p[11] = 0;
-        *current = true;
-        return 12;
-
-    case 0x0003:                /* Removable Medium */
-        stw_be_p(p, 0x0003);
-        p[2] = 0x03;
-        p[3] = 4;
-        p[4] = (1 << 5) | (1 << 3) | (1 << 1);  /* tray, eject, lockable */
-        p[5] = p[6] = p[7] = 0;
-        *current = true;
-        return 8;
-
-    case 0x0010:                /* Random Readable */
-        stw_be_p(p, 0x0010);
-        p[2] = 0x03;
-        p[3] = 8;
-        stl_be_p(p + 4, 2048);  /* logical block size */
-        stw_be_p(p + 8, 1);     /* blocking */
-        p[10] = 0;
-        p[11] = 0;
-        *current = media_present(s);
-        return 12;
-
-    default:
-        return 0;
-    }
-}
-
 static void cmd_get_configuration(IDEState *s, uint8_t *buf)
 {
-    static const uint16_t features[] = { 0x0000, 0x0001, 0x0003, 0x0010 };
-    uint16_t start = lduw_be_p(buf + 2);
-    int rt = buf[1] & 0x03;
-    int max_len = lduw_be_p(buf + 7);
-    uint32_t len = 8;
-    unsigned i;
+    uint32_t len;
+    uint8_t index = 0;
+    int max_len;
+
+    /* only feature 0 is supported */
+    if (buf[2] != 0 || buf[3] != 0) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                            ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+
+    /* XXX: could result in alignment problems in some architectures */
+    max_len = lduw_be_p(buf + 7);
 
     /*
-     * The three request types are not optional extras: Mac OS X asks with
-     * RT=2 for one feature at a time, starting with 0x0000 and then 0x0001,
-     * and a drive that answers only feature 0 hands it an ILLEGAL REQUEST
-     * for the second question.  It then asks what went wrong, is told
-     * nothing useful, and tries again -- which is where the run of REQUEST
-     * SENSE packets in a capture comes from.
+     * XXX: avoid overflow for io_buffer if max_len is bigger than
+     *      the size of that buffer (dimensioned to max number of
+     *      sectors to transfer at once)
+     *
+     *      Only a problem if the feature/profiles grow.
      */
     if (max_len > BDRV_SECTOR_SIZE) {
-        max_len = BDRV_SECTOR_SIZE;     /* XXX: assume one sector */
+        /* XXX: assume 1 sector */
+        max_len = BDRV_SECTOR_SIZE;
     }
-    memset(buf, 0, BDRV_SECTOR_SIZE);
 
+    memset(buf, 0, max_len);
+    /*
+     * the number of sectors from the media tells us which profile
+     * to use as current.  0 means there is no media
+     */
     if (media_is_dvd(s)) {
         stw_be_p(buf + 6, MMC_PROFILE_DVD_ROM);
     } else if (media_is_cd(s)) {
         stw_be_p(buf + 6, MMC_PROFILE_CD_ROM);
     }
 
-    for (i = 0; i < ARRAY_SIZE(features); i++) {
-        bool current = false;
-        int n;
+    buf[10] = 0x02 | 0x01; /* persistent and current */
+    len = 12; /* headers: 8 + 4 */
+    len += ide_atapi_set_profile(buf, &index, MMC_PROFILE_DVD_ROM);
+    len += ide_atapi_set_profile(buf, &index, MMC_PROFILE_CD_ROM);
+    stl_be_p(buf, len - 4); /* data length */
 
-        if (rt == 2 && features[i] != start) {
-            continue;
-        }
-        if (rt != 2 && features[i] < start) {
-            continue;
-        }
-        /*
-         * Built in full and truncated on the way out, never while building.
-         * An initiator asks twice: once with a small buffer to learn how
-         * long the answer is, then again with room for it.  Stopping early
-         * makes the first answer say the drive has no features at all,
-         * which Mac OS X believes -- and then panics.
-         */
-        if (len + 12 > BDRV_SECTOR_SIZE) {
-            break;
-        }
-        n = atapi_feature(s, features[i], buf + len, &current);
-        if (n == 0 || (rt == 1 && !current)) {
-            continue;
-        }
-        len += n;
-    }
-
-    stl_be_p(buf, len - 4);     /* data length */
     ide_atapi_cmd_reply(s, len, max_len);
-}
-
-static int atapi_mode_page(IDEState *s, int code, uint8_t *p)
-{
-    switch (code) {
-    case MODE_PAGE_R_W_ERROR:
-        p[0] = MODE_PAGE_R_W_ERROR;
-        p[1] = 6;
-        p[2] = 0x00;
-        p[3] = 0x05;
-        p[4] = p[5] = p[6] = p[7] = 0x00;
-        return 8;
-
-    case MODE_PAGE_AUDIO_CTL:
-        memset(p, 0, 16);
-        p[0] = MODE_PAGE_AUDIO_CTL;
-        p[1] = 14;
-        return 16;
-
-    case MODE_PAGE_CAPABILITIES:
-        memset(p, 0, 22);
-        p[0] = MODE_PAGE_CAPABILITIES;
-        p[1] = 20;
-        p[2] = 0x3b;            /* reads CD-R/RW, DVD-ROM, DVD-R, DVD-RAM */
-        p[3] = 0x00;            /* writes nothing, yet */
-        /*
-         * Claim PLAY_AUDIO (0x01): some Linux code will not automount
-         * without it.
-         */
-        p[4] = 0x71;
-        p[5] = 3 << 5;
-        p[6] = (1 << 0) | (1 << 3) | (1 << 5);
-        if (s->tray_locked) {
-            p[6] |= 1 << 1;
-        }
-        p[7] = 0x00;            /* no volume or mute control, no changer */
-        stw_be_p(&p[8], 704);   /* 4x read */
-        p[10] = 0;              /* two volume levels */
-        p[11] = 2;
-        stw_be_p(&p[12], 512);  /* 512k buffer */
-        stw_be_p(&p[14], 704);  /* 4x read, current */
-        return 22;
-
-    default:
-        return 0;
-    }
-}
-
-static void atapi_mode_sense(IDEState *s, uint8_t *buf, bool ten)
-{
-    int action = buf[2] >> 6;
-    int code = buf[2] & 0x3f;
-    int head = ten ? 8 : 4;
-    int max_len = ten ? lduw_be_p(buf + 7) : buf[4];
-    int page;
-
-    if (action == 3) {          /* saved values */
-        ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
-                            ASC_SAVING_PARAMETERS_NOT_SUPPORTED);
-        return;
-    }
-    if (action != 0) {          /* changeable or default values */
-        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
-        return;
-    }
-
-    memset(buf, 0, head);
-    page = atapi_mode_page(s, code, buf + head);
-    if (page == 0) {
-        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
-        return;
-    }
-
-    if (ten) {
-        stw_be_p(&buf[0], head + page - 2);
-        buf[2] = 0x70;          /* medium type */
-    } else {
-        buf[0] = head + page - 1;
-        buf[1] = 0x70;
-    }
-    ide_atapi_cmd_reply(s, head + page, max_len);
 }
 
 static void cmd_mode_sense(IDEState *s, uint8_t *buf)
 {
-    atapi_mode_sense(s, buf, true);
-}
+    int action, code;
+    int max_len;
 
-static void cmd_mode_sense_6(IDEState *s, uint8_t *buf)
-{
-    atapi_mode_sense(s, buf, false);
+    max_len = lduw_be_p(buf + 7);
+    action = buf[2] >> 6;
+    code = buf[2] & 0x3f;
+
+    switch(action) {
+    case 0: /* current values */
+        switch(code) {
+        case MODE_PAGE_R_W_ERROR: /* error recovery */
+            stw_be_p(&buf[0], 16 - 2);
+            buf[2] = 0x70;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = 0;
+            buf[7] = 0;
+
+            buf[8] = MODE_PAGE_R_W_ERROR;
+            buf[9] = 16 - 10;
+            buf[10] = 0x00;
+            buf[11] = 0x05;
+            buf[12] = 0x00;
+            buf[13] = 0x00;
+            buf[14] = 0x00;
+            buf[15] = 0x00;
+            ide_atapi_cmd_reply(s, 16, max_len);
+            break;
+        case MODE_PAGE_AUDIO_CTL:
+            stw_be_p(&buf[0], 24 - 2);
+            buf[2] = 0x70;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = 0;
+            buf[7] = 0;
+
+            buf[8] = MODE_PAGE_AUDIO_CTL;
+            buf[9] = 24 - 10;
+            /* Fill with CDROM audio volume */
+            buf[17] = 0;
+            buf[19] = 0;
+            buf[21] = 0;
+            buf[23] = 0;
+
+            ide_atapi_cmd_reply(s, 24, max_len);
+            break;
+        case MODE_PAGE_CAPABILITIES:
+            stw_be_p(&buf[0], 30 - 2);
+            buf[2] = 0x70;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = 0;
+            buf[7] = 0;
+
+            buf[8] = MODE_PAGE_CAPABILITIES;
+            buf[9] = 30 - 10;
+            buf[10] = 0x3b; /* read CDR/CDRW/DVDROM/DVDR/DVDRAM */
+            buf[11] = 0x00;
+
+            /* Claim PLAY_AUDIO capability (0x01) since some Linux
+               code checks for this to automount media. */
+            buf[12] = 0x71;
+            buf[13] = 3 << 5;
+            buf[14] = (1 << 0) | (1 << 3) | (1 << 5);
+            if (s->tray_locked) {
+                buf[14] |= 1 << 1;
+            }
+            buf[15] = 0x00; /* No volume & mute control, no changer */
+            stw_be_p(&buf[16], 704); /* 4x read speed */
+            buf[18] = 0; /* Two volume levels */
+            buf[19] = 2;
+            stw_be_p(&buf[20], 512); /* 512k buffer */
+            stw_be_p(&buf[22], 704); /* 4x read speed current */
+            buf[24] = 0;
+            buf[25] = 0;
+            buf[26] = 0;
+            buf[27] = 0;
+            buf[28] = 0;
+            buf[29] = 0;
+            ide_atapi_cmd_reply(s, 30, max_len);
+            break;
+        default:
+            goto error_cmd;
+        }
+        break;
+    case 1: /* changeable values */
+        goto error_cmd;
+    case 2: /* default values */
+        goto error_cmd;
+    default:
+    case 3: /* saved values */
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                            ASC_SAVING_PARAMETERS_NOT_SUPPORTED);
+        break;
+    }
+    return;
+
+error_cmd:
+    ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
 }
 
 static void cmd_test_unit_ready(IDEState *s, uint8_t *buf)
@@ -1322,7 +1273,6 @@ static const struct AtapiCmd {
     [ 0x03 ] = { cmd_request_sense,                 ALLOW_UA },
     [ 0x12 ] = { cmd_inquiry,                       ALLOW_UA },
     [ 0x1b ] = { cmd_start_stop_unit,               NONDATA }, /* [1] */
-    [ 0x1a ] = { cmd_mode_sense_6,                  0 },
     [ 0x1e ] = { cmd_prevent_allow_medium_removal,  NONDATA },
     [ 0x25 ] = { cmd_read_cdvd_capacity,            CHECK_READY },
     [ 0x28 ] = { cmd_read, /* (10) */               CHECK_READY },
@@ -1340,70 +1290,10 @@ static const struct AtapiCmd {
     /* [1] handler detects and reports not ready condition itself */
 };
 
-/*
- * Every packet the guest sends the drive, named, with POWEREMU_ATAPI set.
- *
- * QEMU's ATAPI drive can only be read from, and teaching it to be written
- * to means knowing what Mac OS X asks a burner for -- which is not the same
- * as what the MMC specification allows it to ask.  The names below cover
- * the commands a writer needs as well as the ones already answered, so an
- * unimplemented one shows up by name rather than as a number, and the
- * "unimplemented" line says what is missing and in what order it was
- * wanted.
- */
-static const char *atapi_cmd_name(uint8_t op)
-{
-    switch (op) {
-    case 0x00: return "TEST UNIT READY";
-    case 0x03: return "REQUEST SENSE";
-    case 0x12: return "INQUIRY";
-    case 0x1b: return "START/STOP UNIT";
-    case 0x1e: return "PREVENT/ALLOW REMOVAL";
-    case 0x23: return "READ FORMAT CAPACITIES";
-    case 0x25: return "READ CAPACITY";
-    case 0x28: return "READ(10)";
-    case 0x2a: return "WRITE(10)";
-    case 0x2b: return "SEEK";
-    case 0x2e: return "WRITE AND VERIFY(10)";
-    case 0x35: return "SYNCHRONIZE CACHE";
-    case 0x3b: return "WRITE BUFFER";
-    case 0x43: return "READ TOC/PMA/ATIP";
-    case 0x46: return "GET CONFIGURATION";
-    case 0x4a: return "GET EVENT STATUS NOTIFICATION";
-    case 0x51: return "READ DISC INFORMATION";
-    case 0x52: return "READ TRACK INFORMATION";
-    case 0x53: return "RESERVE TRACK";
-    case 0x54: return "SEND OPC INFORMATION";
-    case 0x55: return "MODE SELECT(10)";
-    case 0x5a: return "MODE SENSE(10)";
-    case 0x5b: return "CLOSE TRACK/SESSION";
-    case 0x5c: return "READ BUFFER CAPACITY";
-    case 0x5d: return "SEND CUE SHEET";
-    case 0xa1: return "BLANK";
-    case 0xa8: return "READ(12)";
-    case 0xaa: return "WRITE(12)";
-    case 0xad: return "READ DVD STRUCTURE";
-    case 0xbb: return "SET CD SPEED";
-    case 0xbd: return "MECHANISM STATUS";
-    case 0xbe: return "READ CD";
-    default:   return "?";
-    }
-}
-
 void ide_atapi_cmd(IDEState *s)
 {
     uint8_t *buf = s->io_buffer;
     const struct AtapiCmd *cmd = &atapi_cmd_table[s->io_buffer[0]];
-
-    if (getenv("POWEREMU_ATAPI")) {
-        char pkt[ATAPI_PACKET_SIZE * 3 + 1];
-        int i;
-        for (i = 0; i < ATAPI_PACKET_SIZE; i++) {
-            snprintf(pkt + i * 3, 4, "%02x ", buf[i]);
-        }
-        fprintf(stderr, "ATAPI %02x %-30s %s%s\n", buf[0], atapi_cmd_name(buf[0]),
-                pkt, cmd->handler ? "" : "   <- unimplemented");
-    }
 
     trace_ide_atapi_cmd(s, s->io_buffer[0]);
 

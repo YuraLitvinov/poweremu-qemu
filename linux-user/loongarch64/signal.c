@@ -111,9 +111,10 @@ static abi_ptr extframe_alloc(struct extctx_layout *extctx,
 {
     abi_ptr sp = orig_sp;
 
-    sp -= sizeof(struct target_sctx_info) + size;
+    sp -= size;
     align = MAX(align, CONTEXT_INFO_ALIGN);
     sp = ROUND_DOWN(sp, align);
+    sp -= sizeof(struct target_sctx_info);
     sctx->gaddr = sp;
 
     size = orig_sp - sp;
@@ -126,6 +127,8 @@ static abi_ptr extframe_alloc(struct extctx_layout *extctx,
 static abi_ptr setup_extcontext(CPULoongArchState *env,
                                 struct extctx_layout *extctx, abi_ptr sp)
 {
+    CPUSysState *sys = env_sys(env);
+
     memset(extctx, 0, sizeof(struct extctx_layout));
 
     /* Grow down, alloc "end" context info first. */
@@ -134,10 +137,10 @@ static abi_ptr setup_extcontext(CPULoongArchState *env,
     /* For qemu, there is no lazy fp context switch, so fp always present. */
     extctx->flags = SC_USED_FP;
 
-    if (FIELD_EX64(env->CSR_EUEN, CSR_EUEN, ASXE)) {
+    if (FIELD_EX64(sys->CSR_EUEN, CSR_EUEN, ASXE)) {
         sp = extframe_alloc(extctx, &extctx->lasx,
                         sizeof(struct target_lasx_context), LASX_CTX_ALIGN, sp);
-    } else if (FIELD_EX64(env->CSR_EUEN, CSR_EUEN, SXE)) {
+    } else if (FIELD_EX64(sys->CSR_EUEN, CSR_EUEN, SXE)) {
         sp = extframe_alloc(extctx, &extctx->lsx,
                         sizeof(struct target_lsx_context), LSX_CTX_ALIGN, sp);
     } else {
@@ -152,6 +155,7 @@ static void setup_sigframe(CPULoongArchState *env,
                            struct target_sigcontext *sc,
                            struct extctx_layout *extctx)
 {
+    CPUSysState *sys = env_sys(env);
     struct target_sctx_info *info;
     int i;
 
@@ -166,7 +170,7 @@ static void setup_sigframe(CPULoongArchState *env,
      * Set extension context
      */
 
-    if (FIELD_EX64(env->CSR_EUEN, CSR_EUEN, ASXE)) {
+    if (FIELD_EX64(sys->CSR_EUEN, CSR_EUEN, ASXE)) {
         struct target_lasx_context *lasx_ctx;
         info = extctx->lasx.haddr;
 
@@ -183,7 +187,7 @@ static void setup_sigframe(CPULoongArchState *env,
         }
         __put_user(read_fcc(env), &lasx_ctx->fcc);
         __put_user(env->fcsr0, &lasx_ctx->fcsr);
-    } else if (FIELD_EX64(env->CSR_EUEN, CSR_EUEN, SXE)) {
+    } else if (FIELD_EX64(sys->CSR_EUEN, CSR_EUEN, SXE)) {
         struct target_lsx_context *lsx_ctx;
         info = extctx->lsx.haddr;
 
@@ -350,6 +354,7 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
                     target_siginfo_t *info,
                     target_sigset_t *set, CPULoongArchState *env)
 {
+    CPUSysState *sys = env_sys(env);
     struct target_rt_sigframe *frame;
     struct extctx_layout extctx;
     abi_ptr frame_addr;
@@ -365,10 +370,10 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
         return;
     }
 
-    if (FIELD_EX64(env->CSR_EUEN, CSR_EUEN, ASXE)) {
+    if (FIELD_EX64(sys->CSR_EUEN, CSR_EUEN, ASXE)) {
         extctx.lasx.haddr = (void *)frame + (extctx.lasx.gaddr - frame_addr);
         extctx.end.haddr = (void *)frame + (extctx.end.gaddr - frame_addr);
-    } else if (FIELD_EX64(env->CSR_EUEN, CSR_EUEN, SXE)) {
+    } else if (FIELD_EX64(sys->CSR_EUEN, CSR_EUEN, SXE)) {
         extctx.lsx.haddr = (void *)frame + (extctx.lsx.gaddr - frame_addr);
         extctx.end.haddr = (void *)frame + (extctx.end.gaddr - frame_addr);
     } else {

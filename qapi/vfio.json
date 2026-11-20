@@ -3,13 +3,20 @@
 #
 
 ##
-# = VFIO devices
+# ************
+# VFIO devices
+# ************
 ##
 
 ##
 # @QapiVfioMigrationState:
-#
-# An enumeration of the VFIO device migration states.
+#     An enumeration of the VFIO device migration states.  In addition
+#     to the regular states, there are prepare states (with 'prepare'
+#     suffix) which indicate that the device is just about to
+#     transition to the corresponding state.  Note that seeing a
+#     prepare state for state X doesn't guarantee that the next state
+#     will be X, as the state transition can fail and the device may
+#     transition to a different state instead.
 #
 # @stop: The device is stopped.
 #
@@ -30,16 +37,19 @@
 #     tracking its internal state and its internal state is available
 #     for reading.
 #
+# @pre-copy-p2p-prepare: The device is just about to move to
+#     pre-copy-p2p state.  (since 11.0)
+#
 # Since: 9.1
 ##
 { 'enum': 'QapiVfioMigrationState',
   'data': [ 'stop', 'running', 'stop-copy', 'resuming', 'running-p2p',
-            'pre-copy', 'pre-copy-p2p' ] }
+            'pre-copy', 'pre-copy-p2p', 'pre-copy-p2p-prepare' ] }
 
 ##
 # @VFIO_MIGRATION:
-#
-# This event is emitted when a VFIO device migration state is changed.
+#     This event is emitted when a VFIO device migration state is
+#     changed.
 #
 # @device-id: The device's id, if it has one.
 #

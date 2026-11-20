@@ -38,10 +38,6 @@ config PCSPK
     default y
     depends on I8254
 
-config WM8750
-    bool
-    depends on I2C
-
 config PL041
     bool
 
@@ -55,9 +51,3 @@ config VIRTIO_SND
     bool
     default y
     depends on VIRTIO
-
-config MARVELL_88W8618
-    bool
-
-config SCREAMER
-    bool

@@ -19,22 +19,22 @@
 #include "monitor/monitor.h"
 #include "monitor/hmp.h"
 #include "qapi/error.h"
-#include "qapi/qapi-commands-misc-target.h"
+#include "qapi/qapi-commands-misc-i386.h"
 #include "qobject/qdict.h"
 #include "qom/object.h"
 #include "exec/target_page.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
 #include "migration/vmstate.h"
 #include "trace.h"
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/xen/xen.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/xen/xen_backend_ops.h"
 
 #include "xen_evtchn.h"
@@ -271,7 +271,7 @@ static const VMStateDescription xen_evtchn_vmstate = {
     }
 };
 
-static void xen_evtchn_class_init(ObjectClass *klass, void *data)
+static void xen_evtchn_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -1877,7 +1877,7 @@ int xen_physdev_map_pirq(struct physdev_map_pirq *map)
             return pirq;
         }
         map->pirq = pirq;
-    } else if (pirq > s->nr_pirqs) {
+    } else if (pirq >= s->nr_pirqs) {
         return -EINVAL;
     } else {
         /*
@@ -2344,51 +2344,53 @@ void qmp_xen_event_inject(uint32_t port, Error **errp)
     }
 }
 
-void hmp_xen_event_list(Monitor *mon, const QDict *qdict)
+#ifdef CONFIG_HMP
+void hmp_xen_event_list(MonitorHMP *hmp, const QDict *qdict)
 {
     EvtchnInfoList *iter, *info_list;
     Error *err = NULL;
 
     info_list = qmp_xen_event_list(&err);
     if (err) {
-        hmp_handle_error(mon, err);
+        hmp_handle_error(hmp, err);
         return;
     }
 
     for (iter = info_list; iter; iter = iter->next) {
         EvtchnInfo *info = iter->value;
 
-        monitor_printf(mon, "port %4u: vcpu: %d %s", info->port, info->vcpu,
-                       EvtchnPortType_str(info->type));
+        monitor_hmp_printf(hmp, "port %4u: vcpu: %d %s", info->port, info->vcpu,
+                           EvtchnPortType_str(info->type));
         if (info->type != EVTCHN_PORT_TYPE_IPI) {
-            monitor_printf(mon,  "(");
+            monitor_hmp_printf(hmp,  "(");
             if (info->remote_domain) {
-                monitor_printf(mon, "%s:", info->remote_domain);
+                monitor_hmp_printf(hmp, "%s:", info->remote_domain);
             }
-            monitor_printf(mon, "%d)", info->target);
+            monitor_hmp_printf(hmp, "%d)", info->target);
         }
         if (info->pending) {
-            monitor_printf(mon, " PENDING");
+            monitor_hmp_printf(hmp, " PENDING");
         }
         if (info->masked) {
-            monitor_printf(mon, " MASKED");
+            monitor_hmp_printf(hmp, " MASKED");
         }
-        monitor_printf(mon, "\n");
+        monitor_hmp_printf(hmp, "\n");
     }
 
     qapi_free_EvtchnInfoList(info_list);
 }
 
-void hmp_xen_event_inject(Monitor *mon, const QDict *qdict)
+void hmp_xen_event_inject(MonitorHMP *hmp, const QDict *qdict)
 {
     int port = qdict_get_int(qdict, "port");
     Error *err = NULL;
 
     qmp_xen_event_inject(port, &err);
     if (err) {
-        hmp_handle_error(mon, err);
+        hmp_handle_error(hmp, err);
     } else {
-        monitor_printf(mon, "Delivered port %d\n", port);
+        monitor_hmp_printf(hmp, "Delivered port %d\n", port);
     }
 }
 
+#endif

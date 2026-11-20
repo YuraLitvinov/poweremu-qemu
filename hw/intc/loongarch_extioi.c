@@ -9,9 +9,11 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
+#include "hw/intc/intc.h"
 #include "hw/loongarch/virt.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
+#include "system/kvm.h"
 #include "hw/intc/loongarch_extioi.h"
 #include "trace.h"
 
@@ -351,43 +353,61 @@ static void loongarch_extioi_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    for (i = 0; i < EXTIOI_IRQS; i++) {
-        sysbus_init_irq(sbd, &s->irq[i]);
-    }
-
-    qdev_init_gpio_in(dev, extioi_setirq, EXTIOI_IRQS);
-    memory_region_init_io(&s->extioi_system_mem, OBJECT(s), &extioi_ops,
-                          s, "extioi_system_mem", 0x900);
-    sysbus_init_mmio(sbd, &s->extioi_system_mem);
-
     if (s->features & BIT(EXTIOI_HAS_VIRT_EXTENSION)) {
-        memory_region_init_io(&s->virt_extend, OBJECT(s), &extioi_virt_ops,
-                              s, "extioi_virt", EXTIOI_VIRT_SIZE);
-        sysbus_init_mmio(sbd, &s->virt_extend);
         s->features |= EXTIOI_VIRT_HAS_FEATURES;
     } else {
         s->status |= BIT(EXTIOI_ENABLE);
     }
+
+    if (kvm_irqchip_in_kernel()) {
+        kvm_extioi_realize(dev, errp);
+    } else {
+        for (i = 0; i < EXTIOI_IRQS; i++) {
+            sysbus_init_irq(sbd, &s->irq[i]);
+        }
+
+        qdev_init_gpio_in(dev, extioi_setirq, EXTIOI_IRQS);
+        memory_region_init_io(&s->extioi_system_mem, OBJECT(s), &extioi_ops,
+                              s, "extioi_system_mem", 0x900);
+        sysbus_init_mmio(sbd, &s->extioi_system_mem);
+        if (s->features & BIT(EXTIOI_HAS_VIRT_EXTENSION)) {
+            memory_region_init_io(&s->virt_extend, OBJECT(s), &extioi_virt_ops,
+                                  s, "extioi_virt", EXTIOI_VIRT_SIZE);
+            sysbus_init_mmio(sbd, &s->virt_extend);
+        }
+    }
 }
 
-static void loongarch_extioi_unrealize(DeviceState *dev)
+static void loongarch_extioi_reset_hold(Object *obj, ResetType type)
 {
-    LoongArchExtIOICommonState *s = LOONGARCH_EXTIOI_COMMON(dev);
+    LoongArchExtIOIClass *lec = LOONGARCH_EXTIOI_GET_CLASS(obj);
 
-    g_free(s->cpu);
+    if (lec->parent_phases.hold) {
+        lec->parent_phases.hold(obj, type);
+    }
+
+    if (kvm_irqchip_in_kernel()) {
+        kvm_extioi_put(obj, 0);
+    }
 }
 
-static void loongarch_extioi_reset(DeviceState *d)
+static int vmstate_extioi_pre_save(void *opaque)
 {
-    LoongArchExtIOICommonState *s = LOONGARCH_EXTIOI_COMMON(d);
+    if (kvm_irqchip_in_kernel()) {
+        return kvm_extioi_get(opaque);
+    }
 
-    s->status = 0;
+    return 0;
 }
 
 static int vmstate_extioi_post_load(void *opaque, int version_id)
 {
     LoongArchExtIOICommonState *s = LOONGARCH_EXTIOI_COMMON(opaque);
     int i, start_irq;
+
+    if (kvm_irqchip_in_kernel()) {
+        return kvm_extioi_put(opaque, version_id);
+    }
 
     for (i = 0; i < (EXTIOI_IRQS / 4); i++) {
         start_irq = i * 4;
@@ -401,18 +421,89 @@ static int vmstate_extioi_post_load(void *opaque, int version_id)
     return 0;
 }
 
-static void loongarch_extioi_class_init(ObjectClass *klass, void *data)
+static void loongarch_extioi_print_info(InterruptStatsProvider *obj,
+                                        GString *buf)
+{
+    LoongArchExtIOICommonState *s = LOONGARCH_EXTIOI_COMMON(obj);
+    uint32_t *val;
+    unsigned long irq;
+    ExtIOICore *core;
+    int i;
+
+    vmstate_extioi_pre_save(s);
+    g_string_append_printf(buf, "%s:\n", object_get_typename(OBJECT(obj)));
+
+    val = s->isr;
+    g_string_append_printf(buf, "  ISR     0x%08"PRIx32" 0x%08"PRIx32
+                                " 0x%08"PRIx32" 0x%08"PRIx32"\n",
+                                *val, *(val + 1), *(val + 2), *(val + 3));
+    val += 4;
+    g_string_append_printf(buf, "          0x%08"PRIx32" 0x%08"PRIx32
+                                " 0x%08"PRIx32" 0x%08"PRIx32"\n",
+                                *val, *(val + 1), *(val + 2), *(val + 3));
+    val = s->enable;
+    g_string_append_printf(buf, "  ENABLE  0x%08"PRIx32" 0x%08"PRIx32
+                                " 0x%08"PRIx32" 0x%08"PRIx32"\n",
+                                *val, *(val + 1), *(val + 2), *(val + 3));
+    val += 4;
+    g_string_append_printf(buf, "          0x%08"PRIx32" 0x%08"PRIx32
+                                " 0x%08"PRIx32" 0x%08"PRIx32"\n",
+                                *val, *(val + 1), *(val + 2), *(val + 3));
+
+    val = s->ipmap;
+    g_string_append_printf(buf, "  IPMAP   0x%08"PRIx32" 0x%08"PRIx32"\n",
+                                *val, *(val + 1));
+
+    val = s->coremap;
+    g_string_append_printf(buf, "  IRQ route:\n");
+    for (i = 0; i < (EXTIOI_IRQS / 4); i += 4) {
+        g_string_append_printf(buf, "    [%-3u - %-3u] 0x%08"PRIx32
+                                    " 0x%08"PRIx32" 0x%08"PRIx32
+                                    " 0x%08"PRIx32"\n",
+                                    i * 4, i * 4 + 15, *val, *(val + 1),
+                                    *(val + 2), *(val + 3));
+        val += 4;
+    }
+
+    core = s->cpu;
+    for (i = 0; i < s->num_cpu; i++, core++) {
+        if (!core->cpu) {
+            continue;
+        }
+
+        irq = find_first_bit((unsigned long *)core->coreisr, EXTIOI_IRQS);
+        /* No pending IRQ */
+        if (irq == EXTIOI_IRQS) {
+            continue;
+        }
+
+        val = core->coreisr;
+        g_string_append_printf(buf, "  CPU[%-3u] ISR 0x%08"PRIx32" 0x%08"PRIx32
+                                    " 0x%08"PRIx32" 0x%08"PRIx32"\n",
+                                    i, *val, *(val + 1), *(val + 2),
+                                    *(val + 3));
+        val += 4;
+        g_string_append_printf(buf, "              0x%08"PRIx32" 0x%08"PRIx32
+                                    " 0x%08"PRIx32" 0x%08"PRIx32"\n",
+                                    *val, *(val + 1), *(val + 2), *(val + 3));
+    }
+}
+
+static void loongarch_extioi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     LoongArchExtIOIClass *lec = LOONGARCH_EXTIOI_CLASS(klass);
     LoongArchExtIOICommonClass *lecc = LOONGARCH_EXTIOI_COMMON_CLASS(klass);
+    InterruptStatsProviderClass *ic = INTERRUPT_STATS_PROVIDER_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     device_class_set_parent_realize(dc, loongarch_extioi_realize,
                                     &lec->parent_realize);
-    device_class_set_parent_unrealize(dc, loongarch_extioi_unrealize,
-                                      &lec->parent_unrealize);
-    device_class_set_legacy_reset(dc, loongarch_extioi_reset);
+    resettable_class_set_parent_phases(rc, NULL, loongarch_extioi_reset_hold,
+                                       NULL, &lec->parent_phases);
+    lecc->pre_save  = vmstate_extioi_pre_save;
     lecc->post_load = vmstate_extioi_post_load;
+    ic->print_info = loongarch_extioi_print_info;
 }
 
 static const TypeInfo loongarch_extioi_types[] = {
@@ -422,6 +513,10 @@ static const TypeInfo loongarch_extioi_types[] = {
         .instance_size = sizeof(LoongArchExtIOIState),
         .class_size    = sizeof(LoongArchExtIOIClass),
         .class_init    = loongarch_extioi_class_init,
+        .interfaces         = (const InterfaceInfo[]) {
+            { TYPE_INTERRUPT_STATS_PROVIDER },
+            { }
+        },
     }
 };
 

@@ -2,8 +2,8 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
-#include "hw/loader.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/loader.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/display/ramfb.h"
 #include "ui/console.h"
 #include "qom/object.h"
@@ -17,9 +17,10 @@ struct RAMFBStandaloneState {
     QemuConsole *con;
     RAMFBState *state;
     bool migrate;
+    bool use_legacy_x86_rom;
 };
 
-static void display_update_wrapper(void *dev)
+static bool display_update_wrapper(void *dev)
 {
     RAMFBStandaloneState *ramfb = RAMFB(dev);
 
@@ -28,6 +29,8 @@ static void display_update_wrapper(void *dev)
     } else {
         ramfb_display_update(ramfb->con, ramfb->state);
     }
+
+    return true;
 }
 
 static const GraphicHwOps wrapper_ops = {
@@ -38,8 +41,8 @@ static void ramfb_realizefn(DeviceState *dev, Error **errp)
 {
     RAMFBStandaloneState *ramfb = RAMFB(dev);
 
-    ramfb->con = graphic_console_init(dev, 0, &wrapper_ops, dev);
-    ramfb->state = ramfb_setup(errp);
+    ramfb->con = qemu_graphic_console_create(dev, 0, &wrapper_ops, dev);
+    ramfb->state = ramfb_setup(ramfb->use_legacy_x86_rom, errp);
 }
 
 static bool migrate_needed(void *opaque)
@@ -62,9 +65,11 @@ static const VMStateDescription ramfb_dev_vmstate = {
 
 static const Property ramfb_properties[] = {
     DEFINE_PROP_BOOL("x-migrate", RAMFBStandaloneState, migrate,  true),
+    DEFINE_PROP_BOOL("use-legacy-x86-rom", RAMFBStandaloneState,
+                     use_legacy_x86_rom, false),
 };
 
-static void ramfb_class_initfn(ObjectClass *klass, void *data)
+static void ramfb_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -80,6 +85,7 @@ static const TypeInfo ramfb_info = {
     .parent        = TYPE_DYNAMIC_SYS_BUS_DEVICE,
     .instance_size = sizeof(RAMFBStandaloneState),
     .class_init    = ramfb_class_initfn,
+    .secure        = true,
 };
 
 static void ramfb_register_types(void)

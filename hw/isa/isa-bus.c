@@ -21,7 +21,7 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "system/system.h"
 #include "hw/isa/isa.h"
 
@@ -29,7 +29,7 @@ static ISABus *isabus;
 
 static char *isabus_get_fw_dev_path(DeviceState *dev);
 
-static void isa_bus_class_init(ObjectClass *klass, void *data)
+static void isa_bus_class_init(ObjectClass *klass, const void *data)
 {
     BusClass *k = BUS_CLASS(klass);
 
@@ -172,6 +172,11 @@ ISADevice *isa_create_simple(ISABus *bus, const char *name)
     return dev;
 }
 
+bool isa_realize(ISADevice *dev, ISABus *bus, Error **errp)
+{
+    return qdev_realize(&dev->parent_obj, &bus->parent_obj, errp);
+}
+
 bool isa_realize_and_unref(ISADevice *dev, ISABus *bus, Error **errp)
 {
     return qdev_realize_and_unref(&dev->parent_obj, &bus->parent_obj, errp);
@@ -205,7 +210,7 @@ ISADevice *isa_vga_init(ISABus *bus)
     }
 }
 
-static void isabus_bridge_class_init(ObjectClass *klass, void *data)
+static void isabus_bridge_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -220,7 +225,7 @@ static const TypeInfo isabus_bridge_info = {
     .class_init    = isabus_bridge_class_init,
 };
 
-static void isa_device_class_init(ObjectClass *klass, void *data)
+static void isa_device_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *k = DEVICE_CLASS(klass);
     k->bus_type = TYPE_ISA_BUS;

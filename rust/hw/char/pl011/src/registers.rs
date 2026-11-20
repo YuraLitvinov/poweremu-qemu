@@ -5,17 +5,22 @@
 //! Device registers exposed as typed structs which are backed by arbitrary
 //! integer bitmaps. [`Data`], [`Control`], [`LineControl`], etc.
 
-use bilge::prelude::*;
-use qemu_api::impl_vmstate_bitsized;
+// rustc prefers "constant-like" enums to use upper case names, but that
+// is inconsistent in its own way.
+#![allow(non_upper_case_globals)]
+
+// For more detail see the PL011 Technical Reference Manual DDI0183:
+// https://developer.arm.com/documentation/ddi0183/latest/
+
+use bitfield_struct::bitfield;
+use bits::bits;
+use migration::impl_vmstate_forward;
 
 /// Offset of each register from the base memory address of the device.
-///
-/// # Source
-/// ARM DDI 0183G, Table 3-1 p.3-3
 #[doc(alias = "offset")]
 #[allow(non_camel_case_types)]
 #[repr(u64)]
-#[derive(Debug, Eq, PartialEq, qemu_api_macros::TryInto)]
+#[derive(Debug, Eq, PartialEq, common::TryInto)]
 pub enum RegisterOffset {
     /// Data Register
     ///
@@ -77,104 +82,58 @@ pub enum RegisterOffset {
 /// The `UARTRSR` register is updated only when a read occurs
 /// from the `UARTDR` register with the same status information
 /// that can also be obtained by reading the `UARTDR` register
-#[bitsize(8)]
-#[derive(Clone, Copy, Default, DebugBits, FromBits)]
+#[bitfield(u8)]
 pub struct Errors {
     pub framing_error: bool,
     pub parity_error: bool,
     pub break_error: bool,
     pub overrun_error: bool,
-    _reserved_unpredictable: u4,
+    #[bits(4)]
+    _reserved_unpredictable: u8,
 }
 
-// TODO: FIFO Mode has different semantics
+impl Errors {
+    pub const BREAK: Self = Errors::new().with_break_error(true);
+}
+
 /// Data Register, `UARTDR`
 ///
-/// The `UARTDR` register is the data register.
-///
-/// For words to be transmitted:
-///
-/// - if the FIFOs are enabled, data written to this location is pushed onto the
-///   transmit
-/// FIFO
-/// - if the FIFOs are not enabled, data is stored in the transmitter holding
-///   register (the
-/// bottom word of the transmit FIFO).
-///
-/// The write operation initiates transmission from the UART. The data is
-/// prefixed with a start bit, appended with the appropriate parity bit
-/// (if parity is enabled), and a stop bit. The resultant word is then
-/// transmitted.
-///
-/// For received words:
-///
-/// - if the FIFOs are enabled, the data byte and the 4-bit status (break,
-///   frame, parity,
-/// and overrun) is pushed onto the 12-bit wide receive FIFO
-/// - if the FIFOs are not enabled, the data byte and status are stored in the
-///   receiving
-/// holding register (the bottom word of the receive FIFO).
-///
-/// The received data byte is read by performing reads from the `UARTDR`
-/// register along with the corresponding status information. The status
-/// information can also be read by a read of the `UARTRSR/UARTECR`
-/// register.
-///
-/// # Note
-///
-/// You must disable the UART before any of the control registers are
-/// reprogrammed. When the UART is disabled in the middle of
-/// transmission or reception, it completes the current character before
-/// stopping.
-///
-/// # Source
-/// ARM DDI 0183G 3.3.1 Data Register, UARTDR
-#[bitsize(32)]
-#[derive(Clone, Copy, Default, DebugBits, FromBits)]
+/// The `UARTDR` register is the data register; write for TX and
+/// read for RX. It is a 12-bit register, where bits 7..0 are the
+/// character and bits 11..8 are error bits.
+#[bitfield(u32)]
 #[doc(alias = "UARTDR")]
 pub struct Data {
     pub data: u8,
+    #[bits(8)]
     pub errors: Errors,
     _reserved: u16,
 }
-impl_vmstate_bitsized!(Data);
+impl_vmstate_forward!(Data);
 
 impl Data {
-    // bilge is not very const-friendly, unfortunately
-    pub const BREAK: Self = Self { value: 1 << 10 };
+    pub const BREAK: Self = Self::new().with_errors(Errors::BREAK);
 }
 
-// TODO: FIFO Mode has different semantics
 /// Receive Status Register / Error Clear Register, `UARTRSR/UARTECR`
 ///
-/// The UARTRSR/UARTECR register is the receive status register/error clear
-/// register. Receive status can also be read from the `UARTRSR`
-/// register. If the status is read from this register, then the status
-/// information for break, framing and parity corresponds to the
-/// data character read from the [Data register](Data), `UARTDR` prior to
-/// reading the UARTRSR register. The status information for overrun is
-/// set immediately when an overrun condition occurs.
+/// This register provides a different way to read the four receive
+/// status error bits that can be found in bits 11..8 of the UARTDR
+/// on a read. It gets updated when the guest reads UARTDR, and the
+/// status bits correspond to that character that was just read.
 ///
-///
-/// # Note
-/// The received data character must be read first from the [Data
-/// Register](Data), `UARTDR` before reading the error status associated
-/// with that data character from the `UARTRSR` register. This read
-/// sequence cannot be reversed, because the `UARTRSR` register is
-/// updated only when a read occurs from the `UARTDR` register. However,
-/// the status information can also be obtained by reading the `UARTDR`
-/// register
-///
-/// # Source
-/// ARM DDI 0183G 3.3.2 Receive Status Register/Error Clear Register,
-/// UARTRSR/UARTECR
-#[bitsize(32)]
-#[derive(Clone, Copy, DebugBits, FromBits)]
+/// The TRM confusingly describes this offset as UARTRSR for reads
+/// and UARTECR for writes, but really it's a single error status
+/// register where writing anything to the register clears the error
+/// bits.
+#[bitfield(u32)]
 pub struct ReceiveStatusErrorClear {
+    #[bits(8)]
     pub errors: Errors,
-    _reserved_unpredictable: u24,
+    #[bits(24)]
+    _reserved_unpredictable: u32,
 }
-impl_vmstate_bitsized!(ReceiveStatusErrorClear);
+impl_vmstate_forward!(ReceiveStatusErrorClear);
 
 impl ReceiveStatusErrorClear {
     pub fn set_from_data(&mut self, data: Data) {
@@ -187,67 +146,36 @@ impl ReceiveStatusErrorClear {
     }
 }
 
-impl Default for ReceiveStatusErrorClear {
-    fn default() -> Self {
-        0.into()
-    }
-}
-
-#[bitsize(32)]
-#[derive(Clone, Copy, DebugBits, FromBits)]
+#[bitfield(u32, default = false)]
 /// Flag Register, `UARTFR`
+///
+/// This has the usual inbound RS232 modem-control signals, plus flags
+/// for RX and TX FIFO fill levels and a BUSY flag.
 #[doc(alias = "UARTFR")]
 pub struct Flags {
-    /// CTS Clear to send. This bit is the complement of the UART clear to
-    /// send, `nUARTCTS`, modem status input. That is, the bit is 1
-    /// when `nUARTCTS` is LOW.
+    /// CTS: Clear to send
     pub clear_to_send: bool,
-    /// DSR Data set ready. This bit is the complement of the UART data set
-    /// ready, `nUARTDSR`, modem status input. That is, the bit is 1 when
-    /// `nUARTDSR` is LOW.
+    /// DSR: Data set ready
     pub data_set_ready: bool,
-    /// DCD Data carrier detect. This bit is the complement of the UART data
-    /// carrier detect, `nUARTDCD`, modem status input. That is, the bit is
-    /// 1 when `nUARTDCD` is LOW.
+    /// DCD: Data carrier detect
     pub data_carrier_detect: bool,
-    /// BUSY UART busy. If this bit is set to 1, the UART is busy
-    /// transmitting data. This bit remains set until the complete
-    /// byte, including all the stop bits, has been sent from the
-    /// shift register. This bit is set as soon as the transmit FIFO
-    /// becomes non-empty, regardless of whether the UART is enabled
-    /// or not.
+    /// BUSY: UART busy. In real hardware, set while the UART is
+    /// busy transmitting data. QEMU's implementation never sets BUSY.
     pub busy: bool,
-    /// RXFE Receive FIFO empty. The meaning of this bit depends on the
-    /// state of the FEN bit in the UARTLCR_H register. If the FIFO
-    /// is disabled, this bit is set when the receive holding
-    /// register is empty. If the FIFO is enabled, the RXFE bit is
-    /// set when the receive FIFO is empty.
+    /// RXFE: Receive FIFO empty
     pub receive_fifo_empty: bool,
-    /// TXFF Transmit FIFO full. The meaning of this bit depends on the
-    /// state of the FEN bit in the UARTLCR_H register. If the FIFO
-    /// is disabled, this bit is set when the transmit holding
-    /// register is full. If the FIFO is enabled, the TXFF bit is
-    /// set when the transmit FIFO is full.
+    /// TXFF: Transmit FIFO full
     pub transmit_fifo_full: bool,
-    /// RXFF Receive FIFO full. The meaning of this bit depends on the state
-    /// of the FEN bit in the UARTLCR_H register. If the FIFO is
-    /// disabled, this bit is set when the receive holding register
-    /// is full. If the FIFO is enabled, the RXFF bit is set when
-    /// the receive FIFO is full.
+    /// RXFF: Receive FIFO full
     pub receive_fifo_full: bool,
-    /// Transmit FIFO empty. The meaning of this bit depends on the state of
-    /// the FEN bit in the [Line Control register](LineControl),
-    /// `UARTLCR_H`. If the FIFO is disabled, this bit is set when the
-    /// transmit holding register is empty. If the FIFO is enabled,
-    /// the TXFE bit is set when the transmit FIFO is empty. This
-    /// bit does not indicate if there is data in the transmit shift
-    /// register.
+    /// TXFE: Transmit FIFO empty
     pub transmit_fifo_empty: bool,
-    /// `RI`, is `true` when `nUARTRI` is `LOW`.
+    /// RI: Ring indicator
     pub ring_indicator: bool,
-    _reserved_zero_no_modify: u23,
+    #[bits(23)]
+    _reserved_zero_no_modify: u32,
 }
-impl_vmstate_bitsized!(Flags);
+impl_vmstate_forward!(Flags);
 
 impl Flags {
     pub fn reset(&mut self) {
@@ -257,101 +185,62 @@ impl Flags {
 
 impl Default for Flags {
     fn default() -> Self {
-        let mut ret: Self = 0.into();
         // After reset TXFF, RXFF, and BUSY are 0, and TXFE and RXFE are 1
-        ret.set_receive_fifo_empty(true);
-        ret.set_transmit_fifo_empty(true);
-        ret
+        Self::from(0)
+            .with_receive_fifo_empty(true)
+            .with_transmit_fifo_empty(true)
     }
 }
 
-#[bitsize(32)]
-#[derive(Clone, Copy, DebugBits, FromBits)]
+#[bitfield(u32)]
 /// Line Control Register, `UARTLCR_H`
 #[doc(alias = "UARTLCR_H")]
 pub struct LineControl {
-    /// BRK Send break.
-    ///
-    /// If this bit is set to `1`, a low-level is continually output on the
-    /// `UARTTXD` output, after completing transmission of the
-    /// current character. For the proper execution of the break command,
-    /// the software must set this bit for at least two complete
-    /// frames. For normal use, this bit must be cleared to `0`.
+    /// BRK: Send break
     pub send_break: bool,
-    /// 1 PEN Parity enable:
-    ///
-    /// - 0 = parity is disabled and no parity bit added to the data frame
-    /// - 1 = parity checking and generation is enabled.
-    ///
-    /// See Table 3-11 on page 3-14 for the parity truth table.
+    /// PEN: Parity enable
     pub parity_enabled: bool,
-    /// EPS Even parity select. Controls the type of parity the UART uses
-    /// during transmission and reception:
-    /// - 0 = odd parity. The UART generates or checks for an odd number of 1s
-    ///   in the data and parity bits.
-    /// - 1 = even parity. The UART generates or checks for an even number of 1s
-    ///   in the data and parity bits.
-    /// This bit has no effect when the `PEN` bit disables parity checking
-    /// and generation. See Table 3-11 on page 3-14 for the parity
-    /// truth table.
+    /// EPS: Even parity select
+    #[bits(1)]
     pub parity: Parity,
-    /// 3 STP2 Two stop bits select. If this bit is set to 1, two stop bits
-    /// are transmitted at the end of the frame. The receive
-    /// logic does not check for two stop bits being received.
+    /// STP2: Two stop bits select
     pub two_stops_bits: bool,
-    /// FEN Enable FIFOs:
-    /// 0 = FIFOs are disabled (character mode) that is, the FIFOs become
-    /// 1-byte-deep holding registers 1 = transmit and receive FIFO
-    /// buffers are enabled (FIFO mode).
+    /// FEN: Enable FIFOs
+    #[bits(1)]
     pub fifos_enabled: Mode,
-    /// WLEN Word length. These bits indicate the number of data bits
-    /// transmitted or received in a frame as follows: b11 = 8 bits
+    /// WLEN: Word length in bits
+    /// b11 = 8 bits
     /// b10 = 7 bits
     /// b01 = 6 bits
     /// b00 = 5 bits.
+    #[bits(2)]
     pub word_length: WordLength,
-    /// 7 SPS Stick parity select.
-    /// 0 = stick parity is disabled
-    /// 1 = either:
-    /// • if the EPS bit is 0 then the parity bit is transmitted and checked
-    /// as a 1 • if the EPS bit is 1 then the parity bit is
-    /// transmitted and checked as a 0. This bit has no effect when
-    /// the PEN bit disables parity checking and generation. See Table 3-11
-    /// on page 3-14 for the parity truth table.
+    /// SPS Stick parity select
     pub sticky_parity: bool,
     /// 31:8 - Reserved, do not modify, read as zero.
-    _reserved_zero_no_modify: u24,
+    #[bits(24)]
+    _reserved_zero_no_modify: u32,
 }
-impl_vmstate_bitsized!(LineControl);
+impl_vmstate_forward!(LineControl);
 
 impl LineControl {
     pub fn reset(&mut self) {
         // All the bits are cleared to 0 when reset.
-        *self = 0.into();
+        *self = Self::default();
     }
 }
 
-impl Default for LineControl {
-    fn default() -> Self {
-        0.into()
-    }
-}
-
-#[bitsize(1)]
-#[derive(Clone, Copy, Debug, Eq, FromBits, PartialEq)]
 /// `EPS` "Even parity select", field of [Line Control
 /// register](LineControl).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, common::TryInto)]
 pub enum Parity {
-    /// - 0 = odd parity. The UART generates or checks for an odd number of 1s
-    ///   in the data and parity bits.
     Odd = 0,
-    /// - 1 = even parity. The UART generates or checks for an even number of 1s
-    ///   in the data and parity bits.
     Even = 1,
 }
 
-#[bitsize(1)]
-#[derive(Clone, Copy, Debug, Eq, FromBits, PartialEq)]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, common::TryInto)]
 /// `FEN` "Enable FIFOs" or Device mode, field of [Line Control
 /// register](LineControl).
 pub enum Mode {
@@ -362,8 +251,9 @@ pub enum Mode {
     FIFO = 1,
 }
 
-#[bitsize(2)]
-#[derive(Clone, Copy, Debug, Eq, FromBits, PartialEq)]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, common::TryInto)]
+#[allow(clippy::enum_variant_names)]
 /// `WLEN` Word length, field of [Line Control register](LineControl).
 ///
 /// These bits indicate the number of data bits transmitted or received in a
@@ -381,126 +271,77 @@ pub enum WordLength {
 
 /// Control Register, `UARTCR`
 ///
-/// The `UARTCR` register is the control register. All the bits are cleared
-/// to `0` on reset except for bits `9` and `8` that are set to `1`.
-///
-/// # Source
-/// ARM DDI 0183G, 3.3.8 Control Register, `UARTCR`, Table 3-12
-#[bitsize(32)]
+/// The `UARTCR` register is the control register. It contains various
+/// enable bits, and the bits to write to set the usual outbound RS232
+/// modem control signals. All bits reset to 0 except TXE and RXE.
+#[bitfield(u32, default = false)]
 #[doc(alias = "UARTCR")]
-#[derive(Clone, Copy, DebugBits, FromBits)]
 pub struct Control {
-    /// `UARTEN` UART enable: 0 = UART is disabled. If the UART is disabled
-    /// in the middle of transmission or reception, it completes the current
-    /// character before stopping. 1 = the UART is enabled. Data
-    /// transmission and reception occurs for either UART signals or SIR
-    /// signals depending on the setting of the SIREN bit.
+    /// `UARTEN` UART enable: 0 = UART is disabled.
     pub enable_uart: bool,
-    /// `SIREN` `SIR` enable: 0 = IrDA SIR ENDEC is disabled. `nSIROUT`
-    /// remains LOW (no light pulse generated), and signal transitions on
-    /// SIRIN have no effect. 1 = IrDA SIR ENDEC is enabled. Data is
-    /// transmitted and received on nSIROUT and SIRIN. UARTTXD remains HIGH,
-    /// in the marking state. Signal transitions on UARTRXD or modem status
-    /// inputs have no effect. This bit has no effect if the UARTEN bit
-    /// disables the UART.
+    /// `SIREN` `SIR` enable: disable or enable IrDA SIR ENDEC.
+    /// QEMU does not model this.
     pub enable_sir: bool,
-    /// `SIRLP` SIR low-power IrDA mode. This bit selects the IrDA encoding
-    /// mode. If this bit is cleared to 0, low-level bits are transmitted as
-    /// an active high pulse with a width of 3/ 16th of the bit period. If
-    /// this bit is set to 1, low-level bits are transmitted with a pulse
-    /// width that is 3 times the period of the IrLPBaud16 input signal,
-    /// regardless of the selected bit rate. Setting this bit uses less
-    /// power, but might reduce transmission distances.
-    pub sir_lowpower_irda_mode: u1,
+    /// `SIRLP` SIR low-power IrDA mode. QEMU does not model this.
+    pub sir_lowpower_irda_mode: bool,
     /// Reserved, do not modify, read as zero.
-    _reserved_zero_no_modify: u4,
-    /// `LBE` Loopback enable. If this bit is set to 1 and the SIREN bit is
-    /// set to 1 and the SIRTEST bit in the Test Control register, UARTTCR
-    /// on page 4-5 is set to 1, then the nSIROUT path is inverted, and fed
-    /// through to the SIRIN path. The SIRTEST bit in the test register must
-    /// be set to 1 to override the normal half-duplex SIR operation. This
-    /// must be the requirement for accessing the test registers during
-    /// normal operation, and SIRTEST must be cleared to 0 when loopback
-    /// testing is finished. This feature reduces the amount of external
-    /// coupling required during system test. If this bit is set to 1, and
-    /// the SIRTEST bit is set to 0, the UARTTXD path is fed through to the
-    /// UARTRXD path. In either SIR mode or UART mode, when this bit is set,
-    /// the modem outputs are also fed through to the modem inputs. This bit
-    /// is cleared to 0 on reset, to disable loopback.
+    #[bits(4)]
+    _reserved_zero_no_modify: u8,
+    /// `LBE` Loopback enable: feed UART output back to the input
     pub enable_loopback: bool,
-    /// `TXE` Transmit enable. If this bit is set to 1, the transmit section
-    /// of the UART is enabled. Data transmission occurs for either UART
-    /// signals, or SIR signals depending on the setting of the SIREN bit.
-    /// When the UART is disabled in the middle of transmission, it
-    /// completes the current character before stopping.
+    /// `TXE` Transmit enable
     pub enable_transmit: bool,
-    /// `RXE` Receive enable. If this bit is set to 1, the receive section
-    /// of the UART is enabled. Data reception occurs for either UART
-    /// signals or SIR signals depending on the setting of the SIREN bit.
-    /// When the UART is disabled in the middle of reception, it completes
-    /// the current character before stopping.
+    /// `RXE` Receive enable
     pub enable_receive: bool,
-    /// `DTR` Data transmit ready. This bit is the complement of the UART
-    /// data transmit ready, `nUARTDTR`, modem status output. That is, when
-    /// the bit is programmed to a 1 then `nUARTDTR` is LOW.
+    /// `DTR` Data transmit ready
     pub data_transmit_ready: bool,
-    /// `RTS` Request to send. This bit is the complement of the UART
-    /// request to send, `nUARTRTS`, modem status output. That is, when the
-    /// bit is programmed to a 1 then `nUARTRTS` is LOW.
+    /// `RTS` Request to send
     pub request_to_send: bool,
-    /// `Out1` This bit is the complement of the UART Out1 (`nUARTOut1`)
-    /// modem status output. That is, when the bit is programmed to a 1 the
-    /// output is 0. For DTE this can be used as Data Carrier Detect (DCD).
+    /// `Out1` UART Out1 signal; can be used as DCD
     pub out_1: bool,
-    /// `Out2` This bit is the complement of the UART Out2 (`nUARTOut2`)
-    /// modem status output. That is, when the bit is programmed to a 1, the
-    /// output is 0. For DTE this can be used as Ring Indicator (RI).
+    /// `Out2` UART Out2 signal; can be used as RI
     pub out_2: bool,
-    /// `RTSEn` RTS hardware flow control enable. If this bit is set to 1,
-    /// RTS hardware flow control is enabled. Data is only requested when
-    /// there is space in the receive FIFO for it to be received.
+    /// `RTSEn` RTS hardware flow control enable
     pub rts_hardware_flow_control_enable: bool,
-    /// `CTSEn` CTS hardware flow control enable. If this bit is set to 1,
-    /// CTS hardware flow control is enabled. Data is only transmitted when
-    /// the `nUARTCTS` signal is asserted.
+    /// `CTSEn` CTS hardware flow control enable
     pub cts_hardware_flow_control_enable: bool,
     /// 31:16 - Reserved, do not modify, read as zero.
     _reserved_zero_no_modify2: u16,
 }
-impl_vmstate_bitsized!(Control);
+impl_vmstate_forward!(Control);
 
 impl Control {
     pub fn reset(&mut self) {
-        *self = 0.into();
-        self.set_enable_receive(true);
-        self.set_enable_transmit(true);
+        *self = Self::default();
     }
 }
 
 impl Default for Control {
     fn default() -> Self {
-        let mut ret: Self = 0.into();
-        ret.reset();
-        ret
+        Self::from(0)
+            .with_enable_receive(true)
+            .with_enable_transmit(true)
     }
 }
 
-/// Interrupt status bits in UARTRIS, UARTMIS, UARTIMSC
-pub struct Interrupt(pub u32);
+bits! {
+    /// Interrupt status bits in UARTRIS, UARTMIS, UARTIMSC
+    #[derive(Default)]
+    pub struct Interrupt(u32) {
+        OE = 1 << 10,
+        BE = 1 << 9,
+        PE = 1 << 8,
+        FE = 1 << 7,
+        RT = 1 << 6,
+        TX = 1 << 5,
+        RX = 1 << 4,
+        DSR = 1 << 3,
+        DCD = 1 << 2,
+        CTS = 1 << 1,
+        RI = 1 << 0,
 
-impl Interrupt {
-    pub const OE: Self = Self(1 << 10);
-    pub const BE: Self = Self(1 << 9);
-    pub const PE: Self = Self(1 << 8);
-    pub const FE: Self = Self(1 << 7);
-    pub const RT: Self = Self(1 << 6);
-    pub const TX: Self = Self(1 << 5);
-    pub const RX: Self = Self(1 << 4);
-    pub const DSR: Self = Self(1 << 3);
-    pub const DCD: Self = Self(1 << 2);
-    pub const CTS: Self = Self(1 << 1);
-    pub const RI: Self = Self(1 << 0);
-
-    pub const E: Self = Self(Self::OE.0 | Self::BE.0 | Self::PE.0 | Self::FE.0);
-    pub const MS: Self = Self(Self::RI.0 | Self::DSR.0 | Self::DCD.0 | Self::CTS.0);
+        E = bits!(Self as u32: OE | BE | PE | FE),
+        MS = bits!(Self as u32: RI | DSR | DCD | CTS),
+    }
 }
+impl_vmstate_forward!(Interrupt);

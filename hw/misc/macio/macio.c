@@ -29,7 +29,7 @@
 #include "hw/misc/macio/cuda.h"
 #include "hw/pci/pci.h"
 #include "hw/ppc/mac_dbdma.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
@@ -102,13 +102,6 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
     memory_region_add_subregion(&s->bar, 0x08000,
                                 sysbus_mmio_get_region(sbd, 0));
 
-    if (!qdev_realize(DEVICE(&s->screamer), BUS(&s->macio_bus), errp)) {
-        return false;
-    }
-    sbd = SYS_BUS_DEVICE(&s->screamer);
-    memory_region_add_subregion(&s->bar, 0x14000,
-                                sysbus_mmio_get_region(sbd, 0));
-
     qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
     qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);
     qdev_prop_set_uint32(DEVICE(&s->escc), "it_shift", 4);
@@ -117,6 +110,7 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
     if (!qdev_realize(DEVICE(&s->escc), BUS(&s->macio_bus), errp)) {
         return false;
     }
+
     macio_bar_setup(s);
     pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
 
@@ -197,13 +191,6 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
                            0x1a, errp)) {
         return;
     }
-    
-    /* Screamer */
-    sbd = SYS_BUS_DEVICE(&s->screamer);
-    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_IRQ));
-    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_DMA_IRQ));
-    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_RX_IRQ));
-    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10, 0x12);
 }
 
 static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
@@ -357,13 +344,6 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         memory_region_add_subregion(&s->bar, 0x16000,
                                     sysbus_mmio_get_region(sbd, 0));
     }
-
-    /* Screamer */
-    sbd = SYS_BUS_DEVICE(&s->screamer);
-    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_IRQ));
-    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_DMA_IRQ));
-    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_RX_IRQ));
-    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10, 0x12);
 }
 
 static void macio_newworld_init(Object *obj)
@@ -393,8 +373,6 @@ static void macio_instance_init(Object *obj)
     object_initialize_child(obj, "dbdma", &s->dbdma, TYPE_MAC_DBDMA);
 
     object_initialize_child(obj, "escc", &s->escc, TYPE_ESCC);
-
-    object_initialize_child(obj, "screamer", &s->screamer, TYPE_SCREAMER);
 }
 
 static const VMStateDescription vmstate_macio_oldworld = {
@@ -407,7 +385,7 @@ static const VMStateDescription vmstate_macio_oldworld = {
     }
 };
 
-static void macio_oldworld_class_init(ObjectClass *oc, void *data)
+static void macio_oldworld_class_init(ObjectClass *oc, const void *data)
 {
     PCIDeviceClass *pdc = PCI_DEVICE_CLASS(oc);
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -432,7 +410,7 @@ static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
 };
 
-static void macio_newworld_class_init(ObjectClass *oc, void *data)
+static void macio_newworld_class_init(ObjectClass *oc, const void *data)
 {
     PCIDeviceClass *pdc = PCI_DEVICE_CLASS(oc);
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -447,7 +425,7 @@ static const Property macio_properties[] = {
     DEFINE_PROP_UINT64("frequency", MacIOState, frequency, 0),
 };
 
-static void macio_class_init(ObjectClass *klass, void *data)
+static void macio_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -487,7 +465,7 @@ static const TypeInfo macio_type_info = {
     .instance_init = macio_instance_init,
     .abstract      = true,
     .class_init    = macio_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },

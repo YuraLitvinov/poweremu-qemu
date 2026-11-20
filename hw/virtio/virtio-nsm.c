@@ -1609,7 +1609,6 @@ static void handle_input(VirtIODevice *vdev, VirtQueue *vq)
     if (in_elem) {
         virtqueue_detach_element(vq, in_elem, 0);
     }
-    return;
 }
 
 static uint64_t get_features(VirtIODevice *vdev, uint64_t f, Error **errp)
@@ -1709,7 +1708,7 @@ static const Property virtio_nsm_properties[] = {
     DEFINE_PROP_STRING("module-id", VirtIONSM, module_id),
 };
 
-static void virtio_nsm_class_init(ObjectClass *klass, void *data)
+static void virtio_nsm_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
@@ -1728,6 +1727,7 @@ static const TypeInfo virtio_nsm_info = {
     .parent = TYPE_VIRTIO_DEVICE,
     .instance_size = sizeof(VirtIONSM),
     .class_init = virtio_nsm_class_init,
+    .secure = true,
 };
 
 static void virtio_register_types(void)

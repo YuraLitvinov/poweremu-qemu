@@ -27,12 +27,14 @@
 #include "qemu/osdep.h"
 #include "hw/nvram/xlnx-efuse.h"
 
+#include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "system/blockdev.h"
-#include "hw/qdev-properties.h"
-#include "hw/qdev-properties-system.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
+#include "qapi/qapi-builtin-type-infos.h"
 
 #define TBIT0_OFFSET     28
 #define TBIT1_OFFSET     29
@@ -224,13 +226,6 @@ static void efuse_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static void efuse_finalize(Object *obj)
-{
-    XlnxEFuse *s = XLNX_EFUSE(obj);
-
-    g_free(s->ro_bits);
-}
-
 static void efuse_prop_set_drive(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
 {
@@ -239,7 +234,7 @@ static void efuse_prop_set_drive(Object *obj, Visitor *v, const char *name,
     qdev_prop_drive.set(obj, v, name, opaque, errp);
 
     /* Fill initial data if backend is attached after realized */
-    if (dev->realized) {
+    if (qdev_is_realized(dev)) {
         efuse_bdrv_read(XLNX_EFUSE(obj), errp);
     }
 }
@@ -258,6 +253,7 @@ static void efuse_prop_release_drive(Object *obj, const char *name,
 
 static const PropertyInfo efuse_prop_drive = {
     .type  = "str",
+    .qapi_type = &str_type_info,
     .description = "Node name or ID of a block device to use as eFUSE backend",
     .realized_set_allowed = true,
     .get = efuse_prop_get_drive,
@@ -274,7 +270,7 @@ static const Property efuse_properties[] = {
                       qdev_prop_uint32, uint32_t),
 };
 
-static void efuse_class_init(ObjectClass *klass, void *data)
+static void efuse_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -288,7 +284,6 @@ static const TypeInfo efuse_info = {
     .name          = TYPE_XLNX_EFUSE,
     .parent        = TYPE_DEVICE,
     .instance_size = sizeof(XlnxEFuse),
-    .instance_finalize = efuse_finalize,
     .class_init    = efuse_class_init,
 };
 

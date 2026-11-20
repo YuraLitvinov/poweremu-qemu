@@ -397,7 +397,7 @@ typedef struct disassemble_info {
   bool show_opcodes;
 
   /* Field intended to be used by targets in any way they deem suitable.  */
-  void *target_info;
+  const void *target_info;
 
   /* Options for Capstone disassembly.  */
   int cap_arch;
@@ -412,7 +412,6 @@ typedef struct disassemble_info {
 typedef int (*disassembler_ftype) (bfd_vma, disassemble_info *);
 
 int print_insn_tci(bfd_vma, disassemble_info*);
-int print_insn_tcti(bfd_vma, disassemble_info*);
 int print_insn_big_mips         (bfd_vma, disassemble_info*);
 int print_insn_little_mips      (bfd_vma, disassemble_info*);
 int print_insn_nanomips         (bfd_vma, disassemble_info*);

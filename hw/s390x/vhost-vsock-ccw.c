@@ -7,7 +7,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/virtio/virtio.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
@@ -35,7 +35,7 @@ static void vhost_vsock_ccw_realize(VirtioCcwDevice *ccw_dev, Error **errp)
     qdev_realize(vdev, BUS(&ccw_dev->bus), errp);
 }
 
-static void vhost_vsock_ccw_class_init(ObjectClass *klass, void *data)
+static void vhost_vsock_ccw_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtIOCCWDeviceClass *k = VIRTIO_CCW_DEVICE_CLASS(klass);
@@ -71,6 +71,7 @@ static const TypeInfo vhost_vsock_ccw_info = {
     .instance_size = sizeof(VHostVSockCCWState),
     .instance_init = vhost_vsock_ccw_instance_init,
     .class_init    = vhost_vsock_ccw_class_init,
+    .secure        = true,
 };
 
 static void vhost_vsock_ccw_register(void)

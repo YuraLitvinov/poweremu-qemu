@@ -88,16 +88,6 @@ static bool validate_options(const Netdev *netdev, Error **errp)
         return false;
     }
 
-    if (__builtin_available(macOS 11, *)) {
-        // clang requires a true branch
-    } else {
-        if (options->has_isolated) {
-            error_setg(errp,
-                       "vmnet-bridged.isolated feature is "
-                       "unavailable: outdated vmnet.framework API");
-            return false;
-        }
-    }
     return true;
 }
 
@@ -116,11 +106,9 @@ static xpc_object_t build_if_desc(const Netdev *netdev)
                               vmnet_shared_interface_name_key,
                               options->ifname);
 
-    if (__builtin_available(macOS 11, *)) {
-        xpc_dictionary_set_bool(if_desc,
-                                vmnet_enable_isolation_key,
-                                options->isolated);
-    }
+    xpc_dictionary_set_bool(if_desc,
+                            vmnet_enable_isolation_key,
+                            options->isolated);
 
     return if_desc;
 }

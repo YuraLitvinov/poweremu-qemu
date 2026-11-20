@@ -19,13 +19,12 @@
 #include "qapi/error.h"
 #include "hw/arm/xlnx-zynqmp.h"
 #include "hw/arm/boot.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "system/device_tree.h"
 #include "qom/object.h"
 #include "net/can_emu.h"
-#include "audio/audio.h"
 
 struct XlnxZCU102 {
     MachineState parent_obj;
@@ -267,7 +266,7 @@ static void xlnx_zcu102_machine_instance_init(Object *obj)
                              0);
 }
 
-static void xlnx_zcu102_machine_class_init(ObjectClass *oc, void *data)
+static void xlnx_zcu102_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 

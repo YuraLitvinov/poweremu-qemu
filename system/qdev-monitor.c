@@ -18,11 +18,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "monitor/hmp.h"
+#include "monitor/hmp-completion.h"
 #include "monitor/monitor.h"
 #include "monitor/qdev.h"
-#include "system/arch_init.h"
+#include "qemu/base-arch-defs.h"
 #include "system/runstate.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-qdev.h"
@@ -34,15 +35,16 @@
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qemu/help_option.h"
+#include "qemu/id.h"
 #include "qemu/option.h"
 #include "qemu/qemu-print.h"
 #include "qemu/option_int.h"
 #include "system/block-backend.h"
 #include "migration/misc.h"
 #include "qemu/cutils.h"
-#include "hw/qdev-properties.h"
-#include "hw/clock.h"
-#include "hw/boards.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/clock.h"
+#include "hw/core/boards.h"
 
 /*
  * Aliases were a bad idea from the start.  Let's keep them
@@ -52,7 +54,7 @@ typedef struct QDevAlias
 {
     const char *typename;
     const char *alias;
-    uint32_t arch_mask;
+    uint64_t arch_mask;
 } QDevAlias;
 
 /* default virtio transport per architecture */
@@ -62,20 +64,20 @@ typedef struct QDevAlias
                               QEMU_ARCH_I386 | \
                               QEMU_ARCH_LOONGARCH | \
                               QEMU_ARCH_MIPS | \
-                              QEMU_ARCH_OPENRISC | \
+                              QEMU_ARCH_OR1K | \
                               QEMU_ARCH_PPC | \
                               QEMU_ARCH_RISCV | \
                               QEMU_ARCH_SH4 | \
                               QEMU_ARCH_SPARC | \
                               QEMU_ARCH_XTENSA)
 #define QEMU_ARCH_VIRTIO_CCW (QEMU_ARCH_S390X)
-#define QEMU_ARCH_VIRTIO_MMIO (QEMU_ARCH_M68K)
+#define QEMU_ARCH_VIRTIO_MMIO (QEMU_ARCH_M68K | QEMU_ARCH_HEXAGON)
 
 /* Please keep this table sorted by typename. */
 static const QDevAlias qdev_alias_table[] = {
-    { "AC97", "ac97" }, /* -soundhw name */
+    { "AC97", "ac97" },
     { "e1000", "e1000-82540em" },
-    { "ES1370", "es1370" }, /* -soundhw name */
+    { "ES1370", "es1370" },
     { "ich9-ahci", "ahci" },
     { "lsi53c895a", "lsi" },
     { "virtio-9p-device", "virtio-9p", QEMU_ARCH_VIRTIO_MMIO },
@@ -163,6 +165,9 @@ static void qdev_print_devinfo(DeviceClass *dc)
     }
     if (!dc->user_creatable) {
         qemu_printf(", no-user");
+    }
+    if (object_class_is_secure(OBJECT_CLASS(dc))) {
+        qemu_printf(", secure");
     }
     qemu_printf("\n");
 }
@@ -601,14 +606,17 @@ const char *qdev_set_id(DeviceState *dev, char *id, Error **errp)
      * has no parent
      */
     if (id) {
+        if (!id_wellformed(id)) {
+            error_setg(errp, "Invalid qdev ID '%s'", id);
+            goto err;
+        }
         prop = object_property_try_add_child(qdev_get_peripheral(), id,
                                              OBJECT(dev), NULL);
         if (prop) {
             dev->id = id;
         } else {
             error_setg(errp, "Duplicate device ID '%s'", id);
-            g_free(id);
-            return NULL;
+            goto err;
         }
     } else {
         static int anon_count;
@@ -619,6 +627,29 @@ const char *qdev_set_id(DeviceState *dev, char *id, Error **errp)
     }
 
     return prop->name;
+
+err:
+    g_free(id);
+    return NULL;
+}
+
+BusState *qdev_find_default_bus(DeviceClass *dc, Error **errp)
+{
+    BusState *bus = NULL;
+
+    assert(dc->bus_type != NULL);
+    bus = qbus_find_recursive(sysbus_get_default(), NULL, dc->bus_type);
+    if (!bus) {
+        error_setg(errp, "No '%s' bus found for device '%s'",
+                   dc->bus_type, object_class_get_name(OBJECT_CLASS(dc)));
+        return NULL;
+    }
+    if (qbus_is_full(bus)) {
+        error_setg(errp, "A '%s' bus was found but is full", dc->bus_type);
+        return NULL;
+    }
+
+    return bus;
 }
 
 DeviceState *qdev_device_add_from_qdict(const QDict *opts,
@@ -628,7 +659,7 @@ DeviceState *qdev_device_add_from_qdict(const QDict *opts,
     DeviceClass *dc;
     const char *driver, *path;
     char *id;
-    DeviceState *dev = NULL;
+    DeviceState *dev;
     BusState *bus = NULL;
     QDict *properties;
 
@@ -641,6 +672,10 @@ DeviceState *qdev_device_add_from_qdict(const QDict *opts,
     /* find driver */
     dc = qdev_get_device_class(&driver, errp);
     if (!dc) {
+        return NULL;
+    }
+
+    if (!object_class_check_security(OBJECT_CLASS(dc), errp)) {
         return NULL;
     }
 
@@ -657,10 +692,8 @@ DeviceState *qdev_device_add_from_qdict(const QDict *opts,
             return NULL;
         }
     } else if (dc->bus_type != NULL) {
-        bus = qbus_find_recursive(sysbus_get_default(), NULL, dc->bus_type);
-        if (!bus || qbus_is_full(bus)) {
-            error_setg(errp, "No '%s' bus found for device '%s'",
-                       dc->bus_type, driver);
+        bus = qdev_find_default_bus(dc, errp);
+        if (!bus) {
             return NULL;
         }
     }
@@ -704,8 +737,8 @@ DeviceState *qdev_device_add_from_qdict(const QDict *opts,
     qdict_del(properties, "bus");
     qdict_del(properties, "id");
 
-    object_set_properties_from_keyval(&dev->parent_obj, properties, from_json,
-                                      errp);
+    object_set_props_from_keyval(&dev->parent_obj, properties, from_json,
+                                 errp);
     qobject_unref(properties);
     if (*errp) {
         goto err_del_dev;
@@ -717,10 +750,9 @@ DeviceState *qdev_device_add_from_qdict(const QDict *opts,
     return dev;
 
 err_del_dev:
-    if (dev) {
-        object_unparent(OBJECT(dev));
-        object_unref(OBJECT(dev));
-    }
+    object_unparent(OBJECT(dev));
+    object_unref(OBJECT(dev));
+
     return NULL;
 }
 
@@ -738,43 +770,44 @@ DeviceState *qdev_device_add(QemuOpts *opts, Error **errp)
     return ret;
 }
 
-#define qdev_printf(fmt, ...) monitor_printf(mon, "%*s" fmt, indent, "", ## __VA_ARGS__)
+#ifdef CONFIG_HMP
+#define qdev_printf(fmt, ...) \
+    monitor_hmp_printf(hmp, "%*s" fmt, indent, "", ## __VA_ARGS__)
 
-static void qdev_print_props(Monitor *mon, DeviceState *dev, DeviceClass *dc,
+static void qdev_print_props(MonitorHMP *hmp, DeviceState *dev, DeviceClass *dc,
                              int indent)
 {
     for (int i = 0, n = dc->props_count_; i < n; ++i) {
         const Property *prop = &dc->props_[i];
         char *value;
-        char *legacy_name = g_strdup_printf("legacy-%s", prop->name);
 
-        if (object_property_get_type(OBJECT(dev), legacy_name, NULL)) {
-            value = object_property_get_str(OBJECT(dev), legacy_name, NULL);
+        if (prop->info->print) {
+            value = prop->info->print(OBJECT(dev), prop);
         } else {
             value = object_property_print(OBJECT(dev), prop->name, true,
                                           NULL);
         }
-        g_free(legacy_name);
 
         if (!value) {
             continue;
         }
+
         qdev_printf("%s = %s\n", prop->name,
                     *value ? value : "<null>");
         g_free(value);
     }
 }
 
-static void bus_print_dev(BusState *bus, Monitor *mon, DeviceState *dev, int indent)
+static void bus_print_dev(BusState *bus, MonitorHMP *hmp, DeviceState *dev, int indent)
 {
     BusClass *bc = BUS_GET_CLASS(bus);
 
     if (bc->print_dev) {
-        bc->print_dev(mon, dev, indent);
+        bc->print_dev(hmp, dev, indent);
     }
 }
 
-static void qdev_print(Monitor *mon, DeviceState *dev, int indent)
+static void qdev_print(MonitorHMP *hmp, DeviceState *dev, int indent)
 {
     ObjectClass *class;
     NamedGPIOList *ngl;
@@ -799,13 +832,13 @@ static void qdev_print(Monitor *mon, DeviceState *dev, int indent)
     }
     class = object_get_class(OBJECT(dev));
     do {
-        qdev_print_props(mon, dev, DEVICE_CLASS(class), indent);
+        qdev_print_props(hmp, dev, DEVICE_CLASS(class), indent);
         class = object_class_get_parent(class);
     } while (class != object_class_by_name(TYPE_DEVICE));
-    bus_print_dev(dev->parent_bus, mon, dev, indent);
+    bus_print_dev(dev->parent_bus, hmp, dev, indent);
 }
 
-static void qbus_print(Monitor *mon, BusState *bus, int indent, bool details)
+static void qbus_print(MonitorHMP *hmp, BusState *bus, int indent, bool details)
 {
     BusChild *kid;
 
@@ -818,28 +851,29 @@ static void qbus_print(Monitor *mon, BusState *bus, int indent, bool details)
         qdev_printf("dev: %s, id \"%s\"\n", object_get_typename(OBJECT(dev)),
                     dev->id ? dev->id : "");
         if (details) {
-            qdev_print(mon, dev, indent + 2);
+            qdev_print(hmp, dev, indent + 2);
         }
         QLIST_FOREACH(child_bus, &dev->child_bus, sibling) {
-            qbus_print(mon, child_bus, indent + 2, details);
+            qbus_print(hmp, child_bus, indent + 2, details);
         }
     }
 }
 #undef qdev_printf
 
-void hmp_info_qtree(Monitor *mon, const QDict *qdict)
+void hmp_info_qtree(MonitorHMP *hmp, const QDict *qdict)
 {
     bool details = !qdict_get_try_bool(qdict, "brief", false);
 
     if (sysbus_get_default()) {
-        qbus_print(mon, sysbus_get_default(), 0, details);
+        qbus_print(hmp, sysbus_get_default(), 0, details);
     }
 }
 
-void hmp_info_qdm(Monitor *mon, const QDict *qdict)
+void hmp_info_qdm(MonitorHMP *hmp, const QDict *qdict)
 {
     qdev_print_devinfos(true);
 }
+#endif /* CONFIG_HMP */
 
 void qmp_device_add(QDict *qdict, QObject **ret_data, Error **errp)
 {
@@ -890,8 +924,8 @@ static DeviceState *find_device_state(const char *id, bool use_generic_error,
 
 void qdev_unplug(DeviceState *dev, Error **errp)
 {
-    HotplugHandler *hotplug_ctrl;
-    HotplugHandlerClass *hdc;
+    const HotplugHandler *hotplug_ctrl;
+    const HotplugHandlerClass *hdc;
     Error *local_err = NULL;
 
     if (!qdev_hotunplug_allowed(dev, errp)) {
@@ -977,7 +1011,8 @@ void qmp_device_sync_config(const char *id, Error **errp)
     qdev_sync_config(dev, errp);
 }
 
-void hmp_device_add(Monitor *mon, const QDict *qdict)
+#ifdef CONFIG_HMP
+void hmp_device_add(MonitorHMP *hmp, const QDict *qdict)
 {
     Error *err = NULL;
     QemuOpts *opts;
@@ -1008,17 +1043,18 @@ void hmp_device_add(Monitor *mon, const QDict *qdict)
     }
     object_unref(dev);
 out:
-    hmp_handle_error(mon, err);
+    hmp_handle_error(hmp, err);
 }
 
-void hmp_device_del(Monitor *mon, const QDict *qdict)
+void hmp_device_del(MonitorHMP *hmp, const QDict *qdict)
 {
     const char *id = qdict_get_str(qdict, "id");
     Error *err = NULL;
 
     qmp_device_del(id, &err);
-    hmp_handle_error(mon, err);
+    hmp_handle_error(hmp, err);
 }
+#endif
 
 void device_add_completion(ReadLineState *rs, int nb_args, const char *str)
 {

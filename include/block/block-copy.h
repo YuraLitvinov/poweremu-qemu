@@ -16,6 +16,7 @@
 #define BLOCK_COPY_H
 
 #include "block/block-common.h"
+#include "block/graph-lock.h"
 #include "qemu/progress_meter.h"
 
 /* All APIs are thread-safe */
@@ -40,8 +41,9 @@ void block_copy_state_free(BlockCopyState *s);
 
 void block_copy_reset(BlockCopyState *s, int64_t offset, int64_t bytes);
 
-int64_t coroutine_fn GRAPH_RDLOCK
-block_copy_reset_unallocated(BlockCopyState *s, int64_t offset, int64_t *count);
+int coroutine_fn GRAPH_RDLOCK
+block_copy_prescan(BlockCopyState *s, int64_t offset, int64_t *cached_end,
+                   int64_t *count);
 
 int coroutine_fn block_copy(BlockCopyState *s, int64_t offset, int64_t bytes,
                             bool ignore_ratelimit, uint64_t timeout_ns,
@@ -100,5 +102,6 @@ void block_copy_call_cancel(BlockCopyCallState *call_state);
 BdrvDirtyBitmap *block_copy_dirty_bitmap(BlockCopyState *s);
 int64_t block_copy_cluster_size(BlockCopyState *s);
 void block_copy_set_skip_unallocated(BlockCopyState *s, bool skip);
+void block_copy_set_scan_done(BlockCopyState *s);
 
 #endif /* BLOCK_COPY_H */

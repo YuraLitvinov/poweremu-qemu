@@ -11,18 +11,21 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "exec/target_page.h"
 #include "hw/s390x/s390-virtio-ccw.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/s390x/storage-keys.h"
 #include "qapi/error.h"
-#include "qapi/qapi-commands-misc-target.h"
+#include "qapi/qapi-commands-machine.h"
 #include "qobject/qdict.h"
 #include "qemu/error-report.h"
 #include "system/memory_mapping.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
 #include "system/kvm.h"
 #include "migration/qemu-file-types.h"
 #include "migration/register.h"
+#include "monitor/hmp.h"
+#include "monitor/monitor.h"
 #include "trace.h"
 
 #define S390_SKEYS_BUFFER_SIZE (128 * KiB)  /* Room for 128k storage keys */
@@ -101,7 +104,8 @@ static void write_keys(FILE *f, uint8_t *keys, uint64_t startgfn,
     }
 }
 
-void hmp_info_skeys(Monitor *mon, const QDict *qdict)
+#ifdef CONFIG_HMP
+void hmp_info_skeys(MonitorHMP *hmp, const QDict *qdict)
 {
     S390SKeysState *ss = s390_get_skeys_device();
     S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
@@ -111,27 +115,27 @@ void hmp_info_skeys(Monitor *mon, const QDict *qdict)
 
     /* Quick check to see if guest is using storage keys*/
     if (!skeyclass->skeys_are_enabled(ss)) {
-        monitor_printf(mon, "Error: This guest is not using storage keys\n");
+        monitor_hmp_printf(hmp, "Error: This guest is not using storage keys\n");
         return;
     }
 
     if (!address_space_access_valid(&address_space_memory,
                                     addr & TARGET_PAGE_MASK, TARGET_PAGE_SIZE,
                                     false, MEMTXATTRS_UNSPECIFIED)) {
-        monitor_printf(mon, "Error: The given address is not valid\n");
+        monitor_hmp_printf(hmp, "Error: The given address is not valid\n");
         return;
     }
 
     r = skeyclass->get_skeys(ss, addr / TARGET_PAGE_SIZE, 1, &key);
     if (r < 0) {
-        monitor_printf(mon, "Error: %s\n", strerror(-r));
+        monitor_hmp_printf(hmp, "Error: %s\n", strerror(-r));
         return;
     }
 
-    monitor_printf(mon, "  key: 0x%X\n", key);
+    monitor_hmp_printf(hmp, "  key: 0x%X\n", key);
 }
 
-void hmp_dump_skeys(Monitor *mon, const QDict *qdict)
+void hmp_dump_skeys(MonitorHMP *hmp, const QDict *qdict)
 {
     const char *filename = qdict_get_str(qdict, "filename");
     Error *err = NULL;
@@ -141,8 +145,9 @@ void hmp_dump_skeys(Monitor *mon, const QDict *qdict)
         error_report_err(err);
     }
 }
+#endif
 
-void qmp_dump_skeys(const char *filename, Error **errp)
+void s390_qmp_dump_skeys(const char *filename, Error **errp)
 {
     S390SKeysState *ss = s390_get_skeys_device();
     S390SKeysClass *skeyclass = S390_SKEYS_GET_CLASS(ss);
@@ -302,7 +307,7 @@ static int qemu_s390_skeys_get(S390SKeysState *ss, uint64_t start_gfn,
     return 0;
 }
 
-static void qemu_s390_skeys_class_init(ObjectClass *oc, void *data)
+static void qemu_s390_skeys_class_init(ObjectClass *oc, const void *data)
 {
     S390SKeysClass *skeyclass = S390_SKEYS_CLASS(oc);
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -315,14 +320,6 @@ static void qemu_s390_skeys_class_init(ObjectClass *oc, void *data)
     /* Reason: Internal device (only one skeys device for the whole memory) */
     dc->user_creatable = false;
 }
-
-static const TypeInfo qemu_s390_skeys_info = {
-    .name          = TYPE_QEMU_S390_SKEYS,
-    .parent        = TYPE_S390_SKEYS,
-    .instance_size = sizeof(QEMUS390SKeysState),
-    .class_init    = qemu_s390_skeys_class_init,
-    .class_size    = sizeof(S390SKeysClass),
-};
 
 static void s390_storage_keys_save(QEMUFile *f, void *opaque)
 {
@@ -472,7 +469,7 @@ static void s390_skeys_realize(DeviceState *dev, Error **errp)
     register_savevm_live(TYPE_S390_SKEYS, 0, 1, &savevm_s390_storage_keys, ss);
 }
 
-static void s390_skeys_class_init(ObjectClass *oc, void *data)
+static void s390_skeys_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
@@ -481,19 +478,27 @@ static void s390_skeys_class_init(ObjectClass *oc, void *data)
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
-static const TypeInfo s390_skeys_info = {
-    .name          = TYPE_S390_SKEYS,
-    .parent        = TYPE_DEVICE,
-    .instance_size = sizeof(S390SKeysState),
-    .class_init    = s390_skeys_class_init,
-    .class_size    = sizeof(S390SKeysClass),
-    .abstract = true,
+static const TypeInfo s390_skeys_types[] = {
+    {
+        .name           = TYPE_DUMP_SKEYS_INTERFACE,
+        .parent         = TYPE_INTERFACE,
+        .class_size     = sizeof(DumpSKeysInterface),
+    },
+    {
+        .name           = TYPE_S390_SKEYS,
+        .parent         = TYPE_DEVICE,
+        .instance_size  = sizeof(S390SKeysState),
+        .class_init     = s390_skeys_class_init,
+        .class_size     = sizeof(S390SKeysClass),
+        .abstract       = true,
+    },
+    {
+        .name           = TYPE_QEMU_S390_SKEYS,
+        .parent         = TYPE_S390_SKEYS,
+        .instance_size  = sizeof(QEMUS390SKeysState),
+        .class_init     = qemu_s390_skeys_class_init,
+        .class_size     = sizeof(S390SKeysClass),
+    },
 };
 
-static void qemu_s390_skeys_register_types(void)
-{
-    type_register_static(&s390_skeys_info);
-    type_register_static(&qemu_s390_skeys_info);
-}
-
-type_init(qemu_s390_skeys_register_types)
+DEFINE_TYPES(s390_skeys_types)

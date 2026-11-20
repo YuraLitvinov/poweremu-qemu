@@ -41,7 +41,7 @@ fn register_names_match_c_over_the_whole_window() {
 
 #[test]
 fn name_table_is_the_c_header() {
-    let hdr = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../r300/r300_regnames.h")).unwrap();
+    let hdr = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../hw/display/r300/r300_regnames.h")).unwrap();
     let rows: Vec<(u16, &str)> = hdr
         .lines()
         .filter_map(|l| {

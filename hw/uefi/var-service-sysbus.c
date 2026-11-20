@@ -6,8 +6,8 @@
 #include "qemu/osdep.h"
 #include "migration/vmstate.h"
 
-#include "hw/qdev-properties.h"
-#include "hw/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
 
 #include "hw/uefi/hardware-info.h"
 #include "hw/uefi/var-service.h"
@@ -33,10 +33,13 @@ static const Property uefi_vars_sysbus_properties[] = {
     DEFINE_PROP_SIZE("size", uefi_vars_sysbus_state, state.max_storage,
                      256 * 1024),
     DEFINE_PROP_STRING("jsonfile", uefi_vars_sysbus_state, state.jsonfile),
+    DEFINE_PROP_STRING("pcapfile", uefi_vars_sysbus_state, state.pcapfile),
     DEFINE_PROP_BOOL("force-secure-boot", uefi_vars_sysbus_state,
                      state.force_secure_boot, false),
     DEFINE_PROP_BOOL("disable-custom-mode", uefi_vars_sysbus_state,
-                     state.disable_custom_mode, false),
+                     state.disable_custom_mode, true),
+    DEFINE_PROP_BOOL("require-self-signed-pk", uefi_vars_sysbus_state,
+                     state.require_self_signed_pk, false),
     DEFINE_PROP_BOOL("use-pio", uefi_vars_sysbus_state,
                      state.use_pio, false),
 };
@@ -64,7 +67,7 @@ static void uefi_vars_sysbus_realize(DeviceState *dev, Error **errp)
     uefi_vars_realize(&uv->state, errp);
 }
 
-static void uefi_vars_sysbus_class_init(ObjectClass *klass, void *data)
+static void uefi_vars_sysbus_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -83,6 +86,7 @@ static const TypeInfo uefi_vars_sysbus_info = {
     .instance_size = sizeof(uefi_vars_sysbus_state),
     .instance_init = uefi_vars_sysbus_init,
     .class_init    = uefi_vars_sysbus_class_init,
+    .secure        = true,
 };
 module_obj(TYPE_UEFI_VARS_SYSBUS);
 
@@ -100,7 +104,7 @@ static void uefi_vars_x64_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(sysbus, 0, hwinfo.mmio_address);
 }
 
-static void uefi_vars_x64_class_init(ObjectClass *klass, void *data)
+static void uefi_vars_x64_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -112,6 +116,7 @@ static const TypeInfo uefi_vars_x64_info = {
     .name          = TYPE_UEFI_VARS_X64,
     .parent        = TYPE_UEFI_VARS_SYSBUS,
     .class_init    = uefi_vars_x64_class_init,
+    .secure        = true,
 };
 module_obj(TYPE_UEFI_VARS_X64);
 

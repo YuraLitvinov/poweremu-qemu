@@ -7,7 +7,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/bswap.h"
 #include "libqtest-single.h"
 #include "qemu/bitops.h"
 #include "aspeed-smc-utils.h"
@@ -53,6 +52,22 @@ static void test_ast2700_evb(AspeedSMCTestData *data)
                         data, aspeed_smc_test_read_status_reg);
     qtest_add_data_func("/ast2700/smc/write_page_qpi",
                         data, aspeed_smc_test_write_page_qpi);
+    qtest_add_data_func("/ast2700/smc/read_page_mem_fast_read",
+                        data, aspeed_smc_test_read_page_mem_fast_read);
+    qtest_add_data_func("/ast2700/smc/write_page_fast_read",
+                        data, aspeed_smc_test_write_page_fast_read);
+    qtest_add_data_func("/ast2700/smc/read_page_mem_dor",
+                        data, aspeed_smc_test_read_page_mem_dor);
+    qtest_add_data_func("/ast2700/smc/write_page_dor",
+                        data, aspeed_smc_test_write_page_dor);
+    qtest_add_data_func("/ast2700/smc/read_page_mem_qor",
+                        data, aspeed_smc_test_read_page_mem_qor);
+    qtest_add_data_func("/ast2700/smc/write_page_qor",
+                        data, aspeed_smc_test_write_page_qor);
+    qtest_add_data_func("/ast2700/smc/write_page_datafifo",
+                        data, aspeed_smc_test_write_page_datafifo);
+    qtest_add_data_func("/ast2700/smc/read_page_datafifo",
+                        data, aspeed_smc_test_read_page_datafifo);
 }
 
 int main(int argc, char **argv)
@@ -67,5 +82,6 @@ int main(int argc, char **argv)
 
     qtest_quit(ast2700_evb_data.s);
     unlink(ast2700_evb_data.tmp_path);
+    g_free(ast2700_evb_data.tmp_path);
     return ret;
 }

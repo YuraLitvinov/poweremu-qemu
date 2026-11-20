@@ -22,6 +22,7 @@
 #include "qgraph.h"
 #include "virtio.h"
 #include "virtio-pci.h"
+#include "hw/9pfs/9p.h"
 
 typedef struct QVirtio9P QVirtio9P;
 typedef struct QVirtio9PPCI QVirtio9PPCI;
@@ -32,6 +33,11 @@ typedef struct QVirtio9PDevice QVirtio9PDevice;
 struct QVirtio9P {
     QVirtioDevice *vdev;
     QVirtQueue *vq;
+    /*
+     * The protocol version negotiated for this 9p session via Tversion request
+     * (0 if no protocol version negotiated yet)
+     */
+    P9ProtoVersion proto_version;
 };
 
 struct QVirtio9PPCI {
@@ -43,6 +49,12 @@ struct QVirtio9PDevice {
     QOSGraphObject obj;
     QVirtio9P v9p;
 };
+
+/**
+ * Add required test specific args to the QEMU command line for the 9pfs
+ * 'synth' fs driver.
+ */
+void virtio_9p_add_synth_driver_args(GString *cmd_line, const char *args);
 
 /**
  * Creates the directory for the 9pfs 'local' filesystem driver to access.

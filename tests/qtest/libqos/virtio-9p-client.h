@@ -21,7 +21,8 @@
 #include "qgraph.h"
 #include "tests/qtest/libqtest-single.h"
 
-#define P9_MAX_SIZE 4096 /* Max size of a T-message or R-message */
+/* Max size of a T-message or R-message */
+#define P9_MAX_SIZE (32 * 1024)
 
 typedef struct {
     QTestState *qts;
@@ -62,8 +63,37 @@ typedef struct v9fs_attr {
     uint64_t data_version;
 } v9fs_attr;
 
+typedef struct v9fs_stat {
+    uint16_t size;
+    uint16_t type;
+    uint32_t dev;
+    v9fs_qid qid;
+    uint32_t mode;
+    uint32_t atime;
+    uint32_t mtime;
+    uint64_t length;
+    char *name;
+    char *uid;
+    char *gid;
+    char *muid;
+    char *extension;
+    uint32_t n_uid;
+    uint32_t n_gid;
+    uint32_t n_muid;
+} v9fs_stat;
+
 #define P9_GETATTR_BASIC    0x000007ffULL /* Mask for fields up to BLOCKS */
 #define P9_GETATTR_ALL      0x00003fffULL /* Mask for ALL fields */
+
+#define P9_SETATTR_MODE         0x00000001UL
+#define P9_SETATTR_UID          0x00000002UL
+#define P9_SETATTR_GID          0x00000004UL
+#define P9_SETATTR_SIZE         0x00000008UL
+#define P9_SETATTR_ATIME        0x00000010UL
+#define P9_SETATTR_MTIME        0x00000020UL
+#define P9_SETATTR_CTIME        0x00000040UL
+#define P9_SETATTR_ATIME_SET    0x00000080UL
+#define P9_SETATTR_MTIME_SET    0x00000100UL
 
 struct V9fsDirent {
     v9fs_qid qid;
@@ -181,6 +211,28 @@ typedef struct TGetAttrRes {
     /* if requestOnly was set: request object for further processing */
     P9Req *req;
 } TGetAttrRes;
+
+/* options for 'Tsetattr' 9p request */
+typedef struct TSetAttrOpt {
+    /* 9P client being used (mandatory) */
+    QVirtio9P *client;
+    /* user supplied tag number being returned with response (optional) */
+    uint16_t tag;
+    /* file ID of file/dir whose attributes shall be modified (required) */
+    uint32_t fid;
+    /* new attribute values to be set by 9p server */
+    v9fs_attr attr;
+    /* only send Tsetattr request but not wait for a reply? (optional) */
+    bool requestOnly;
+    /* do we expect an Rlerror response, if yes which error code? (optional) */
+    uint32_t expectErr;
+} TSetAttrOpt;
+
+/* result of 'Tsetattr' 9p request */
+typedef struct TSetAttrRes {
+    /* if requestOnly was set: request object for further processing */
+    P9Req *req;
+} TSetAttrRes;
 
 /* options for 'Treaddir' 9p request */
 typedef struct TReadDirOpt {
@@ -320,6 +372,54 @@ typedef struct TMkdirRes {
     P9Req *req;
 } TMkdirRes;
 
+/* create directory */
+#define P9_CREATE_PERM_DMDIR     0x80000000
+
+/* options for 'Tcreate' 9p request (legacy 9p2000.u) */
+typedef struct TCreateOpt {
+    /* 9P client being used (mandatory) */
+    QVirtio9P *client;
+    /* user supplied tag number being returned with response (optional) */
+    uint16_t tag;
+    /* file ID of the directory the new file shall be created in (required) */
+    uint32_t fid;
+    /* name of the new file (required) */
+    const char *name;
+    /*
+     * Create mode bits (including file type bits):
+     * e.g. 0644 for a regular file,
+     * or P9_CREATE_PERM_DMDIR | 0755 for a directory
+     * (optional)
+     */
+    uint32_t perm;
+    /*
+     * Open mode byte:
+     * OREAD (0), OWRITE (1), ORDWR (2), OEXEC(3), OTRUNC(0x10), ORCLOSE(0x40)
+     * (optional)
+     */
+    uint8_t mode;
+    /*
+     * Extension data for special files (e.g. symlink target), empty for
+     * regular files. (optional)
+     */
+    const char *extension;
+    /* data being received from 9p server as 'Rcreate' response (optional) */
+    struct {
+        v9fs_qid *qid;
+        uint32_t *iounit;
+    } rcreate;
+    /* only send Tcreate request but not wait for a reply? (optional) */
+    bool requestOnly;
+    /* do we expect an error response, if yes which error code? (optional) */
+    uint32_t expectErr;
+} TCreateOpt;
+
+/* result of 'Tcreate' 9p request */
+typedef struct TCreateRes {
+    /* if requestOnly was set: request object for further processing */
+    P9Req *req;
+} TCreateRes;
+
 /* options for 'Tlcreate' 9p request */
 typedef struct TlcreateOpt {
     /* 9P client being used (mandatory) */
@@ -441,6 +541,135 @@ typedef struct TunlinkatRes {
     P9Req *req;
 } TunlinkatRes;
 
+/* options for 'Tread' 9p request */
+typedef struct TReadOpt {
+    /* 9P client being used (mandatory) */
+    QVirtio9P *client;
+    /* user supplied tag number being returned with response (optional) */
+    uint16_t tag;
+    /* file ID of file to read from (required) */
+    uint32_t fid;
+    /* start position of read from beginning of file (optional) */
+    uint64_t offset;
+    /* how many bytes to read (required) */
+    uint32_t count;
+    /* data being received from 9p server as 'Rread' response (optional) */
+    struct {
+        uint32_t *count;
+        void *data;
+    } rread;
+    /* only send Tread request but not wait for a reply? (optional) */
+    bool requestOnly;
+    /* do we expect an Rlerror response, if yes which error code? (optional) */
+    uint32_t expectErr;
+} TReadOpt;
+
+/* result of 'Tread' 9p request */
+typedef struct TReadRes {
+    /* if requestOnly was set: request object for further processing */
+    P9Req *req;
+    /* amount of bytes read */
+    uint32_t count;
+} TReadRes;
+
+/* options for 'Tclunk' 9p request */
+typedef struct TClunkOpt {
+    /* 9P client being used (mandatory) */
+    QVirtio9P *client;
+    /* user supplied tag number being returned with response (optional) */
+    uint16_t tag;
+    /* file ID to clunk (required) */
+    uint32_t fid;
+    /* only send Tclunk request but not wait for a reply? (optional) */
+    bool requestOnly;
+    /* do we expect an Rlerror response, if yes which error code? (optional) */
+    uint32_t expectErr;
+} TClunkOpt;
+
+/* result of 'Tclunk' 9p request */
+typedef struct TClunkRes {
+    /* if requestOnly was set: request object for further processing */
+    P9Req *req;
+} TClunkRes;
+
+/* options for 'Txattrcreate' 9p request */
+typedef struct TXattrCreateOpt {
+    /* 9P client being used (mandatory) */
+    QVirtio9P *client;
+    /* user supplied tag number being returned with response (optional) */
+    uint16_t tag;
+    /* file ID to convert to xattr fid (required) */
+    uint32_t fid;
+    /* name of the xattr (required) */
+    const char *name;
+    /* size of the xattr value (required) */
+    uint64_t size;
+    /* flags: P9_XATTR_CREATE or P9_XATTR_REPLACE (optional) */
+    uint32_t flags;
+    /* only send Txattrcreate request but not wait for a reply? (optional) */
+    bool requestOnly;
+    /* do we expect an Rlerror response, if yes which error code? (optional) */
+    uint32_t expectErr;
+} TXattrCreateOpt;
+
+/* result of 'Txattrcreate' 9p request */
+typedef struct TXattrCreateRes {
+    /* if requestOnly was set: request object for further processing */
+    P9Req *req;
+    /* error code if Rlerror received */
+    uint32_t err;
+} TXattrCreateRes;
+
+/* options for 'Txattrwalk' 9p request */
+typedef struct TXattrWalkOpt {
+    /* 9P client being used (mandatory) */
+    QVirtio9P *client;
+    /* user supplied tag number being returned with response (optional) */
+    uint16_t tag;
+    /* file ID of file/dir from which to walk (required) */
+    uint32_t fid;
+    /* file ID that will refer to the walked-to xattr (required) */
+    uint32_t newfid;
+    /* xattr name, or empty for a list of all xattrs (required) */
+    const char *name;
+    /* only send Txattrwalk request but not wait for a reply? (optional) */
+    bool requestOnly;
+    /* do we expect an Rlerror response, if yes which error code? (optional) */
+    uint32_t expectErr;
+} TXattrWalkOpt;
+
+/* result of 'Txattrwalk' 9p request */
+typedef struct TXattrWalkRes {
+    /* if requestOnly was set: request object for further processing */
+    P9Req *req;
+    /* size of xattr */
+    uint64_t size;
+} TXattrWalkRes;
+
+/* options for 'Tstat' 9p request */
+typedef struct TStatOpt {
+    /* 9P client being used (mandatory) */
+    QVirtio9P *client;
+    /* user supplied tag number being returned with response (optional) */
+    uint16_t tag;
+    /* file ID to get the Rstat for (required) */
+    uint32_t fid;
+    /* data being received from 9p server as 'Rstat' response (optional) */
+    struct {
+        v9fs_stat *stat;
+    } rstat;
+    /* only send Tstat request but not wait for a reply? (optional) */
+    bool requestOnly;
+    /* do we expect an error response, if yes which error code? (optional) */
+    uint32_t expectErr;
+} TStatOpt;
+
+/* result of 'Tstat' 9p request */
+typedef struct TStatRes {
+    /* if requestOnly was set: request object for further processing */
+    P9Req *req;
+} TStatRes;
+
 void v9fs_set_allocator(QGuestAllocator *t_alloc);
 void v9fs_memwrite(P9Req *req, const void *addr, size_t len);
 void v9fs_memskip(P9Req *req, size_t len);
@@ -461,6 +690,7 @@ void v9fs_req_send(P9Req *req);
 void v9fs_req_wait_for_reply(P9Req *req, uint32_t *len);
 void v9fs_req_recv(P9Req *req, uint8_t id);
 void v9fs_req_free(P9Req *req);
+void v9fs_rerror(P9Req *req, uint32_t *err);
 void v9fs_rlerror(P9Req *req, uint32_t *err);
 TVersionRes v9fs_tversion(TVersionOpt);
 void v9fs_rversion(P9Req *req, uint16_t *len, char **version);
@@ -470,6 +700,8 @@ TWalkRes v9fs_twalk(TWalkOpt opt);
 void v9fs_rwalk(P9Req *req, uint16_t *nwqid, v9fs_qid **wqid);
 TGetAttrRes v9fs_tgetattr(TGetAttrOpt);
 void v9fs_rgetattr(P9Req *req, v9fs_attr *attr);
+TSetAttrRes v9fs_tsetattr(TSetAttrOpt opt);
+void v9fs_rsetattr(P9Req *req);
 TReadDirRes v9fs_treaddir(TReadDirOpt);
 void v9fs_rreaddir(P9Req *req, uint32_t *count, uint32_t *nentries,
                    struct V9fsDirent **entries);
@@ -482,6 +714,8 @@ TFlushRes v9fs_tflush(TFlushOpt);
 void v9fs_rflush(P9Req *req);
 TMkdirRes v9fs_tmkdir(TMkdirOpt);
 void v9fs_rmkdir(P9Req *req, v9fs_qid *qid);
+TCreateRes v9fs_tcreate(TCreateOpt opt);
+void v9fs_rcreate(P9Req *req, v9fs_qid *qid, uint32_t *iounit);
 TlcreateRes v9fs_tlcreate(TlcreateOpt);
 void v9fs_rlcreate(P9Req *req, v9fs_qid *qid, uint32_t *iounit);
 TsymlinkRes v9fs_tsymlink(TsymlinkOpt);
@@ -490,5 +724,15 @@ TlinkRes v9fs_tlink(TlinkOpt);
 void v9fs_rlink(P9Req *req);
 TunlinkatRes v9fs_tunlinkat(TunlinkatOpt);
 void v9fs_runlinkat(P9Req *req);
+TReadRes v9fs_tread(TReadOpt opt);
+void v9fs_rread(P9Req *req, uint32_t *count, void *data);
+TClunkRes v9fs_tclunk(TClunkOpt opt);
+void v9fs_rclunk(P9Req *req);
+TXattrCreateRes v9fs_txattrcreate(TXattrCreateOpt opt);
+void v9fs_rxattrcreate(P9Req *req);
+TXattrWalkRes v9fs_txattrwalk(TXattrWalkOpt opt);
+void v9fs_rxattrwalk(P9Req *req, uint64_t *size);
+TStatRes v9fs_tstat(TStatOpt opt);
+void v9fs_rstat(P9Req *req, v9fs_stat *stat);
 
 #endif

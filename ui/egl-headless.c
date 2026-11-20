@@ -9,6 +9,7 @@
 
 typedef struct egl_dpy {
     DisplayChangeListener dcl;
+    DisplayGLCtx *ctx;
     DisplaySurface *ds;
     QemuGLShader *gls;
     egl_fb guest_fb;
@@ -19,15 +20,13 @@ typedef struct egl_dpy {
     uint32_t pos_y;
 } egl_dpy;
 
-#ifndef CONFIG_GBM
-static EGLContext ctx;
-#endif
+static GPtrArray *egl_dpys;
 
 /* ------------------------------------------------------------------ */
 
 static void egl_refresh(DisplayChangeListener *dcl)
 {
-    graphic_hw_update(dcl->con);
+    qemu_console_hw_update(dcl->con);
 }
 
 static void egl_gfx_update(DisplayChangeListener *dcl,
@@ -46,24 +45,20 @@ static void egl_gfx_switch(DisplayChangeListener *dcl,
 static QEMUGLContext egl_create_context(DisplayGLCtx *dgc,
                                         QEMUGLParams *params)
 {
-#ifdef CONFIG_GBM
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   qemu_egl_rn_ctx);
-#else
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);
-#endif
-    return qemu_egl_create_context(dgc, params);
+    return qemu_egl_create_context(dgc, params, qemu_egl_rn_ctx);
 }
 
 static void egl_scanout_disable(DisplayChangeListener *dcl)
 {
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
 
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
     egl_fb_destroy(&edpy->guest_fb);
     egl_fb_destroy(&edpy->blit_fb);
 }
 
-static void egl_scanout_imported_texture(DisplayChangeListener *dcl,
+static void egl_scanout_texture(DisplayChangeListener *dcl,
                                 uint32_t backing_id,
                                 bool backing_y_0_top,
                                 uint32_t backing_width,
@@ -75,6 +70,9 @@ static void egl_scanout_imported_texture(DisplayChangeListener *dcl,
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
 
     edpy->y_0_top = backing_y_0_top;
+
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
 
     /* source framebuffer */
     egl_fb_setup_for_tex(&edpy->guest_fb,
@@ -88,25 +86,6 @@ static void egl_scanout_imported_texture(DisplayChangeListener *dcl,
     }
 }
 
-static void egl_scanout_texture(DisplayChangeListener *dcl,
-                                uint32_t backing_id,
-                                DisplayGLTextureBorrower backing_borrow,
-                                uint32_t x, uint32_t y,
-                                uint32_t w, uint32_t h)
-{
-    bool backing_y_0_top;
-    uint32_t backing_width;
-    uint32_t backing_height;
-    void *d3d_tex2d;
-
-    GLuint backing_texture = backing_borrow(backing_id, &backing_y_0_top,
-                                            &backing_width, &backing_height,
-                                            &d3d_tex2d);
-    egl_scanout_imported_texture(dcl, backing_texture, backing_y_0_top,
-                                 backing_width, backing_height,
-                                 x, y, w, h, d3d_tex2d);
-}
-
 #ifdef CONFIG_GBM
 
 static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
@@ -114,6 +93,8 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
 {
     uint32_t width, height, texture;
 
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
     egl_dmabuf_import_texture(dmabuf);
     texture = qemu_dmabuf_get_texture(dmabuf);
     if (!texture) {
@@ -123,7 +104,7 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
     width = qemu_dmabuf_get_width(dmabuf);
     height = qemu_dmabuf_get_height(dmabuf);
 
-    egl_scanout_imported_texture(dcl, texture, false, width, height, 0, 0,
+    egl_scanout_texture(dcl, texture, false, width, height, 0, 0,
                         width, height, NULL);
 }
 
@@ -134,6 +115,8 @@ static void egl_cursor_dmabuf(DisplayChangeListener *dcl,
     uint32_t width, height, texture;
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
 
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
     if (dmabuf) {
         egl_dmabuf_import_texture(dmabuf);
         texture = qemu_dmabuf_get_texture(dmabuf);
@@ -152,6 +135,8 @@ static void egl_cursor_dmabuf(DisplayChangeListener *dcl,
 static void egl_release_dmabuf(DisplayChangeListener *dcl,
                                QemuDmaBuf *dmabuf)
 {
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
     egl_dmabuf_release_texture(dmabuf);
 }
 
@@ -177,12 +162,14 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
     }
     assert(surface_format(edpy->ds) == PIXMAN_x8r8g8b8);
 
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
     if (edpy->cursor_fb.texture) {
         /* have cursor -> render using textures */
         egl_texture_blit(edpy->gls, &edpy->blit_fb, &edpy->guest_fb,
-                         !edpy->y_0_top, false);
+                         !edpy->y_0_top);
         egl_texture_blend(edpy->gls, &edpy->blit_fb, &edpy->cursor_fb,
-                          !edpy->y_0_top, false, edpy->pos_x, edpy->pos_y,
+                          !edpy->y_0_top, edpy->pos_x, edpy->pos_y,
                           1.0, 1.0);
     } else {
         /* no cursor -> use simple framebuffer blit */
@@ -190,7 +177,7 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
     }
 
     egl_fb_read(edpy->ds, &edpy->blit_fb);
-    dpy_gfx_update(edpy->dcl.con, x, y, w, h);
+    qemu_console_update(edpy->dcl.con, x, y, w, h);
 }
 
 static const DisplayChangeListenerOps egl_ops = {
@@ -240,20 +227,7 @@ static void early_egl_headless_init(DisplayOptions *opts)
         mode = opts->gl;
     }
 
-#ifdef CONFIG_GBM
     egl_init(opts->u.egl_headless.rendernode, mode, &error_fatal);
-#else
-    if (qemu_egl_init_dpy_surfaceless(mode)) {
-        error_report("egl: display init failed");
-        exit(1);
-    }
-
-    ctx = qemu_egl_init_ctx();
-    if (!ctx) {
-        error_report("egl: egl_init_ctx failed");
-        exit(1);
-    }
-#endif
 }
 
 static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)
@@ -262,6 +236,10 @@ static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)
     egl_dpy *edpy;
     int idx;
 
+    egl_dpys = g_ptr_array_new();
+
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
     for (idx = 0;; idx++) {
         DisplayGLCtx *ctx;
 
@@ -271,20 +249,46 @@ static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)
         }
 
         edpy = g_new0(egl_dpy, 1);
-        edpy->dcl.con = con;
-        edpy->dcl.ops = &egl_ops;
         edpy->gls = qemu_gl_init_shader();
         ctx = g_new0(DisplayGLCtx, 1);
         ctx->ops = &eglctx_ops;
+        edpy->ctx = ctx;
         qemu_console_set_display_gl_ctx(con, ctx);
-        register_displaychangelistener(&edpy->dcl);
+        qemu_console_register_listener(con, &edpy->dcl, &egl_ops);
+        g_ptr_array_add(egl_dpys, edpy);
     }
+}
+
+static void egl_headless_cleanup(void)
+{
+    if (!egl_dpys) {
+        return;
+    }
+
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE,
+                   EGL_NO_SURFACE, qemu_egl_rn_ctx);
+    for (guint i = 0; i < egl_dpys->len; i++) {
+        egl_dpy *edpy = g_ptr_array_index(egl_dpys, i);
+
+        qemu_console_unregister_listener(&edpy->dcl);
+        qemu_console_set_display_gl_ctx(edpy->dcl.con, NULL);
+        egl_fb_destroy(&edpy->guest_fb);
+        egl_fb_destroy(&edpy->cursor_fb);
+        egl_fb_destroy(&edpy->blit_fb);
+        qemu_gl_fini_shader(edpy->gls);
+        g_free(edpy->ctx);
+        g_free(edpy);
+    }
+    g_clear_pointer(&egl_dpys, g_ptr_array_unref);
+
+    egl_cleanup();
 }
 
 static QemuDisplay qemu_display_egl = {
     .type       = DISPLAY_TYPE_EGL_HEADLESS,
     .early_init = early_egl_headless_init,
     .init       = egl_headless_init,
+    .cleanup    = egl_headless_cleanup,
 };
 
 static void register_egl(void)

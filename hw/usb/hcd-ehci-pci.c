@@ -16,7 +16,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/usb/hcd-ehci.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -136,7 +136,7 @@ static void usb_ehci_pci_write_config(PCIDevice *dev, uint32_t addr,
 }
 
 static const Property ehci_pci_properties[] = {
-    DEFINE_PROP_UINT32("maxframes", EHCIPCIState, ehci.maxframes, 128),
+    DEFINE_EHCI_COMMON_PROPERTIES(EHCIPCIState),
 };
 
 static const VMStateDescription vmstate_ehci_pci = {
@@ -150,7 +150,7 @@ static const VMStateDescription vmstate_ehci_pci = {
     }
 };
 
-static void ehci_class_init(ObjectClass *klass, void *data)
+static void ehci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -172,13 +172,13 @@ static const TypeInfo ehci_pci_type_info = {
     .instance_finalize = usb_ehci_pci_finalize,
     .abstract = true,
     .class_init = ehci_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },
 };
 
-static void ehci_data_class_init(ObjectClass *klass, void *data)
+static void ehci_data_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);

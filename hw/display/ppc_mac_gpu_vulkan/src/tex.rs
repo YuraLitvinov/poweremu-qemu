@@ -7,6 +7,48 @@ use ash::vk;
 use crate::state::*;
 use crate::sys::*;
 
+/// The R300 helpers the texture upload uses.  With the Rust crate linked in (feature `r300_rs`, see
+/// hw/display/meson.build) they are plain safe Rust calls; the big-endian build still calls the C ones.
+#[cfg(feature = "r300_rs")]
+mod r300_api {
+    use super::R300TexDesc;
+
+    // The descriptor bindgen made from r300_draw.h and the crate's mirror of it are the same C layout (the crate's
+    // tests/layout.rs checks it against the header); this is the one place that relies on it.
+    const _: () = assert!(std::mem::size_of::<R300TexDesc>() == std::mem::size_of::<r300::types::R300TexDesc>());
+
+    pub fn desc(td: &R300TexDesc) -> &r300::types::R300TexDesc {
+        // SAFETY: same size (asserted above) and `repr(C)` layout; the fields are plain integers and a pointer.
+        unsafe { &*(td as *const R300TexDesc).cast() }
+    }
+
+    pub fn hash_tex(src: *const u8, len: usize) -> u64 {
+        // SAFETY: the caller has `len` readable bytes at `src` (the texture's guest memory).
+        r300::draw::misc::hash_tex(unsafe { std::slice::from_raw_parts(src, len) })
+    }
+
+    pub fn level_dims(td: &R300TexDesc, l: u32) -> (u32, u32, u32) {
+        r300::draw::layout::tex_level_dims(desc(td), l)
+    }
+}
+
+#[cfg(not(feature = "r300_rs"))]
+mod r300_api {
+    use super::*;
+
+    pub fn hash_tex(src: *const u8, len: usize) -> u64 {
+        // SAFETY: as the C function requires: `len` readable bytes at `src`.
+        unsafe { r300_hash_tex(src, len) }
+    }
+
+    pub fn level_dims(td: &R300TexDesc, l: u32) -> (u32, u32, u32) {
+        let (mut w, mut h, mut d) = (0u32, 0u32, 0u32);
+        // SAFETY: valid descriptor and out pointers.
+        unsafe { r300_tex_level_dims(td, l, &mut w, &mut h, &mut d) };
+        (w, h, d)
+    }
+}
+
 extern "C" {
     fn free(p: *mut c_void);
 }
@@ -151,7 +193,7 @@ impl Vk {
             levels: td.levels,
             pitch: td.pitch_bytes,
             host: if !td.host_data.is_null() { 1 + (td.endian << 1) } else { td.endian << 1 },
-            hash: unsafe { r300_hash_tex(src, td.size_bytes as usize) },
+            hash: r300_api::hash_tex(src, td.size_bytes as usize),
         };
         if dxt && !self.bc {
             self.warn(2, "DXT texture on a GPU without BC formats");
@@ -222,8 +264,7 @@ impl Vk {
         let cb = self.cb();
         self.layout_general(cb, img, td.levels, if cube { 6 } else { 1 });
         for l in 0..td.levels {
-            let (mut lw, mut lh, mut n) = (0u32, 0u32, 0u32);
-            unsafe { r300_tex_level_dims(td, l, &mut lw, &mut lh, &mut n) };
+            let (lw, lh, n) = r300_api::level_dims(td, l);
             let mw = (w >> l).max(1);
             let mh = (h >> l).max(1);
             let (cw, ch) = if dxt { (mw, mh) } else { (lw, lh) };
@@ -265,16 +306,21 @@ impl Vk {
     /// converts in place; the C one returns a malloc'd copy.
     #[cfg(feature = "r300_rs")]
     fn level_to_arena(&mut self, td: &R300TexDesc, src: *const u8, l: u32, w: u32, h: u32, _dxt: bool) -> Option<(vk::Buffer, u64)> {
-        let td = td as *const R300TexDesc as *const r300::types::R300TexDesc;
-        let mut bpr = 0u32;
-        // SAFETY: the two descriptors have the same C layout (checked by the r300 crate against r300_draw.h).
-        let len = unsafe { r300::capi::r300_tex_level_size(td, l, w, h, &mut bpr) };
+        use r300::texel::{convert_level, LevelSpec};
+
+        let spec = LevelSpec::for_desc(r300_api::desc(td), l)?;
+        let geo = spec.geometry(w, h).ok()?;
+        let len = geo.out_len();
         if len == 0 {
             return None;
         }
         let (sb, so, dst) = self.arena(len as u64)?;
-        // SAFETY: `dst` has `len` writable bytes; `src` covers the level's source rows.
-        unsafe { r300::capi::r300_tex_level_convert(td, src, l, w, h, dst, len) }.then_some((sb, so))
+        // SAFETY: `src` covers the level's source rows (the caller's contract) and `dst` is `len` bytes of the arena.
+        let (src, out) = unsafe {
+            (std::slice::from_raw_parts(src, geo.src_len(spec.src_pitch)), std::slice::from_raw_parts_mut(dst, len))
+        };
+        convert_level(&spec, src, w, h, out).ok()?;
+        Some((sb, so))
     }
 
     #[cfg(not(feature = "r300_rs"))]

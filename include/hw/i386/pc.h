@@ -4,12 +4,12 @@
 #include "qemu/notify.h"
 #include "qapi/qapi-types-common.h"
 #include "qemu/uuid.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "hw/block/fdc.h"
 #include "hw/block/flash.h"
 #include "hw/i386/x86.h"
 
-#include "hw/hotplug.h"
+#include "hw/core/hotplug.h"
 #include "qom/object.h"
 #include "hw/i386/sgx-epc.h"
 #include "hw/cxl/cxl.h"
@@ -38,13 +38,19 @@ typedef struct PCMachineState {
     DeviceState *iommu;
     BusState *idebus[MAX_IDE_BUS];
 
+    Object *alias_pcspk;
+    Object *alias_rtc_time;
+    Object *alias_pflash0;
+    Object *alias_pflash1;
+
     /* Configuration options: */
     uint64_t max_ram_below_4g;
     OnOffAuto vmport;
     SmbiosEntryPointType smbios_entry_point_type;
-    const char *south_bridge;
+    PCSouthBridgeOption south_bridge;
 
     bool acpi_build_enabled;
+    bool wdat_enabled;
     bool smbus_enabled;
     bool sata_enabled;
     bool hpet_enabled;
@@ -88,7 +94,7 @@ struct PCMachineClass {
 
     /* Device configuration: */
     bool pci_enabled;
-    const char *default_south_bridge;
+    PCSouthBridgeOption default_south_bridge;
 
     /* Compat options: */
 
@@ -107,15 +113,8 @@ struct PCMachineClass {
     /* RAM / address space compat: */
     bool gigabyte_align;
     bool has_reserved_memory;
-    bool broken_reserved_end;
     bool enforce_amd_1tb_hole;
     bool isa_bios_alias;
-
-    /* generate legacy CPU hotplug AML */
-    bool legacy_cpu_hotplug;
-
-    /* use PVH to load kernels that support this feature */
-    bool pvh_enabled;
 
     /* create kvmclock device even when KVM PV features are not exposed */
     bool kvmclock_create_always;
@@ -215,6 +214,21 @@ void pc_system_parse_ovmf_flash(uint8_t *flash_ptr, size_t flash_size);
 /* sgx.c */
 void pc_machine_init_sgx_epc(PCMachineState *pcms);
 
+extern GlobalProperty pc_compat_11_1[];
+extern const size_t pc_compat_11_1_len;
+
+extern GlobalProperty pc_compat_11_0[];
+extern const size_t pc_compat_11_0_len;
+
+extern GlobalProperty pc_compat_10_2[];
+extern const size_t pc_compat_10_2_len;
+
+extern GlobalProperty pc_compat_10_1[];
+extern const size_t pc_compat_10_1_len;
+
+extern GlobalProperty pc_compat_10_0[];
+extern const size_t pc_compat_10_0_len;
+
 extern GlobalProperty pc_compat_9_2[];
 extern const size_t pc_compat_9_2_len;
 
@@ -266,44 +280,9 @@ extern const size_t pc_compat_4_2_len;
 extern GlobalProperty pc_compat_4_1[];
 extern const size_t pc_compat_4_1_len;
 
-extern GlobalProperty pc_compat_4_0[];
-extern const size_t pc_compat_4_0_len;
-
-extern GlobalProperty pc_compat_3_1[];
-extern const size_t pc_compat_3_1_len;
-
-extern GlobalProperty pc_compat_3_0[];
-extern const size_t pc_compat_3_0_len;
-
-extern GlobalProperty pc_compat_2_12[];
-extern const size_t pc_compat_2_12_len;
-
-extern GlobalProperty pc_compat_2_11[];
-extern const size_t pc_compat_2_11_len;
-
-extern GlobalProperty pc_compat_2_10[];
-extern const size_t pc_compat_2_10_len;
-
-extern GlobalProperty pc_compat_2_9[];
-extern const size_t pc_compat_2_9_len;
-
-extern GlobalProperty pc_compat_2_8[];
-extern const size_t pc_compat_2_8_len;
-
-extern GlobalProperty pc_compat_2_7[];
-extern const size_t pc_compat_2_7_len;
-
-extern GlobalProperty pc_compat_2_6[];
-extern const size_t pc_compat_2_6_len;
-
-extern GlobalProperty pc_compat_2_5[];
-extern const size_t pc_compat_2_5_len;
-
-extern GlobalProperty pc_compat_2_4[];
-extern const size_t pc_compat_2_4_len;
-
-#define DEFINE_PC_MACHINE(suffix, namestr, initfn, optsfn) \
-    static void pc_machine_##suffix##_class_init(ObjectClass *oc, void *data) \
+#define DEFINE_PC_MACHINE_EXTENDED(suffix, namestr, initfn, optsfn, issecure) \
+    static void pc_machine_##suffix##_class_init(ObjectClass *oc, \
+                                                 const void *data) \
     { \
         MachineClass *mc = MACHINE_CLASS(oc); \
         optsfn(mc); \
@@ -313,12 +292,21 @@ extern const size_t pc_compat_2_4_len;
         .name       = namestr TYPE_MACHINE_SUFFIX, \
         .parent     = TYPE_PC_MACHINE, \
         .class_init = pc_machine_##suffix##_class_init, \
+        .secure     = issecure, \
     }; \
     static void pc_machine_init_##suffix(void) \
     { \
         type_register_static(&pc_machine_type_##suffix); \
     } \
     type_init(pc_machine_init_##suffix)
+
+/* Implicitly insecure */
+#define DEFINE_PC_MACHINE(suffix, namestr, initfn, optsfn) \
+    DEFINE_PC_MACHINE_EXTENDED(suffix, namestr, initfn, optsfn, false)
+
+#define DEFINE_SECURE_PC_MACHINE(suffix, namestr, initfn, optsfn) \
+    DEFINE_PC_MACHINE_EXTENDED(suffix, namestr, initfn, optsfn, true)
+
 
 #define DEFINE_PC_VER_MACHINE(namesym, namestr, initfn, isdefault, malias, ...) \
     static void MACHINE_VER_SYM(init, namesym, __VA_ARGS__)( \
@@ -328,7 +316,7 @@ extern const size_t pc_compat_2_4_len;
     } \
     static void MACHINE_VER_SYM(class_init, namesym, __VA_ARGS__)( \
         ObjectClass *oc, \
-        void *data) \
+        const void *data) \
     { \
         MachineClass *mc = MACHINE_CLASS(oc); \
         MACHINE_VER_SYM(options, namesym, __VA_ARGS__)(mc); \
@@ -342,6 +330,7 @@ extern const size_t pc_compat_2_4_len;
         .name       = MACHINE_VER_TYPE_NAME(namestr, __VA_ARGS__), \
         .parent     = TYPE_PC_MACHINE, \
         .class_init = MACHINE_VER_SYM(class_init, namesym, __VA_ARGS__), \
+        .secure     = true, \
     }; \
     static void MACHINE_VER_SYM(register, namesym, __VA_ARGS__)(void) \
     { \

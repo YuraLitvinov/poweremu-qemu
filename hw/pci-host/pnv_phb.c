@@ -14,8 +14,9 @@
 #include "hw/pci-host/pnv_phb.h"
 #include "hw/pci-host/pnv_phb3.h"
 #include "hw/pci-host/pnv_phb4.h"
+#include "hw/pci-host/pnv_phb5.h"
 #include "hw/ppc/pnv.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "qom/object.h"
 #include "system/system.h"
 
@@ -194,7 +195,7 @@ static const Property pnv_phb_properties[] = {
                      PnvPhb4PecState *),
 };
 
-static void pnv_phb_class_init(ObjectClass *klass, void *data)
+static void pnv_phb_class_init(ObjectClass *klass, const void *data)
 {
     PCIHostBridgeClass *hc = PCI_HOST_BRIDGE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -202,7 +203,6 @@ static void pnv_phb_class_init(ObjectClass *klass, void *data)
     hc->root_bus_path = pnv_phb_root_bus_path;
     dc->realize = pnv_phb_realize;
     device_class_set_props(dc, pnv_phb_properties);
-    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
     dc->user_creatable = true;
 }
 
@@ -211,7 +211,6 @@ static void pnv_phb_root_port_reset_hold(Object *obj, ResetType type)
     PCIERootPortClass *rpc = PCIE_ROOT_PORT_GET_CLASS(obj);
     PnvPHBRootPort *phb_rp = PNV_PHB_ROOT_PORT(obj);
     PCIDevice *d = PCI_DEVICE(obj);
-    uint8_t *conf = d->config;
 
     if (rpc->parent_phases.hold) {
         rpc->parent_phases.hold(obj, type);
@@ -222,17 +221,13 @@ static void pnv_phb_root_port_reset_hold(Object *obj, ResetType type)
     }
 
     /* PHB4 and later requires these extra reset steps */
-    pci_byte_test_and_set_mask(conf + PCI_IO_BASE,
-                               PCI_IO_RANGE_MASK & 0xff);
-    pci_byte_test_and_clear_mask(conf + PCI_IO_LIMIT,
-                                 PCI_IO_RANGE_MASK & 0xff);
-    pci_set_word(conf + PCI_MEMORY_BASE, 0);
-    pci_set_word(conf + PCI_MEMORY_LIMIT, 0xfff0);
-    pci_set_word(conf + PCI_PREF_MEMORY_BASE, 0x1);
-    pci_set_word(conf + PCI_PREF_MEMORY_LIMIT, 0xfff1);
-    pci_set_long(conf + PCI_PREF_BASE_UPPER32, 0x1); /* Hack */
-    pci_set_long(conf + PCI_PREF_LIMIT_UPPER32, 0xffffffff);
-    pci_config_set_interrupt_pin(conf, 0);
+    pnv_phb4_cfg_core_reset(d);
+
+    if (phb_rp->version == 4) {
+        return;
+    }
+
+    pnv_phb5_cfg_core_reset(d);
 }
 
 static void pnv_phb_root_port_realize(DeviceState *dev, Error **errp)
@@ -304,7 +299,7 @@ static const Property pnv_phb_root_port_properties[] = {
     DEFINE_PROP_UINT32("version", PnvPHBRootPort, version, 0),
 };
 
-static void pnv_phb_root_port_class_init(ObjectClass *klass, void *data)
+static void pnv_phb_root_port_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);

@@ -36,9 +36,10 @@ typedef struct TraceEventGroup {
 
 static TraceEventGroup *event_groups;
 static size_t nevent_groups;
+#ifdef CONFIG_TRACE_SIMPLE
 static uint32_t next_id;
-static uint32_t next_vcpu_id;
 static bool init_trace_on_startup;
+#endif
 static char *trace_opts_file;
 
 QemuOptsList qemu_trace_opts = {
@@ -64,10 +65,12 @@ QemuOptsList qemu_trace_opts = {
 
 void trace_event_register_group(TraceEvent **events)
 {
+#ifdef CONFIG_TRACE_SIMPLE
     size_t i;
     for (i = 0; events[i] != NULL; i++) {
         events[i]->id = next_id++;
     }
+#endif
     event_groups = g_renew(TraceEventGroup, event_groups, nevent_groups + 1);
     event_groups[nevent_groups].events = events;
     nevent_groups++;
@@ -164,15 +167,6 @@ static void do_trace_enable_events(const char *line_buf)
 
     trace_event_iter_init_pattern(&iter, line_ptr);
     while ((ev = trace_event_iter_next(&iter)) != NULL) {
-        if (!trace_event_get_state_static(ev)) {
-            if (!is_pattern) {
-                warn_report("trace event '%s' is not traceable",
-                            line_ptr);
-                return;
-            }
-            continue;
-        }
-
         /* start tracing */
         trace_event_set_state_dynamic(ev, enable);
         if (!is_pattern) {
@@ -295,13 +289,10 @@ void trace_opt_parse(const char *optstr)
         trace_enable_events(qemu_opt_get(opts, "enable"));
     }
     trace_init_events(qemu_opt_get(opts, "events"));
+#ifdef CONFIG_TRACE_SIMPLE
     init_trace_on_startup = true;
+#endif
     g_free(trace_opts_file);
     trace_opts_file = g_strdup(qemu_opt_get(opts, "file"));
     qemu_opts_del(opts);
-}
-
-uint32_t trace_get_vcpu_event_count(void)
-{
-    return next_vcpu_id;
 }

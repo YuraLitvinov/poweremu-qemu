@@ -15,10 +15,11 @@
 #include "qemu/lockable.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "qapi/error.h"
-#include "block/aio-wait.h"
-#include "exec/address-spaces.h"
+#include "qemu/aio-wait.h"
+#include "system/address-spaces.h"
 #include "system/dma.h"
 #include "migration/blocker.h"
 #include "ui/console.h"
@@ -69,7 +70,7 @@ struct PGTask_s {
     mach_vm_address_t address;
     uint64_t len;
     /*
-     * All unique MemoryRegions for which a mapping has been created in in this
+     * All unique MemoryRegions for which a mapping has been created in this
      * task, and on which we have thus called memory_region_ref(). There are
      * usually very few regions of system RAM in total, so we expect this array
      * to be very short. Therefore, no need for sorting or fancy search
@@ -317,8 +318,8 @@ static void apple_gfx_render_frame_completed_bh(void *opaque)
             copy_mtl_texture_to_surface_mem(s->texture, surface_data(s->surface));
             if (s->gfx_update_requested) {
                 s->gfx_update_requested = false;
-                dpy_gfx_update_full(s->con);
-                graphic_hw_update_done(s->con);
+                qemu_console_update_full(s->con);
+                qemu_console_hw_update_done(s->con);
                 s->new_frame_ready = false;
             } else {
                 s->new_frame_ready = true;
@@ -330,25 +331,25 @@ static void apple_gfx_render_frame_completed_bh(void *opaque)
     }
 }
 
-static void apple_gfx_fb_update_display(void *opaque)
+static bool apple_gfx_fb_update_display(void *opaque)
 {
     AppleGFXState *s = opaque;
+    bool done = true;
 
     assert(bql_locked());
     if (s->new_frame_ready) {
-        dpy_gfx_update_full(s->con);
+        qemu_console_update_full(s->con);
         s->new_frame_ready = false;
-        graphic_hw_update_done(s->con);
     } else if (s->pending_frames > 0) {
         s->gfx_update_requested = true;
-    } else {
-        graphic_hw_update_done(s->con);
+        done = false;
     }
+
+    return done;
 }
 
 static const GraphicHwOps apple_gfx_fb_ops = {
     .gfx_update = apple_gfx_fb_update_display,
-    .gfx_update_async = true,
 };
 
 /* ------ Mouse cursor and display mode setting ------ */
@@ -380,14 +381,14 @@ static void set_mode(AppleGFXState *s, uint32_t width, uint32_t height)
             (s->texture.storageMode == MTLStorageModeManaged);
     }
 
-    dpy_gfx_replace_surface(s->con, s->surface);
+    qemu_console_set_surface(s->con, s->surface);
 }
 
 static void update_cursor(AppleGFXState *s)
 {
     assert(bql_locked());
-    dpy_mouse_set(s->con, s->pgdisp.cursorPosition.x,
-                  s->pgdisp.cursorPosition.y, qatomic_read(&s->cursor_show));
+    qemu_console_set_mouse(s->con, s->pgdisp.cursorPosition.x,
+                           s->pgdisp.cursorPosition.y, qatomic_read(&s->cursor_show));
 }
 
 static void update_cursor_bh(void *opaque)
@@ -443,7 +444,7 @@ static void set_cursor_glyph(void *opaque)
             }
             px_data += padding_bytes_per_row;
         }
-        dpy_cursor_define(s->con, s->cursor);
+        qemu_console_set_cursor(s->con, s->cursor);
         update_cursor(s);
     }
     [glyph release];
@@ -454,7 +455,7 @@ static void set_cursor_glyph(void *opaque)
 /* ------ DMA (device reading system memory) ------ */
 
 typedef struct AppleGFXReadMemoryJob {
-    QemuSemaphore sem;
+    QemuEvent event;
     hwaddr physical_address;
     uint64_t length;
     void *dst;
@@ -470,7 +471,7 @@ static void apple_gfx_do_read_memory(void *opaque)
                         job->dst, job->length, MEMTXATTRS_UNSPECIFIED);
     job->success = (r == MEMTX_OK);
 
-    qemu_sem_post(&job->sem);
+    qemu_event_set(&job->event);
 }
 
 static bool apple_gfx_read_memory(AppleGFXState *s, hwaddr physical_address,
@@ -483,11 +484,11 @@ static bool apple_gfx_read_memory(AppleGFXState *s, hwaddr physical_address,
     trace_apple_gfx_read_memory(physical_address, length, dst);
 
     /* Performing DMA requires BQL, so do it in a BH. */
-    qemu_sem_init(&job.sem, 0);
+    qemu_event_init(&job.event, 0);
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_do_read_memory, &job);
-    qemu_sem_wait(&job.sem);
-    qemu_sem_destroy(&job.sem);
+    qemu_event_wait(&job.event);
+    qemu_event_destroy(&job.event);
     return job.success;
 }
 
@@ -792,7 +793,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         apple_gfx_create_display_mode_array(display_modes, num_display_modes);
     [mode_array release];
 
-    s->con = graphic_console_init(dev, 0, &apple_gfx_fb_ops, s);
+    s->con = qemu_graphic_console_create(dev, 0, &apple_gfx_fb_ops, s);
     return true;
 }
 
@@ -872,6 +873,7 @@ separator_error:
 
 const PropertyInfo qdev_prop_apple_gfx_display_mode = {
     .type  = "display_mode",
+    .qapi_type = &str_type_info,
     .description =
         "Display mode in pixels and Hertz, as <width>x<height>@<refresh-rate> "
         "Example: 3840x2160@60",

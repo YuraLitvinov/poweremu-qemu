@@ -177,6 +177,6 @@ uint32_t r300_cb_view(uint32_t colorformat, uint32_t outfmt, uint32_t *bpp);
 float r300_float24(uint32_t v);
 
 /* Disassemble the active US program, for traces.  Caller frees. */
-char *r300_us_disasm(const R300State *st);
+void r300_us_disasm(const R300State *st, R300WriteFn write, void *ctx);
 
 #endif

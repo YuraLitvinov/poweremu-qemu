@@ -27,12 +27,7 @@
 #include "ui/qemu-pixman.h"
 #include "ui/console.h"
 
-#if defined(CONFIG_IOSURFACE)
-#include <CoreFoundation/CoreFoundation.h>
-#include <IOSurface/IOSurfaceRef.h>
-#endif
-
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_GBM)
 #  define HAVE_SPICE_GL 1
 #  include "ui/egl-helpers.h"
 #  include "ui/egl-context.h"
@@ -126,29 +121,21 @@ struct SimpleSpiceDisplay {
     QEMUBH *gl_unblock_bh;
     QEMUTimer *gl_unblock_timer;
     QemuGLShader *gls;
+    GLuint gl_surface_mem_obj;
     int gl_updates;
     bool have_scanout;
     bool have_surface;
 
-#if defined(CONFIG_GBM)
     QemuDmaBuf *guest_dmabuf;
     bool guest_dmabuf_refresh;
-#endif
-#if defined(CONFIG_IOSURFACE)
-    IOSurfaceRef iosurface;
-    int surface_send_fd;
-#endif
-#if defined(CONFIG_ANGLE)
-    EGLSurface esurface;
-    egl_fb iosurface_fb;
-    DisplayGLTextureBorrower backing_borrow;
-    uint32_t backing_id;
-#endif
     bool render_cursor;
 
     egl_fb guest_fb;
     egl_fb blit_fb;
     egl_fb cursor_fb;
+    bool backing_y_0_top;
+    bool blit_scanout_texture;
+    bool new_scanout_texture;
     bool have_hot;
 #endif
 };
@@ -168,6 +155,8 @@ struct SimpleSpiceCursor {
 };
 
 extern bool spice_opengl;
+extern bool spice_remote_client;
+extern int spice_max_refresh_rate;
 
 int qemu_spice_rect_is_empty(const QXLRect* r);
 void qemu_spice_rect_union(QXLRect *dest, const QXLRect *r);
