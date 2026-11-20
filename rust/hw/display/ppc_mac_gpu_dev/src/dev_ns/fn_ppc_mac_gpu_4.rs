@@ -65,7 +65,7 @@ pub fn ppc_mac_gpu_mmio_write_cp(
             s.regs.cp_me_ram_addr = s.regs.cp_me_ram_addr.wrapping_add(1);
         }
         2012 | 2032 | 2036 => {}
-        96 => {
+        96..=99 => {
             ppc_mac_gpu_reg_write_offs(
                 &mut s.regs.gpio_vga_ddc,
                 addr.wrapping_sub(0x60 as hwaddr) as ::core::ffi::c_int,
@@ -85,7 +85,7 @@ pub fn ppc_mac_gpu_mmio_write_cp(
                 ) as uint32_t;
             }
         }
-        100 => {
+        100..=103 => {
             ppc_mac_gpu_reg_write_offs(
                 &mut s.regs.gpio_dvi_ddc,
                 addr.wrapping_sub(0x64 as hwaddr) as ::core::ffi::c_int,
@@ -101,7 +101,7 @@ pub fn ppc_mac_gpu_mmio_write_cp(
                 s.regs.gpio_dvi_ddc |= 0x300 as uint32_t;
             }
         }
-        104 => {
+        104..=107 => {
             ppc_mac_gpu_reg_write_offs(
                 &mut s.regs.gpio_monid,
                 addr.wrapping_sub(0x68 as hwaddr) as ::core::ffi::c_int,
@@ -123,17 +123,17 @@ pub fn ppc_mac_gpu_mmio_write_cp(
         5924 => {
             s.regs.isync_cntl = val as uint32_t;
         }
-        5600 => {
+        5600..=5620 => {
             let idx: ::core::ffi::c_int =
                 addr.wrapping_sub(0x15e0 as hwaddr)
                     .wrapping_div(4 as hwaddr) as ::core::ffi::c_int;
             s.regs.scratch_reg[idx as usize] = val as uint32_t;
             r200_scratch_write(s, idx, val as uint32_t);
         }
-        4096 => {
+        4096..=5119 => {
             ppc_mac_gpu_pm4_fifo_push(s, val as uint32_t);
         }
-        6080 => {
+        6080..=6112 => {
             ppc_mac_gpu_host_data_write(s, val as uint32_t);
         }
         _ => return 0 as ::core::ffi::c_int != 0,

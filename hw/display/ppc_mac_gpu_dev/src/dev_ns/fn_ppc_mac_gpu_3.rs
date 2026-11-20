@@ -379,7 +379,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
         0 => {
             val = s.regs.mm_index as uint64_t;
         }
-        16 => {
+        16..=44 => {
             val = (s.regs.bios_scratch
                 [addr.wrapping_sub(0x10 as hwaddr).wrapping_div(4 as hwaddr) as usize]
                 >> (addr & 3 as hwaddr).wrapping_mul(8 as hwaddr)) as uint64_t;
@@ -804,21 +804,21 @@ pub fn ppc_mac_gpu_mmio_read_cp(
 ) -> bool {
     let mut val: uint64_t = 0 as uint64_t;
     match addr {
-        96 => {
+        96..=99 => {
             val = ppc_mac_gpu_reg_read_offs(
                 ppc_mac_gpu_gpio_ddc(s.regs.gpio_vga_ddc),
                 addr.wrapping_sub(0x60 as hwaddr) as ::core::ffi::c_int,
                 size,
             );
         }
-        100 => {
+        100..=103 => {
             val = ppc_mac_gpu_reg_read_offs(
                 ppc_mac_gpu_gpio_ddc(s.regs.gpio_dvi_ddc),
                 addr.wrapping_sub(0x64 as hwaddr) as ::core::ffi::c_int,
                 size,
             );
         }
-        104 => {
+        104..=107 => {
             val = ppc_mac_gpu_reg_read_offs(
                 ppc_mac_gpu_gpio_ddc(s.regs.gpio_monid),
                 addr.wrapping_sub(0x68 as hwaddr) as ::core::ffi::c_int,
@@ -837,7 +837,7 @@ pub fn ppc_mac_gpu_mmio_read_cp(
         3336 => {
             val = 0 as uint64_t;
         }
-        5600 => {
+        5600..=5620 => {
             let scratch_idx: ::core::ffi::c_int =
                 addr.wrapping_sub(0x15e0 as hwaddr)
                     .wrapping_div(4 as hwaddr) as ::core::ffi::c_int;
@@ -1588,7 +1588,7 @@ pub fn ppc_mac_gpu_mmio_write_misc(
                 & (0x80000000 as ::core::ffi::c_uint | 0xffff as ::core::ffi::c_uint) as uint64_t)
                 as uint32_t;
         }
-        16 => {
+        16..=44 => {
             let sh: uint32_t = (addr & 3 as hwaddr).wrapping_mul(8 as hwaddr) as uint32_t;
             let m: uint32_t = if size >= 4 as ::core::ffi::c_uint {
                 0xffffffff as uint32_t
@@ -1897,7 +1897,7 @@ pub fn ppc_mac_gpu_mmio_write_2d(
         5236 => {
             s.regs.brush_y_x = val as uint32_t;
         }
-        5248 => {
+        5248..=5308 => {
             s.regs.brush_data[addr
                 .wrapping_sub(0x1480 as hwaddr)
                 .wrapping_div(4 as hwaddr) as usize] = val as uint32_t;
