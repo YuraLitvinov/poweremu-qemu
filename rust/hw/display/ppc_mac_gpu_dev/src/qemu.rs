@@ -201,6 +201,17 @@ const _: () = {
     assert!(align_of::<S>() >= align_of::<super::dev_ns::PCIDevice>());
 };
 
+// PPCMacGPUState is a QOM object whose parent is `pci-device` and whose first field is the PCIDevice
+// (asserted above), so QEMU's `qom` and `pci` crates can treat it as one: this is what lets the safe
+// `PCIDeviceMethods` (add_capability, config accessors, ...) be called on the device.
+//
+// SAFETY: `pci` is at offset 0, and "ppc-mac-gpu" is registered with `pci-device` as its parent.
+unsafe impl qom::ObjectType for super::dev_ns::PPCMacGPUState {
+    type Class = super::dev_ns::PCIDeviceClass;
+    const TYPE_NAME: &'static CStr = c"ppc-mac-gpu";
+}
+qom::qom_isa!(super::dev_ns::PPCMacGPUState: pci::PCIDevice, hwcore::DeviceState, qom::Object);
+
 // Layout of QEMU's MemTxAttrs (include/exec/memattrs.h): a 32-bit bitfield word, then `unspecified` (bool),
 // `_reserved1` (u8) and `_reserved2` (u16).  The device passes it by value to address_space_*, so the
 // bindgen type from QEMU's `system` crate must match this exactly.

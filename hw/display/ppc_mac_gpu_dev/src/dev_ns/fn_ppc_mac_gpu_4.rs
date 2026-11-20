@@ -1062,16 +1062,16 @@ fn realize_inner(s: &mut PPCMacGPUState, errp: &mut *mut Error) -> Result<(), Re
     if let Some(id) = std::env::var_os("PPCGPU_DEVICE_ID").filter(|v| !v.is_empty()) {
         q::pci_set_u16(&mut s.pci, 0x2, strtoul_hex16(id.as_bytes()));
     }
-    if q::pci_add_capability(&mut s.pci, 0x2, 0x58, 12, errp) < 0 {
-        return Err(RealizeError::Reported);
-    }
+    // AGP capability (id 0x2), through QEMU's safe `pci` crate.
+    pci::PCIDeviceMethods::add_capability(&&*s, 0x2, 0x58, 12)
+        .map_err(|e| RealizeError::Report(line!() as ::core::ffi::c_int, format!("{}: AGP capability: {}", tn, e)))?;
     q::pci_set_u8(&mut s.pci, 0x58 + 2, 0x20);
     q::pci_set_u32(&mut s.pci, 0x58 + 4, 0x200 | 0x4 | 0x2 | 0x1 | (0x1f << 24));
     q::pci_set_u32(&mut s.pci, 0x58 + 8, 0x100 | 0x200 | 0x4 | (0x1f << 24));
     q::pci_set_wmask_u32(&mut s.pci, 0x58 + 8, 0xffff_ffff);
-    if q::pci_add_capability(&mut s.pci, 0x1, 0x50, 8, errp) < 0 {
-        return Err(RealizeError::Reported);
-    }
+    // Power management capability (id 0x1).
+    pci::PCIDeviceMethods::add_capability(&&*s, 0x1, 0x50, 8)
+        .map_err(|e| RealizeError::Report(line!() as ::core::ffi::c_int, format!("{}: PM capability: {}", tn, e)))?;
     q::pci_set_u16(&mut s.pci, 0x50 + 2, 0x1 | (1 << 9) | (1 << 10));
     q::trace_realize(s.vram_size_mb, s.vram_size);
     Ok(())
