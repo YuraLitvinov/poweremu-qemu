@@ -4,6 +4,7 @@ members = [
     "rust/hw/char/pl011",
     "rust/hw/display/ppc_mac_gpu_dev",
     "rust/hw/display/r300",
+    "rust/hw/pci",
     "rust/hw/timer/hpet",
     "rust/tests",
     "rust/bindings/display-sys",

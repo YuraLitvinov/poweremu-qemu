@@ -1,0 +1,23 @@
+[package]
+name = "pci"
+version = "0.1.0"
+description = "Safe Rust bindings for the QEMU PCI device API"
+publish = false
+
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pci-sys = { path = "../../bindings/pci-sys" }
+common = { path = "../../common" }
+bql = { path = "../../bql" }
+qom = { path = "../../qom" }
+util = { path = "../../util" }
+system = { path = "../../system" }
+hwcore = { path = "../core" }
+
+[lints]
+workspace = true
