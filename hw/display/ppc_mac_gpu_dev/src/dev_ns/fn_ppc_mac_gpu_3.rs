@@ -1,5 +1,5 @@
 use super::*;
-pub fn ppc_mac_gpu_ring_run(s: &mut PPCMacGPUState) {
+pub fn ppc_mac_gpu_ring_run(s: &mut PPCMacGPUFields) {
     let mut old_rptr: uint32_t = 0;
     let mut val: uint32_t = 0;
     if !s.ring_pending {
@@ -27,11 +27,12 @@ pub fn ppc_mac_gpu_ring_run(s: &mut PPCMacGPUState) {
 }
 pub unsafe extern "C" fn ppc_mac_gpu_ring_bh_cb(opaque: *mut ::core::ffi::c_void) {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    if let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) {
+    if let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) {
+        let s = &mut *s_guard;
         ppc_mac_gpu_ring_run(s);
     }
 }
-pub fn ppc_mac_gpu_pm4_fifo_push(s: &mut PPCMacGPUState, val: uint32_t) {
+pub fn ppc_mac_gpu_pm4_fifo_push(s: &mut PPCMacGPUFields, val: uint32_t) {
     s.regs.stall_pio_dwords = s.regs.stall_pio_dwords.wrapping_add(1);
     s.regs.csq_just_submitted = 1 as ::core::ffi::c_int != 0;
     if s.pm4_pkt_count == 0 as uint32_t {
@@ -133,7 +134,7 @@ pub fn ppc_mac_gpu_post_reg_name(addr: uint32_t) -> Option<&'static ::core::ffi:
     let i = ppc_mac_gpu_post_reg(addr);
     (i >= 0).then(|| ppc_mac_gpu_post_regs_mut()[i as usize].name)
 }
-pub fn ppc_mac_gpu_post_regs_reset(s: &mut PPCMacGPUState) {
+pub fn ppc_mac_gpu_post_regs_reset(s: &mut PPCMacGPUFields) {
     s.mc_ind.fill(0);
     s.mc_ind_index = 0 as uint32_t;
     let mut i: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
@@ -155,7 +156,7 @@ pub fn ppc_mac_gpu_post_regs_reset(s: &mut PPCMacGPUState) {
         i_0 += 1;
     }
 }
-pub fn ppc_mac_gpu_cursor_sync(s: &mut PPCMacGPUState) {
+pub fn ppc_mac_gpu_cursor_sync(s: &mut PPCMacGPUFields) {
     let fb: uint32_t =
         (s.regs.mc_fb_location & 0xffff as uint32_t) << 16 as ::core::ffi::c_int;
     let mut off: uint32_t = s.regs.cur_offset & 0xfffffff as ::core::ffi::c_int as uint32_t;
@@ -213,7 +214,7 @@ pub fn ppc_mac_gpu_cursor_sync(s: &mut PPCMacGPUState) {
     crate::src::qemu::console_set_mouse_at(s, 0, 0, false);
 }
 pub fn ppc_mac_gpu_hwc_write(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     reg: uint32_t,
     val: uint32_t,
 ) {
@@ -281,7 +282,7 @@ pub fn ppc_mac_gpu_hwc_write(
     };
 }
 pub fn ppc_mac_gpu_hwc_read(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     reg: uint32_t,
 ) -> uint32_t {
     match reg {
@@ -295,7 +296,7 @@ pub fn ppc_mac_gpu_hwc_read(
     return 0 as uint32_t;
 }
 pub fn ppc_mac_gpu_mm_aper_read(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     off: uint64_t,
     size: ::core::ffi::c_uint,
 ) -> uint64_t {
@@ -312,7 +313,7 @@ pub fn ppc_mac_gpu_mm_aper_read(
     return v;
 }
 pub fn ppc_mac_gpu_mm_aper_write(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     off: uint64_t,
     val: uint64_t,
     size: ::core::ffi::c_uint,
@@ -329,7 +330,7 @@ pub fn ppc_mac_gpu_mm_aper_write(
 }
 /// CRTC_STATUS: bit 0 is set in the last 5% of each 60 Hz frame (vertical blank), bit 1 once
 /// the frame's blank has passed `crtc_vblank_clear_ns`.  Arithmetic wraps as the C original.
-pub fn ppc_mac_gpu_crtc_status(s: &mut PPCMacGPUState) -> uint32_t {
+pub fn ppc_mac_gpu_crtc_status(s: &mut PPCMacGPUFields) -> uint32_t {
     if crate::src::qemu::timer_is_pending(&s.vblank_timer) {
         return s.regs.crtc_status;
     }
@@ -352,7 +353,7 @@ pub fn ppc_mac_gpu_crtc_status(s: &mut PPCMacGPUState) -> uint32_t {
     }
     v
 }
-pub fn ppc_mac_gpu_mm_reg_index(s: & PPCMacGPUState) -> uint32_t {
+pub fn ppc_mac_gpu_mm_reg_index(s: & PPCMacGPUFields) -> uint32_t {
     let idx: uint32_t = s.regs.mm_index & 0xffff as uint32_t;
     return if idx >= 0x4 as uint32_t
         && idx < (0x4 as ::core::ffi::c_int + 4 as ::core::ffi::c_int) as uint32_t
@@ -369,7 +370,7 @@ pub fn ppc_mac_gpu_gpio_ddc(mut reg: uint32_t) -> uint32_t {
     return reg;
 }
 pub fn ppc_mac_gpu_mmio_read_cfg(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     _size: ::core::ffi::c_uint,
     valp: &mut uint64_t,
@@ -395,7 +396,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
         }
         256 => {
             val = (crate::src::qemu::pci_config_read(
-                crate::src::qemu::pci_raw(&mut s.pci),
+                s.pci_dev(),
                 0x10 as uint32_t,
                 4 as ::core::ffi::c_int,
             ) as ::core::ffi::c_uint
@@ -403,7 +404,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
         }
         260 => {
             val = (crate::src::qemu::pci_config_read(
-                crate::src::qemu::pci_raw(&mut s.pci),
+                s.pci_dev(),
                 0x10 as uint32_t,
                 4 as ::core::ffi::c_int,
             ) & !(0xf as uint32_t))
@@ -414,7 +415,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
         }
         268 => {
             val = (crate::src::qemu::pci_config_read(
-                crate::src::qemu::pci_raw(&mut s.pci),
+                s.pci_dev(),
                 0x18 as uint32_t,
                 4 as ::core::ffi::c_int,
             ) as ::core::ffi::c_uint
@@ -491,7 +492,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_mmio_read_display(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     _size: ::core::ffi::c_uint,
     valp: &mut uint64_t,
@@ -660,7 +661,7 @@ pub fn ppc_mac_gpu_mmio_read_display(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_mmio_read_2d(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     _size: ::core::ffi::c_uint,
     valp: &mut uint64_t,
@@ -797,7 +798,7 @@ pub fn ppc_mac_gpu_mmio_read_2d(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_mmio_read_cp(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     size: ::core::ffi::c_uint,
     valp: &mut uint64_t,
@@ -884,7 +885,7 @@ pub fn ppc_mac_gpu_mmio_read_cp(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_mmio_read_stub_3d(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     size: ::core::ffi::c_uint,
     valp: &mut uint64_t,
@@ -937,7 +938,7 @@ pub fn ppc_mac_gpu_mmio_read_stub_3d(
             } else if addr >= 0xf00 as hwaddr && addr < 0xf40 as hwaddr {
                 let pci_off: uint32_t = addr.wrapping_sub(0xf00 as hwaddr) as uint32_t;
                 val = crate::src::qemu::pci_config_read(
-                    crate::src::qemu::pci_raw(&mut s.pci),
+                    s.pci_dev(),
                     pci_off,
                     size as ::core::ffi::c_int,
                 ) as uint64_t;
@@ -1137,7 +1138,7 @@ pub fn ppc_mac_gpu_mmio_read_stub_3d(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_mmio_read_impl(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     size: ::core::ffi::c_uint,
 ) -> uint64_t {
@@ -1493,7 +1494,7 @@ pub fn ppc_mac_gpu_mmio_read_impl(
     return val;
 }
 pub fn ppc_mac_gpu_mmio_read(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     size: ::core::ffi::c_uint,
 ) -> uint64_t {
@@ -1515,7 +1516,7 @@ pub fn ppc_mac_gpu_mmio_read(
     return val;
 }
 pub fn ppc_mac_gpu_tcl_port_write(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     val: uint32_t,
 ) {
@@ -1570,7 +1571,7 @@ pub fn ppc_mac_gpu_tcl_port_write(
     };
 }
 pub fn ppc_mac_gpu_mmio_write_misc(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     val: uint64_t,
     size: ::core::ffi::c_uint,
@@ -1660,7 +1661,7 @@ pub fn ppc_mac_gpu_mmio_write_misc(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_mmio_write_display(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     val: uint64_t,
     _size: ::core::ffi::c_uint,
@@ -1816,7 +1817,7 @@ pub fn ppc_mac_gpu_mmio_write_display(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_mmio_write_2d(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: hwaddr,
     val: uint64_t,
     _size: ::core::ffi::c_uint,

@@ -828,9 +828,10 @@ pub struct PPCMacGPUDisplayMode {
     pub format: pixman_format_code_t,
     pub crtc_ext: bool,
 }
+/// Everything the device keeps after its PCI parent object (the old `PPCMacGPUState` minus `pci`).
+/// It lives in the `state` cell of [`PPCMacGPUState`] and is reached through `state_mut`.
 #[repr(C)]
-pub struct PPCMacGPUState {
-    pub pci: qom::ParentField<pci::PCIDevice>,
+pub struct PPCMacGPUFields {
     pub vram_dev_dirty: bool,
     pub kick_epoch: uint32_t,
     pub last_draw_epoch: uint32_t,
@@ -1125,3 +1126,98 @@ pub struct C2RustUnnamed_103 {
 opaque!(CPUPluginState);
 opaque!(CPUJumpCache);
 opaque!(CPUAddressSpace);
+
+/// The QOM device object: the PCI parent followed by the device state in a cell.
+///
+/// QEMU's safe Rust APIs hand callbacks a shared `&T`, so the mutable state sits in an `Opaque`
+/// (`UnsafeCell` underneath, `repr(transparent)`: no layout change) and is reached with
+/// [`PPCMacGPUState::state_mut`] under the BQL.
+#[repr(C)]
+pub struct PPCMacGPUState {
+    pub pci: qom::ParentField<pci::PCIDevice>,
+    pub(crate) state: common::Opaque<PPCMacGPUFields>,
+}
+
+/// Set while a `StateRef` is alive; a second `state_mut` meanwhile is a re-entrant access.
+static STATE_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Call sites already reported as re-entrant (file, line, hits), so each distinct one is logged once.
+static REENTRY_SITES: std::sync::Mutex<Vec<(&'static str, u32, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn report_reentry(loc: &'static core::panic::Location<'static>) {
+    let Ok(mut sites) = REENTRY_SITES.lock() else { return };
+    if let Some(site) = sites.iter_mut().find(|(f, l, _)| *f == loc.file() && *l == loc.line()) {
+        site.2 += 1;
+    } else {
+        sites.push((loc.file(), loc.line(), 1));
+        eprintln!("[REENTRY] ppc-mac-gpu state accessed while already borrowed at {}:{} (new site #{})", loc.file(), loc.line(), sites.len());
+    }
+}
+
+/// Exclusive access to the device state for the duration of one QEMU callback.
+pub struct StateRef<'a> {
+    fields: &'a mut PPCMacGPUFields,
+    outermost: bool,
+}
+
+impl core::ops::Deref for StateRef<'_> {
+    type Target = PPCMacGPUFields;
+    fn deref(&self) -> &PPCMacGPUFields {
+        self.fields
+    }
+}
+impl core::ops::DerefMut for StateRef<'_> {
+    fn deref_mut(&mut self) -> &mut PPCMacGPUFields {
+        self.fields
+    }
+}
+impl Drop for StateRef<'_> {
+    fn drop(&mut self) {
+        if self.outermost {
+            STATE_BUSY.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl PPCMacGPUState {
+    /// Offset of the state cell inside the device object (property and vmstate tables add it to the
+    /// offset of a field inside [`PPCMacGPUFields`]).
+    pub const FIELDS_OFFSET: usize = core::mem::offset_of!(PPCMacGPUState, state);
+
+    /// Exclusive access to the device state.
+    ///
+    /// QEMU calls into the device with the BQL held, on the main loop thread, one callback at a time;
+    /// the C original relied on the same rule.  A nested call (a callback reached while another still
+    /// holds the state) would alias the `&mut`; it is logged here with its call site (each distinct site once) so
+    /// such paths can be found and removed.
+    #[track_caller]
+    pub fn state_mut(&self) -> StateRef<'_> {
+        let outermost = !STATE_BUSY.swap(true, core::sync::atomic::Ordering::Acquire);
+        if !outermost {
+            report_reentry(core::panic::Location::caller());
+        }
+        // SAFETY: the cell holds a `PPCMacGPUFields` for the whole life of the device object (QEMU
+        // zero-initialises the instance); the BQL serialises callers, and nesting is reported above.
+        StateRef { fields: unsafe { &mut *self.state.as_mut_ptr() }, outermost }
+    }
+}
+
+impl PPCMacGPUFields {
+    /// The device object this state cell belongs to (the cell is its last field).
+    pub fn device_ptr(&self) -> *mut PPCMacGPUState {
+        let cell = self as *const PPCMacGPUFields as *const u8;
+        // SAFETY: a `PPCMacGPUFields` is only ever created inside the `state` cell of a PPCMacGPUState.
+        unsafe { cell.sub(PPCMacGPUState::FIELDS_OFFSET) as *mut PPCMacGPUState }
+    }
+
+    /// The C `PCIDevice` of this device.  It lives outside the state cell, so handing out a mutable
+    /// reference does not alias the fields; the lifetime is the device's.
+    pub fn pci_dev<'a>(&self) -> &'a mut PCIDevice {
+        // SAFETY: `device_ptr` is the live device object and `pci` is its first field.
+        unsafe { &mut *(*self.device_ptr()).pci.as_mut_ptr() }
+    }
+}
+
+/// Offset in the device object of a field of [`PPCMacGPUFields`], given its offset inside the fields.
+pub const fn foff(inner: usize) -> usize {
+    PPCMacGPUState::FIELDS_OFFSET + inner
+}

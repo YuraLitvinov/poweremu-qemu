@@ -13,6 +13,7 @@ path = "lib.rs"
 r300 = { path = "../r300" }
 system = { path = "../../../system" }
 qom = { path = "../../../qom" }
+common = { path = "../../../common" }
 pci = { path = "../../../hw/pci" }
 hwcore = { path = "../../../hw/core" }
 pci-sys = { path = "../../../bindings/pci-sys" }

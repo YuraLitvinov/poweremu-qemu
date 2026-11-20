@@ -1,6 +1,6 @@
 use super::*;
 pub fn ppc_mac_gpu_hostdata_stream(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     hdr: &[uint32_t],
     pos: uint32_t,
     size: uint32_t,
@@ -104,7 +104,7 @@ pub fn ppc_mac_gpu_hostdata_stream(
     );
 }
 pub fn ppc_mac_gpu_pm4_2d(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     opcode: uint32_t,
     d: &[uint32_t],
     n: uint32_t,
@@ -468,7 +468,7 @@ pub fn ppc_mac_gpu_pm4_2d(
     return false;
 }
 /// The VRAM watch word at 0x353000, or 0 when the watch is off or the word is out of range.
-fn vram_watch_word(s: &PPCMacGPUState) -> uint32_t {
+fn vram_watch_word(s: &PPCMacGPUFields) -> uint32_t {
     if s.vram_watch_active && (0x353000 + 4) as uint64_t <= s.vram_size {
         crate::src::qemu::Vram::of(s).get32(0x353000).unwrap_or(0)
     } else {
@@ -496,7 +496,7 @@ fn bbm_state_store(hdr: [uint32_t; 6], hdr_n: uint32_t) {
     st.hdr_n = hdr_n;
 }
 
-pub fn ppc_mac_gpu_process_pm4(s: &mut PPCMacGPUState, pm4: &[uint32_t]) {
+pub fn ppc_mac_gpu_process_pm4(s: &mut PPCMacGPUFields, pm4: &[uint32_t]) {
     g_in_pm4.set(g_in_pm4.get() + 1);
     let size_dw: uint32_t = pm4.len() as uint32_t;
     let mut i: uint32_t = 0 as uint32_t;
@@ -1757,7 +1757,7 @@ pub fn ppc_mac_gpu_process_pm4(s: &mut PPCMacGPUState, pm4: &[uint32_t]) {
     g_in_pm4.set(g_in_pm4.get() - 1);
 }
 pub fn ppc_mac_gpu_execute_ib(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     ib_base: uint32_t,
     ib_size_dw: uint32_t,
 ) {
@@ -1804,7 +1804,7 @@ pub fn ppc_mac_gpu_execute_ib(
     }
 }
 pub fn ppc_mac_gpu_process_ring_buffer(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     old_rptr: uint32_t,
     new_wptr: uint32_t,
 ) {

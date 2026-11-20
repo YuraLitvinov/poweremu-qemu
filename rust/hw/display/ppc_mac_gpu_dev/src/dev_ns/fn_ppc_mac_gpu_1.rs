@@ -210,16 +210,17 @@ pub fn ppc_mac_gpu_reg_write_offs(
         );
     };
 }
-pub fn ppc_mac_gpu_update_irq(s: &mut PPCMacGPUState) {
+pub fn ppc_mac_gpu_update_irq(s: &mut PPCMacGPUFields) {
     let level: bool = s.regs.gen_int_status & s.regs.gen_int_cntl != 0;
-    crate::src::qemu::pci_irq_set(crate::src::qemu::pci_raw(&mut s.pci), level);
+    crate::src::qemu::pci_irq_set(s.pci_dev(), level);
     crate::src::qemu::trace_irq_event(s.regs.gen_int_status, s.regs.gen_int_cntl, level);
 }
 pub unsafe extern "C" fn ppc_mac_gpu_vblank(opaque: *mut ::core::ffi::c_void) {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return;
     };
+    let s = &mut *s_guard;
     let now: int64_t = crate::src::qemu::clock_virtual_ns();
     let frame: int64_t =
         (1000000000 as ::core::ffi::c_longlong / 60 as ::core::ffi::c_longlong) as int64_t;
@@ -248,7 +249,7 @@ fn mode_eq(a: &PPCMacGPUDisplayMode, b: &PPCMacGPUDisplayMode) -> bool {
 
 /// Derives the display mode from the CRTC registers and the stride override.  Returns true when
 /// the mode changed.
-pub fn ppc_mac_gpu_update_display_mode(s: &mut PPCMacGPUState) -> bool {
+pub fn ppc_mac_gpu_update_display_mode(s: &mut PPCMacGPUFields) -> bool {
     let old: PPCMacGPUDisplayMode = s.disp;
     let crtc_gen: uint32_t = s.regs.crtc_gen_cntl;
     let h_total_disp: uint32_t = s.regs.crtc_h_total_disp;
@@ -390,7 +391,7 @@ pub fn ppc_mac_gpu_update_display_mode(s: &mut PPCMacGPUState) -> bool {
     false
 }
 pub fn ppc_mac_gpu_vga_bank_off(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     a: hwaddr,
     write: bool,
 ) -> uint64_t {
@@ -419,9 +420,10 @@ pub unsafe extern "C" fn ppc_mac_gpu_vga_bank_read(
     size: ::core::ffi::c_uint,
 ) -> uint64_t {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return 0;
     };
+    let s = &mut *s_guard;
     let vram = crate::src::qemu::Vram::of(s);
     let mut v: uint64_t = 0 as uint64_t;
     let mut i: ::core::ffi::c_uint = 0 as ::core::ffi::c_uint;
@@ -446,9 +448,10 @@ pub unsafe extern "C" fn ppc_mac_gpu_vga_bank_write(
     size: ::core::ffi::c_uint,
 ) {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return;
     };
+    let s = &mut *s_guard;
     let vram = crate::src::qemu::Vram::of(s);
     let mut i: ::core::ffi::c_uint = 0 as ::core::ffi::c_uint;
     while i < size {
@@ -464,7 +467,7 @@ pub unsafe extern "C" fn ppc_mac_gpu_vga_bank_write(
         i = i.wrapping_add(1);
     }
 }
-pub fn ppc_mac_gpu_vga_bank_update(s: &mut PPCMacGPUState) {
+pub fn ppc_mac_gpu_vga_bank_update(s: &mut PPCMacGPUFields) {
     if s.legacy_vga {
         let on: bool = s.regs.crtc_gen_cntl
             & ((1 as ::core::ffi::c_int) << 24 as ::core::ffi::c_int) as uint32_t
@@ -535,16 +538,17 @@ fn drag_sample(vram: Vram, base: u64, x_start: uint32_t, n: uint32_t) -> (uint32
 /// C-ABI display-change callback: recovers the device state and runs one display update.
 pub unsafe extern "C" fn ppc_mac_gpu_display_update(opaque: *mut ::core::ffi::c_void) -> bool {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return false;
     };
+    let s = &mut *s_guard;
     display_update(s)
 }
 
 /// One display update: legacy VGA hand-off, cursor, mode change, and the copy of the scanout into
 /// the shadow surface.  Guest-controlled sizes and offsets are checked before any allocation or
 /// VRAM access.
-fn display_update(s: &mut PPCMacGPUState) -> bool {
+fn display_update(s: &mut PPCMacGPUFields) -> bool {
     use crate::src::qemu as q;
     if s.legacy_vga {
         if s.regs.crtc_gen_cntl & (1 << 24) == 0 || q::env_flag(c"PPCGPU_FORCE_VGA") {
@@ -935,7 +939,7 @@ fn display_update(s: &mut PPCMacGPUState) -> bool {
     true
 }
 pub fn ppc_mac_gpu_scratch_writeback_val(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     reg_idx: ::core::ffi::c_int,
     wb_val: uint32_t,
 ) {
@@ -982,7 +986,7 @@ pub fn ppc_mac_gpu_scratch_writeback_val(
         crate::src::logs::debug(format_args!("SCRATCH_WB reg{}=0x{:x} -> memory[0x{:x}]", ((reg_idx) as i32), ((wb_val) as u32), ((wb_addr) as u32)));
     };
 }
-pub fn ppc_mac_gpu_rptr_writeback(s: &mut PPCMacGPUState) {
+pub fn ppc_mac_gpu_rptr_writeback(s: &mut PPCMacGPUFields) {
     let addr: uint32_t = s.regs.cp_rb_rptr_addr & !(3 as uint32_t);
     let mut phys: hwaddr = 0;
     if addr == 0
@@ -1020,7 +1024,7 @@ pub fn ppc_mac_gpu_rptr_writeback(s: &mut PPCMacGPUState) {
 /// Runs one R300 draw through `r300_render`. `idx` is None for a direct draw; for an indexed
 /// draw it holds the index dwords.
 fn r300_render_checked(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     opcode: uint32_t,
     d: &[uint32_t],
     body_dw: uint32_t,
@@ -1029,7 +1033,7 @@ fn r300_render_checked(
     r300_render(s, opcode, d, body_dw, idx);
 }
 pub fn ppc_mac_gpu_r300_packet3(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     mut opcode: uint32_t,
     mut d: &[uint32_t],
     mut body_dw: uint32_t,
@@ -1293,7 +1297,7 @@ pub fn ppc_mac_gpu_r300_packet3(
     return 1 as ::core::ffi::c_int != 0;
 }
 pub fn ppc_mac_gpu_gart_translate(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     gpu_addr: uint32_t,
     phys_addr: &mut hwaddr,
 ) -> bool {
@@ -1334,7 +1338,7 @@ pub fn ppc_mac_gpu_gart_translate(
     true
 }
 pub fn ppc_mac_gpu_agp_translate(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     gpu_addr: uint32_t,
     phys_addr: &mut hwaddr,
 ) -> bool {
@@ -1382,7 +1386,7 @@ pub fn ppc_mac_gpu_agp_translate(
     true
 }
 pub fn ppc_mac_gpu_read_ib_via_gart(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     ib_base: uint32_t,
     ib_size_dw: uint32_t,
 ) -> Option<Vec<uint32_t>> {
@@ -1412,7 +1416,7 @@ pub fn ppc_mac_gpu_read_ib_via_gart(
     Some(dwords)
 }
 pub fn ppc_mac_gpu_pm4_process_type0(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     reg_base: uint32_t,
     one_reg_wr: bool,
     count: uint32_t,
@@ -1435,7 +1439,7 @@ pub fn ppc_mac_gpu_pm4_process_type0(
     }
 }
 pub fn ppc_mac_gpu_host_data_write(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     val: uint32_t,
 ) {
     if !s.host_data_active {
@@ -1568,7 +1572,7 @@ pub fn ppc_mac_gpu_host_data_write(
     }
 }
 pub fn ppc_mac_gpu_hostdata_mono(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     d: &[uint32_t],
     n: uint32_t,
 ) -> bool {

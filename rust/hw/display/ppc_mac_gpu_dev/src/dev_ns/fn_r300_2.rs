@@ -3,7 +3,7 @@ use super::*;
 /// VRAM, hands it to the renderer and does the bookkeeping the guest relies on afterwards.
 /// `idx` is non-null for an indexed draw. The stages live in `fn_r300_render.rs`.
 pub fn r300_render(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     opcode: uint32_t,
     d: &[uint32_t],
     body_dw: uint32_t,
@@ -72,9 +72,10 @@ pub unsafe extern "C" fn r300_watch_read(
     size: ::core::ffi::c_uint,
 ) -> uint64_t {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return 0;
     };
+    let s = &mut *s_guard;
     let vram = crate::src::qemu::Vram::of(s);
     let base = (s.r300_watch_base as uint64_t).wrapping_add(addr);
     gpu_sync_at(
@@ -102,9 +103,10 @@ pub unsafe extern "C" fn r300_watch_write(
     size: ::core::ffi::c_uint,
 ) {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return;
     };
+    let s = &mut *s_guard;
     let vram = crate::src::qemu::Vram::of(s);
     let base = (s.r300_watch_base as uint64_t).wrapping_add(addr);
     for i in 0..size {
@@ -154,7 +156,7 @@ fn zconv_copy_pixel(src: &[u8], s_at: u64, dst: &mut [u8], d_at: u64) {
     }
 }
 
-pub fn r300_zconv(s: &mut PPCMacGPUState, to_card: bool) {
+pub fn r300_zconv(s: &mut PPCMacGPUFields, to_card: bool) {
     let vram = crate::src::qemu::Vram::of(s);
     let off: uint32_t = s.r3_zconv_off;
     let pitch: uint32_t = s.r3_zconv_pitch;
@@ -243,7 +245,7 @@ pub fn r300_zconv(s: &mut PPCMacGPUState, to_card: bool) {
             })));
     }
 }
-pub fn r300_surface_changed(s: &mut PPCMacGPUState) {
+pub fn r300_surface_changed(s: &mut PPCMacGPUFields) {
     let lo: uint32_t = s.r300_surf[1 as ::core::ffi::c_int as usize];
     let hi: uint32_t = s.r300_surf[2 as ::core::ffi::c_int as usize];
     let pitch: uint32_t = r300_reg(s.r3_ref(), 0x4f24 as uint32_t) & 0x3ffc as uint32_t;
@@ -310,7 +312,7 @@ pub fn r300_surface_changed(s: &mut PPCMacGPUState) {
     r300_zconv(s, 1 as ::core::ffi::c_int != 0);
     s.r3_zconv = 1 as ::core::ffi::c_int != 0;
 }
-pub fn r300_surfwatch_update(s: &mut PPCMacGPUState) {
+pub fn r300_surfwatch_update(s: &mut PPCMacGPUFields) {
     static enabled: crate::src::global::Global<::core::ffi::c_int> = crate::src::global::Global::<::core::ffi::c_int>::new(-(1 as ::core::ffi::c_int));
     let lo: uint32_t = s.r300_surf[1 as ::core::ffi::c_int as usize];
     let hi: uint32_t = s.r300_surf[2 as ::core::ffi::c_int as usize];

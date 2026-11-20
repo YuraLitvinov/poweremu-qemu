@@ -54,7 +54,7 @@ fn note_texture_dump(addr: uint32_t, hash: uint64_t) -> bool {
 /// `PPCGPU_TEX_LOG` / `PPCGPU_TEX_DUMP`: logs a texture that lives in VRAM and optionally
 /// dumps it to a file in the `PPCGPU_TEX_DUMP` directory.
 pub fn r300_trace_vram_texture(
-    s: &PPCMacGPUState,
+    s: &PPCMacGPUFields,
     td: &R300TexDesc,
     ga: uint32_t,
     tlen: uint64_t,
@@ -135,7 +135,7 @@ pub fn r300_trace_gart_render_target(
 /// Logs the state a draw is about to use (`r3_dump` tracing and the sequence log): which
 /// texture formats and render targets are seen, once each.
 pub fn r300_trace_draw_inputs(
-    s: &PPCMacGPUState,
+    s: &PPCMacGPUFields,
     opcode: uint32_t,
     d: &[uint32_t],
     body_dw: uint32_t,
@@ -217,7 +217,7 @@ pub fn r300_trace_draw_inputs(
 }
 
 /// `r3_dump` tracing: logs each distinct render target once.
-pub fn r300_trace_render_target(s: &PPCMacGPUState) {
+pub fn r300_trace_render_target(s: &PPCMacGPUFields) {
     if !s.r3_dump.is_null() {
         static SEEN_RT: crate::src::qemu::SeenSet = crate::src::qemu::SeenSet::new();
         let key = format!(
@@ -233,7 +233,7 @@ pub fn r300_trace_render_target(s: &PPCMacGPUState) {
 
 /// Draw-log and `r3_dump` tracing of a freshly built packet.
 pub fn r300_trace_built_packet(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     pkt: &R300DrawPacket,
     opcode: uint32_t,
     d: &[uint32_t],
@@ -338,7 +338,7 @@ pub fn r300_trace_built_packet(
 
 /// Logs a failed draw build (once per message) and, with `r3_dump` on, the first few details.
 pub fn r300_report_build_failure(
-    s: &PPCMacGPUState,
+    s: &PPCMacGPUFields,
     opcode: uint32_t,
     d: &[uint32_t],
     body_dw: uint32_t,
@@ -372,7 +372,7 @@ const MAX_DXT_DUMPS: uint32_t = 60;
 /// `R300_GLSLDUMP` / `R300_DXTDUMP`: writes the draw's generated fragment shader and its
 /// compressed textures to files, each distinct one once, up to a limit.
 pub fn r300_dump_draw_assets(
-    s: &PPCMacGPUState,
+    s: &PPCMacGPUFields,
     pkt: &R300DrawPacket,
     vram: crate::src::qemu::Vram,
 ) {
@@ -388,7 +388,7 @@ fn write_dump(what: &str, path: &str, data: impl AsRef<[u8]>) {
 }
 
 /// `R300_GLSLDUMP=<prefix>`: writes each distinct fragment shader to `<prefix>.NN.frag`.
-fn r300_dump_glsl(s: &PPCMacGPUState, pkt: &R300DrawPacket) {
+fn r300_dump_glsl(s: &PPCMacGPUFields, pkt: &R300DrawPacket) {
     static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     static COUNT: crate::src::global::Global<uint32_t> = crate::src::global::Global::<uint32_t>::new(0);
     static SEEN: crate::src::qemu::SeenSet = crate::src::qemu::SeenSet::new();
@@ -482,7 +482,7 @@ fn dump_vram(path: &str, vram: crate::src::qemu::Vram, addr: uint64_t, len: usiz
 /// Debug aid (`r3_dump`): arms on a large texture-to-screen copy, then dumps the next 60
 /// draws that target that surface (`R300_DUMP` prefix) together with their state.
 pub fn r300_trace_armed_steps(
-    s: &PPCMacGPUState,
+    s: &PPCMacGPUFields,
     pkt: &R300DrawPacket,
     vram: crate::src::qemu::Vram,
 ) {
@@ -576,7 +576,7 @@ pub fn r300_trace_armed_steps(
 /// Debug aid (`r3_dump`): every 150th qualifying texture draw, snapshots the source texture
 /// and the screen to `R300_DUMP` files.
 pub fn r300_snapshot_textures(
-    s: &PPCMacGPUState,
+    s: &PPCMacGPUFields,
     pkt: &R300DrawPacket,
     vram: crate::src::qemu::Vram,
 ) {
@@ -626,7 +626,7 @@ pub fn r300_snapshot_textures(
 }
 
 /// `ZPASS` tracing: logs each draw counted by the Z-pass query.
-pub fn r300_trace_zpass(s: &PPCMacGPUState, pkt: &R300DrawPacket) {
+pub fn r300_trace_zpass(s: &PPCMacGPUFields, pkt: &R300DrawPacket) {
     if s.r3_zpass_active as ::core::ffi::c_int != 0
         && r300_zpass_log() as ::core::ffi::c_int != 0
     {

@@ -1,6 +1,6 @@
 //! Safe layer over QEMU's C API.  `unsafe` for the device's C calls lives
 //! here, each use with its justification.
-use super::dev_ns::{memory_region_get_ram_ptr, r300_us_disasm, size_t, PPCMacGPUState, R300State};
+use super::dev_ns::{memory_region_get_ram_ptr, r300_us_disasm, size_t, PPCMacGPUFields, R300State};
 use core::ffi::{c_char, CStr};
 
 /// Handle to the card's VRAM (the RAM block behind `s.vram`).
@@ -16,7 +16,7 @@ pub struct Vram {
 }
 
 impl Vram {
-    pub fn of(s: &PPCMacGPUState) -> Vram {
+    pub fn of(s: &PPCMacGPUFields) -> Vram {
         // SAFETY: `s.vram` is an initialised RAM MemoryRegion once realized;
         // the call only reads the region's host mapping.
         let ptr = unsafe { memory_region_get_ram_ptr(&s.vram) } as *mut u8;
@@ -191,7 +191,7 @@ pub fn clock_realtime_ns() -> i64 {
 }
 
 // QOM requires the parent object at offset 0 of the instance, and the instance_size registered with the
-// TypeInfo is size_of::<PPCMacGPUState>(); PCIDevice itself is pinned to the C layout in the `pci` crate.
+// TypeInfo is size_of::<PPCMacGPUFields>(); PCIDevice itself is pinned to the C layout in the `pci` crate.
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
     type S = super::dev_ns::PPCMacGPUState;
@@ -200,22 +200,12 @@ const _: () = {
     assert!(size_of::<super::dev_ns::PCIDevice>() == 2768);
     assert!(size_of::<S>() >= size_of::<super::dev_ns::PCIDevice>());
     assert!(align_of::<S>() >= align_of::<super::dev_ns::PCIDevice>());
+    // Moving the state into a cell must not change the object: same size and alignment as before.
+    assert!(size_of::<S>() == 156720);
+    assert!(align_of::<S>() == 16);
+    assert!(offset_of!(S, state) == 2768);
+    assert!(size_of::<super::dev_ns::PPCMacGPUFields>() == 156720 - 2768);
 };
-
-/// The raw C `PCIDevice` inside the QOM parent field, for the C-style helpers in this file.
-///
-/// Takes the field (not the whole device) so callers can keep borrowing other fields at the same time.
-pub fn pci_raw(parent: &mut qom::ParentField<pci::PCIDevice>) -> &mut super::dev_ns::PCIDevice {
-    // SAFETY: `pci::PCIDevice` is a transparent wrapper around the C PCIDevice, and `parent` is a live,
-    // exclusively borrowed instance field.
-    unsafe { &mut *parent.as_mut_ptr() }
-}
-
-/// Shared-borrow counterpart of [`pci_raw`].
-pub fn pci_raw_ref(parent: &qom::ParentField<pci::PCIDevice>) -> &super::dev_ns::PCIDevice {
-    // SAFETY: as in `pci_raw`; only read through the returned reference.
-    unsafe { &*parent.as_ptr() }
-}
 
 // Sizes of the QEMU structs the device embeds or allocates, from a C program built against the same
 // headers (sizeof in system/memory.h and qemu/timer.h).  They come from QEMU's bindgen crates now, so a
@@ -229,7 +219,7 @@ const _: () = {
     assert!(size_of::<super::dev_ns::MemoryRegionSection>() == 64);
 };
 
-// PPCMacGPUState is a QOM object whose parent is `pci-device` and whose first field is the PCIDevice
+// PPCMacGPUFields is a QOM object whose parent is `pci-device` and whose first field is the PCIDevice
 // (asserted above), so QEMU's `qom` and `pci` crates can treat it as one: this is what lets the safe
 // `PCIDeviceMethods` (add_capability, config accessors, ...) be called on the device.
 //
@@ -428,7 +418,7 @@ pub fn aa_samples(st: &super::dev_ns::R300State) -> u32 {
 
 /// Calls the renderer's `flush_sync` callback if it registered one.  The caller holds the
 /// big lock (see `BqlGuard`).
-pub fn renderer_flush_sync(s: &super::dev_ns::PPCMacGPUState) {
+pub fn renderer_flush_sync(s: &super::dev_ns::PPCMacGPUFields) {
     if s.renderer.is_null() {
         return;
     }
@@ -444,7 +434,7 @@ pub fn renderer_flush_sync(s: &super::dev_ns::PPCMacGPUState) {
 /// renderer table does nothing.  The caller holds the big lock (see `BqlGuard`).
 #[allow(clippy::too_many_arguments)]
 pub fn renderer_fill_notify(
-    s: &super::dev_ns::PPCMacGPUState,
+    s: &super::dev_ns::PPCMacGPUFields,
     offset: u32,
     pitch: u32,
     x: u32,
@@ -636,15 +626,16 @@ pub fn guest_ram_page_host(phys: super::dev_ns::hwaddr) -> Option<*mut u8> {
 /// the device (the ring bottom half).  Returns `None` for a null pointer.
 /// # Safety
 /// `opaque` must be null or point to the live device state, with no other live reference to it.
-pub unsafe fn state_of_opaque<'a>(opaque: *mut core::ffi::c_void) -> Option<&'a mut PPCMacGPUState> {
+#[track_caller]
+pub unsafe fn state_of_opaque<'a>(opaque: *mut core::ffi::c_void) -> Option<super::dev_ns::StateRef<'a>> {
     if opaque.is_null() {
         return None;
     }
-    // SAFETY: the only caller-visible pointer is the `PPCMacGPUState` passed as `opaque` when the
+    // SAFETY: the only caller-visible pointer is the `PPCMacGPUFields` passed as `opaque` when the
     // device registered the callback; QEMU keeps that device alive and unmoved for as long as the
     // bottom half can run, and the callback runs on the single QEMU main loop thread, so no other
     // live `&mut` to the state exists while the returned reference is used.
-    Some(unsafe { &mut *(opaque as *mut PPCMacGPUState) })
+    Some(unsafe { &*(opaque as *const super::dev_ns::PPCMacGPUState) }.state_mut())
 }
 /// Disarms the timer (timer_del).
 pub fn timer_disarm(t: &mut super::dev_ns::QEMUTimer) {
@@ -657,7 +648,7 @@ pub fn trace_soft_reset(val: u64) {
     unsafe { super::dev_ns::trace_ppc_mac_gpu_soft_reset(val) }
 }
 /// Sends an explicit mouse position and visibility to the console.
-pub fn console_set_mouse_at(s: &super::dev_ns::PPCMacGPUState, x: i32, y: i32, visible: bool) {
+pub fn console_set_mouse_at(s: &super::dev_ns::PPCMacGPUFields, x: i32, y: i32, visible: bool) {
     if s.con.is_null() {
         return;
     }
@@ -665,7 +656,7 @@ pub fn console_set_mouse_at(s: &super::dev_ns::PPCMacGPUState, x: i32, y: i32, v
     unsafe { super::dev_ns::qemu_console_set_mouse(s.con, x, y, visible) };
 }
 /// Sets the 1x1 placeholder cursor on the console; the console keeps its own reference.
-pub fn console_set_blank_cursor(s: &super::dev_ns::PPCMacGPUState) {
+pub fn console_set_blank_cursor(s: &super::dev_ns::PPCMacGPUFields) {
     if s.con.is_null() {
         return;
     }
@@ -682,13 +673,13 @@ pub fn console_set_blank_cursor(s: &super::dev_ns::PPCMacGPUState) {
 /// The fence-done counter as an atomic.  The field is written by the fence callback (run on
 /// the main loop) and read by the device under the big lock; `from_mut` needs no unsafe code
 /// because the exclusive borrow of the state already guarantees the access is unshared.
-pub fn fence_done_atomic(s: &mut super::dev_ns::PPCMacGPUState) -> &std::sync::atomic::AtomicU32 {
+pub fn fence_done_atomic(s: &mut super::dev_ns::PPCMacGPUFields) -> &std::sync::atomic::AtomicU32 {
     std::sync::atomic::AtomicU32::from_mut(&mut s.regs.r200_fence_done)
 }
 
 /// Creates the fence bottom half on first use, with the device state as its opaque pointer.
-pub fn fence_bh_ensure(s: &mut super::dev_ns::PPCMacGPUState, cb: unsafe extern "C" fn(*mut core::ffi::c_void)) {
-    let opaque = s as *mut super::dev_ns::PPCMacGPUState as *mut core::ffi::c_void;
+pub fn fence_bh_ensure(s: &mut super::dev_ns::PPCMacGPUFields, cb: unsafe extern "C" fn(*mut core::ffi::c_void)) {
+    let opaque = s.device_ptr() as *mut core::ffi::c_void;
     // SAFETY: `r200_fence_bh` is only touched on the device thread under the big lock; the bottom
     // half is created once, never freed, and `opaque` is the device state that owns it.  The name
     // is a static NUL-terminated string.
@@ -721,7 +712,7 @@ pub fn fence_bh_schedule() {
 /// the renderer registered no fence support.  `done` is called with the device state as its
 /// opaque pointer once the fence completes.
 pub fn renderer_submit_fence(
-    s: &mut super::dev_ns::PPCMacGPUState,
+    s: &mut super::dev_ns::PPCMacGPUFields,
     done: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
 ) -> Option<u32> {
     if s.renderer.is_null() {
@@ -729,7 +720,7 @@ pub fn renderer_submit_fence(
     }
     let submit = s.renderer_ref().submit_fence?;
     let opaque = s.renderer_opaque;
-    let arg = s as *mut super::dev_ns::PPCMacGPUState as *mut core::ffi::c_void;
+    let arg = s.device_ptr() as *mut core::ffi::c_void;
     // SAFETY: the renderer table is static and set at realize; `submit` is the callback it
     // registered and takes the device opaque pointer, as before.  `arg` is the device state,
     // which outlives the fence because QEMU keeps the device alive until its callbacks run.
@@ -782,7 +773,7 @@ pub fn mc_watch_tag(name: &'static CStr, line: core::ffi::c_int) {
 /// AGP translation cache (`r200_agp_tc`, whose host pointers are the guest RAM pages that
 /// `gpu_agp_page` resolved). A null pointer, a zero length, or a range that crosses the end of
 /// its block is rejected.
-pub fn guest_px_ptr_valid(s: &super::dev_ns::PPCMacGPUState, p: *mut u8, len: usize) -> bool {
+pub fn guest_px_ptr_valid(s: &super::dev_ns::PPCMacGPUFields, p: *mut u8, len: usize) -> bool {
     if p.is_null() || len == 0 {
         return false;
     }
@@ -837,7 +828,7 @@ fn px_width(bytes: usize) -> usize {
 
 /// Little-endian read of a pixel at `p` (see `px_width`). Returns 0 if the range is not a
 /// valid guest pixel range (see `guest_px_ptr_valid`).
-pub fn px_read(s: &super::dev_ns::PPCMacGPUState, p: *mut u8, bytes: usize) -> u32 {
+pub fn px_read(s: &super::dev_ns::PPCMacGPUFields, p: *mut u8, bytes: usize) -> u32 {
     let n = px_width(bytes);
     if !guest_px_ptr_valid(s, p, n) {
         return 0;
@@ -855,7 +846,7 @@ pub fn px_read(s: &super::dev_ns::PPCMacGPUState, p: *mut u8, bytes: usize) -> u
 
 /// Little-endian write of the low `bytes`-width part of `v` at `p` (see `px_width`). Does
 /// nothing if the range is not a valid guest pixel range (see `guest_px_ptr_valid`).
-pub fn px_write(s: &super::dev_ns::PPCMacGPUState, p: *mut u8, bytes: usize, v: u32) {
+pub fn px_write(s: &super::dev_ns::PPCMacGPUFields, p: *mut u8, bytes: usize, v: u32) {
     let n = px_width(bytes);
     if !guest_px_ptr_valid(s, p, n) {
         return;
@@ -873,7 +864,7 @@ pub fn px_write(s: &super::dev_ns::PPCMacGPUState, p: *mut u8, bytes: usize, v: 
 
 /// memmove of `len` bytes from `src` to `dst`, both pixel ranges (see `guest_px_ptr_valid`).
 /// Does nothing unless both ranges are valid; overlapping ranges are handled.
-pub fn px_move(s: &super::dev_ns::PPCMacGPUState, dst: *mut u8, src: *mut u8, len: usize) {
+pub fn px_move(s: &super::dev_ns::PPCMacGPUFields, dst: *mut u8, src: *mut u8, len: usize) {
     if !guest_px_ptr_valid(s, dst, len) || !guest_px_ptr_valid(s, src, len) {
         return;
     }
@@ -907,7 +898,7 @@ pub fn guest_fmt24() -> super::dev_ns::pixman_format_code_t {
 /// Makes the device's shadow framebuffer at least `need` bytes.  A block that is missing or too
 /// small is freed and replaced; returns true when a new block was allocated.  `need` must fit
 /// the 32-bit `shadow_buf_size` field (callers bound it).
-pub fn shadow_ensure(s: &mut super::dev_ns::PPCMacGPUState, need: u64) -> bool {
+pub fn shadow_ensure(s: &mut super::dev_ns::PPCMacGPUFields, need: u64) -> bool {
     if !s.shadow_buf.is_null() && u64::from(s.shadow_buf_size) >= need {
         return false;
     }
@@ -924,7 +915,7 @@ pub fn shadow_ensure(s: &mut super::dev_ns::PPCMacGPUState, need: u64) -> bool {
 
 /// The shadow framebuffer as bytes: `shadow_buf_size` bytes from `shadow_buf`, or an empty slice
 /// if none is allocated.  The slice borrows the device mutably, so nothing else reads it meanwhile.
-pub fn shadow_bytes(s: &mut super::dev_ns::PPCMacGPUState) -> &mut [u8] {
+pub fn shadow_bytes(s: &mut super::dev_ns::PPCMacGPUFields) -> &mut [u8] {
     if s.shadow_buf.is_null() {
         return &mut [];
     }
@@ -936,7 +927,7 @@ pub fn shadow_bytes(s: &mut super::dev_ns::PPCMacGPUState) -> &mut [u8] {
 
 /// Creates a display surface over the shadow framebuffer and installs it on the console.
 pub fn console_set_shadow_surface(
-    s: &super::dev_ns::PPCMacGPUState,
+    s: &super::dev_ns::PPCMacGPUFields,
     width: u32,
     height: u32,
     format: super::dev_ns::pixman_format_code_t,
@@ -963,7 +954,7 @@ pub fn console_set_shadow_surface(
 /// Creates a display surface over VRAM starting at byte `offset` and installs it on the console.
 /// Does nothing if `offset` lies beyond the VRAM block.
 pub fn console_set_vram_surface(
-    s: &super::dev_ns::PPCMacGPUState,
+    s: &super::dev_ns::PPCMacGPUFields,
     width: u32,
     height: u32,
     format: super::dev_ns::pixman_format_code_t,
@@ -990,7 +981,7 @@ pub fn console_set_vram_surface(
 }
 
 /// Marks the whole console surface for redraw.
-pub fn console_update_full(s: &super::dev_ns::PPCMacGPUState) {
+pub fn console_update_full(s: &super::dev_ns::PPCMacGPUFields) {
     if s.con.is_null() {
         return;
     }
@@ -999,7 +990,7 @@ pub fn console_update_full(s: &super::dev_ns::PPCMacGPUState) {
 }
 
 /// Marks a rectangle of the console surface for redraw.
-pub fn console_update_rect(s: &super::dev_ns::PPCMacGPUState, x: i32, y: i32, w: i32, h: i32) {
+pub fn console_update_rect(s: &super::dev_ns::PPCMacGPUFields, x: i32, y: i32, w: i32, h: i32) {
     if s.con.is_null() {
         return;
     }
@@ -1008,7 +999,7 @@ pub fn console_update_rect(s: &super::dev_ns::PPCMacGPUState, x: i32, y: i32, w:
 }
 
 /// Sends the hardware mouse position and visibility to the console.
-pub fn console_set_mouse(s: &super::dev_ns::PPCMacGPUState) {
+pub fn console_set_mouse(s: &super::dev_ns::PPCMacGPUFields) {
     if s.con.is_null() {
         return;
     }
@@ -1018,7 +1009,7 @@ pub fn console_set_mouse(s: &super::dev_ns::PPCMacGPUState) {
 
 /// Publishes the hardware cursor image (`hwc_w` x `hwc_h` ARGB pixels from `hwc_pix`) to the
 /// console.  An image larger than the `hwc_pix` buffer is not published.
-pub fn cursor_publish_hwc(s: &super::dev_ns::PPCMacGPUState) {
+pub fn cursor_publish_hwc(s: &super::dev_ns::PPCMacGPUFields) {
     let (w, h) = (s.hwc_w, s.hwc_h);
     let Some(n) = w.checked_mul(h).filter(|&n| n as usize <= s.hwc_pix.len()) else {
         return;
@@ -1049,7 +1040,7 @@ pub fn cursor_publish_hwc(s: &super::dev_ns::PPCMacGPUState) {
 
 /// Asks the renderer whether `[lo, hi)` is busy (pending GPU work).  False when no renderer or no
 /// such callback is registered.
-pub fn renderer_range_busy_sync(s: &super::dev_ns::PPCMacGPUState, lo: u64, hi: u64, write: bool) -> bool {
+pub fn renderer_range_busy_sync(s: &super::dev_ns::PPCMacGPUFields, lo: u64, hi: u64, write: bool) -> bool {
     if s.renderer.is_null() {
         return false;
     }
@@ -1063,7 +1054,7 @@ pub fn renderer_range_busy_sync(s: &super::dev_ns::PPCMacGPUState, lo: u64, hi: 
 
 /// The renderer's current drag state, if it has one.  None when no renderer or callback exists,
 /// or when the callback reports no drag.
-pub fn renderer_drag_state(s: &super::dev_ns::PPCMacGPUState) -> Option<DragState> {
+pub fn renderer_drag_state(s: &super::dev_ns::PPCMacGPUFields) -> Option<DragState> {
     if s.renderer.is_null() {
         return None;
     }
@@ -1085,7 +1076,7 @@ pub fn renderer_drag_state(s: &super::dev_ns::PPCMacGPUState) -> Option<DragStat
 }
 
 /// Lets the renderer paste the drag buffer into VRAM.  Does nothing without a renderer callback.
-pub fn renderer_flush_drag_paste(s: &super::dev_ns::PPCMacGPUState, vram: Vram) {
+pub fn renderer_flush_drag_paste(s: &super::dev_ns::PPCMacGPUFields, vram: Vram) {
     if s.renderer.is_null() {
         return;
     }
@@ -1098,7 +1089,7 @@ pub fn renderer_flush_drag_paste(s: &super::dev_ns::PPCMacGPUState, vram: Vram) 
 }
 
 /// Runs the VGA core's graphics update hook (the legacy VGA hand-off).
-pub fn vga_gfx_update(s: &super::dev_ns::PPCMacGPUState) {
+pub fn vga_gfx_update(s: &super::dev_ns::PPCMacGPUFields) {
     if s.vga.is_null() {
         return;
     }
@@ -1116,7 +1107,7 @@ pub fn vga_gfx_update(s: &super::dev_ns::PPCMacGPUState) {
 }
 
 /// Bumps the frame and row counters the device publishes for FPS readout (when registered).
-pub fn fps_count(s: &super::dev_ns::PPCMacGPUState, rows: u32) {
+pub fn fps_count(s: &super::dev_ns::PPCMacGPUFields, rows: u32) {
     if s.fps_frames_ptr.is_null() || s.fps_rows_ptr.is_null() {
         return;
     }
@@ -1606,12 +1597,12 @@ pub fn ringdump_write(s: &[u8]) {
 // BEGIN w8_packet3
 /// Calls `ppc_mac_gpu_mmio_write` for the device: QEMU passes the device state as the opaque
 /// pointer, so `s` is what it would receive.
-pub fn mmio_write_dev(s: &mut super::dev_ns::PPCMacGPUState, addr: super::dev_ns::hwaddr, val: u64, size: u32) {
+pub fn mmio_write_dev(s: &mut super::dev_ns::PPCMacGPUFields, addr: super::dev_ns::hwaddr, val: u64, size: u32) {
     super::dev_ns::ppc_mac_gpu_mmio_write(s, addr, val, size)
 }
 
 /// `fflush` on the device's R300 dump file, if one is open.
-pub fn r3_dump_flush(s: &super::dev_ns::PPCMacGPUState) {
+pub fn r3_dump_flush(s: &super::dev_ns::PPCMacGPUFields) {
     if s.r3_dump.is_null() {
         return;
     }
@@ -1621,7 +1612,7 @@ pub fn r3_dump_flush(s: &super::dev_ns::PPCMacGPUState) {
 }
 
 /// `r300_state_write` on the device's R300 register block (no-op if the block is absent).
-pub fn r3_state_write(s: &mut super::dev_ns::PPCMacGPUState, addr: u32, val: u32) {
+pub fn r3_state_write(s: &mut super::dev_ns::PPCMacGPUFields, addr: u32, val: u32) {
     if s.r3.is_null() {
         return;
     }
@@ -1631,7 +1622,7 @@ pub fn r3_state_write(s: &mut super::dev_ns::PPCMacGPUState, addr: u32, val: u32
 
 /// Dumps the R300 register block to the device's dump file, then flushes it. No-op unless both
 /// the register block and the dump file exist.
-pub fn r3_state_dump_to_file(s: &super::dev_ns::PPCMacGPUState) {
+pub fn r3_state_dump_to_file(s: &super::dev_ns::PPCMacGPUFields) {
     if s.r3.is_null() || s.r3_dump.is_null() {
         return;
     }
@@ -1652,7 +1643,7 @@ pub fn r3_state_dump_to_file(s: &super::dev_ns::PPCMacGPUState) {
 
 /// Copies `out.len()` bytes from the host page `p` (an AGP/GART page from `gpu_agp_page`) into
 /// `out`. Returns false, leaving `out` untouched, unless the range passes `guest_px_ptr_valid`.
-pub fn agp_page_read(s: &super::dev_ns::PPCMacGPUState, p: *mut u8, out: &mut [u8]) -> bool {
+pub fn agp_page_read(s: &super::dev_ns::PPCMacGPUFields, p: *mut u8, out: &mut [u8]) -> bool {
     if !guest_px_ptr_valid(s, p, out.len()) {
         return false;
     }
@@ -1814,7 +1805,7 @@ pub fn r300_draw_free_packet(pkt: &mut super::dev_ns::R300DrawPacket) {
 
 /// Calls the renderer's `zpass_r300` callback if one is registered. Returns its count for a
 /// query (`enable` false), or `None` when there is no callback.
-pub fn renderer_zpass(s: &super::dev_ns::PPCMacGPUState, enable: bool, val: u32) -> Option<u32> {
+pub fn renderer_zpass(s: &super::dev_ns::PPCMacGPUFields, enable: bool, val: u32) -> Option<u32> {
     if s.renderer.is_null() {
         return None;
     }
@@ -1836,9 +1827,9 @@ mod watch_wrap {
     /// Initialises `s.r300_watch` as an MMIO region of `size` bytes that dispatches to `ops`,
     /// with the device state as both its owner and its opaque pointer (the callbacks read the
     /// state back through `state_of_opaque`).
-    pub fn r300_watch_region_init(s: &mut PPCMacGPUState, ops: &'static MemoryRegionOps, size: uint64_t) {
-        let owner = s as *mut PPCMacGPUState as *mut Object;
-        let opaque = s as *mut PPCMacGPUState as *mut ::core::ffi::c_void;
+    pub fn r300_watch_region_init(s: &mut PPCMacGPUFields, ops: &'static MemoryRegionOps, size: uint64_t) {
+        let owner = s.device_ptr() as *mut Object;
+        let opaque = s.device_ptr() as *mut ::core::ffi::c_void;
         let mr = &raw mut s.r300_watch;
         // SAFETY: `s` is the live device state, which outlives the region; `mr` is a field of
         // `s`, so it is valid to initialise; `ops` is a static table and the name is a static
@@ -1944,7 +1935,7 @@ pub fn trace_cp_ring_setup(base: u64, cntl: u32) {
 }
 
 /// Schedules the ring bottom half, if the device has created one (`qemu_bh_schedule`).
-pub fn ring_bh_schedule(s: &super::dev_ns::PPCMacGPUState) {
+pub fn ring_bh_schedule(s: &super::dev_ns::PPCMacGPUFields) {
     if s.ring_bh.is_null() {
         return;
     }
@@ -1991,7 +1982,7 @@ pub fn timer_delete(t: &mut super::dev_ns::QEMUTimer) {
 }
 
 /// Frees the device's shadow framebuffer and clears its pointer (`g_free` on `shadow_buf`).
-pub fn shadow_free(s: &mut PPCMacGPUState) {
+pub fn shadow_free(s: &mut PPCMacGPUFields) {
     // SAFETY: shadow_buf is NULL or a g_malloc block owned by the device, and g_free accepts NULL.
     // The pointer is cleared straight after, so the block is freed once.
     unsafe { super::dev_ns::g_free(s.shadow_buf as super::dev_ns::gpointer) };
@@ -2003,7 +1994,7 @@ pub struct VramDirtySnapshot(*mut super::dev_ns::DirtyBitmapSnapshot);
 
 impl VramDirtySnapshot {
     /// Snapshots and clears the dirty state of all of VRAM.
-    pub fn take(s: &mut PPCMacGPUState) -> Self {
+    pub fn take(s: &mut PPCMacGPUFields) -> Self {
         let size = s.vram_size as super::dev_ns::hwaddr;
         // SAFETY: &raw mut s.vram is the device's VRAM MemoryRegion, live for the device's lifetime;
         // the returned snapshot is owned by the caller and freed by Drop.
@@ -2014,7 +2005,7 @@ impl VramDirtySnapshot {
     }
 
     /// True if any page in `[addr, addr + len)` was dirty when the snapshot was taken.
-    pub fn get_dirty(&self, s: &mut PPCMacGPUState, addr: u64, len: u64) -> bool {
+    pub fn get_dirty(&self, s: &mut PPCMacGPUFields, addr: u64, len: u64) -> bool {
         if self.0.is_null() {
             return false;
         }
@@ -2118,7 +2109,7 @@ pub fn class_add_trace_property(
 #[repr(transparent)]
 pub struct AtiRadeon9700(super::dev_ns::PPCMacGPUState);
 
-// SAFETY: transparent over PPCMacGPUState, whose first field is the PCIDevice; "ati-radeon-9700" is
+// SAFETY: transparent over PPCMacGPUFields, whose first field is the PCIDevice; "ati-radeon-9700" is
 // registered with "ppc-mac-gpu" as its parent.
 unsafe impl qom::ObjectType for AtiRadeon9700 {
     type Class = super::dev_ns::PCIDeviceClass;
@@ -2167,7 +2158,7 @@ pub fn host_graphic_size() -> (core::ffi::c_int, core::ffi::c_int, core::ffi::c_
 }
 
 /// Sends an explicit mouse position and visibility to the device's console.
-pub fn console_set_mouse_to(s: &PPCMacGPUState, x: i32, y: i32, on: bool) {
+pub fn console_set_mouse_to(s: &PPCMacGPUFields, x: i32, y: i32, on: bool) {
     if s.con.is_null() {
         return;
     }
@@ -2176,7 +2167,7 @@ pub fn console_set_mouse_to(s: &PPCMacGPUState, x: i32, y: i32, on: bool) {
 }
 
 /// Resets the device's VGA state (`vga_common_reset`).
-pub fn vga_reset(s: &PPCMacGPUState) {
+pub fn vga_reset(s: &PPCMacGPUFields) {
     if s.vga.is_null() {
         return;
     }
@@ -2186,7 +2177,7 @@ pub fn vga_reset(s: &PPCMacGPUState) {
 }
 
 /// Closes the device's graphic console (`qemu_graphic_console_close`).
-pub fn graphic_console_close(s: &PPCMacGPUState) {
+pub fn graphic_console_close(s: &PPCMacGPUFields) {
     if s.con.is_null() {
         return;
     }
@@ -2227,7 +2218,7 @@ pub fn c_malloc_copy(src: &[u8]) -> *mut u8 {
 
 /// Copies `data` into the host page `p` (an AGP/GART page from `gpu_agp_page`, offset already
 /// applied). Returns false, writing nothing, unless the range passes `guest_px_ptr_valid`.
-pub fn agp_page_write(s: &super::dev_ns::PPCMacGPUState, p: *mut u8, data: &[u8]) -> bool {
+pub fn agp_page_write(s: &super::dev_ns::PPCMacGPUFields, p: *mut u8, data: &[u8]) -> bool {
     if !guest_px_ptr_valid(s, p, data.len()) {
         return false;
     }
@@ -2247,7 +2238,7 @@ pub fn r300_load_arrays(arr: &mut super::dev_ns::R300Arrays, aos: &[u32]) {
 /// holds the index dwords). Returns whether it worked and the builder's error message (a static
 /// C string, or null) when it did not. Guest data is read back through `r300_read_raw`.
 pub fn r300_build_packet(
-    s: &mut super::dev_ns::PPCMacGPUState,
+    s: &mut super::dev_ns::PPCMacGPUFields,
     pkt: &mut super::dev_ns::R300DrawPacket,
     opcode: u32,
     d: &[u32],
@@ -2257,7 +2248,7 @@ pub fn r300_build_packet(
     let mut err: *const core::ffi::c_char = core::ptr::null();
     let st = s.r3;
     let arrays = &raw mut s.r3_arrays;
-    let opaque = s as *mut super::dev_ns::PPCMacGPUState as *mut core::ffi::c_void;
+    let opaque = s.device_ptr() as *mut core::ffi::c_void;
     let read: super::dev_ns::R300ReadFn = Some(super::dev_ns::r300_read_raw);
     // SAFETY: `st` is the device's R300 state (set at realize) and `arrays` its array block, both
     // alive for the call; `d` and `idx` are live slices whose lengths are passed (the dword count
@@ -2280,7 +2271,7 @@ pub fn r300_build_packet(
 
 /// Hands `pkt` to the renderer's `draw_r300` with the VRAM base. Negative when there is no
 /// renderer or callback, or when the renderer rejects the draw.
-pub fn renderer_draw_r300(s: &super::dev_ns::PPCMacGPUState, vram: &Vram, pkt: &mut super::dev_ns::R300DrawPacket) -> i32 {
+pub fn renderer_draw_r300(s: &super::dev_ns::PPCMacGPUFields, vram: &Vram, pkt: &mut super::dev_ns::R300DrawPacket) -> i32 {
     if s.renderer.is_null() {
         return -1;
     }

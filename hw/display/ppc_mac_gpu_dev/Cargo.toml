@@ -15,6 +15,7 @@ crate-type = ["staticlib", "rlib"]
 r300 = { path = "../r300_rs" }
 system = { path = "../../../rust/system" }
 qom = { path = "../../../rust/qom" }
+common = { path = "../../../rust/common" }
 pci = { path = "../../../rust/hw/pci" }
 hwcore = { path = "../../../rust/hw/core" }
 pci-sys = { path = "../../../rust/bindings/pci-sys" }

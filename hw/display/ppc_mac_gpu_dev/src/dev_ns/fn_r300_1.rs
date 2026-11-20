@@ -21,9 +21,10 @@ pub unsafe extern "C" fn r300_read_raw(
     len: uint32_t,
 ) -> bool {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return false;
     };
+    let s = &mut *s_guard;
     // SAFETY: the C caller passes `dst` as the `len`-byte buffer it allocated for this call, and
     // nothing else touches it until we return.
     let Some(out) = (unsafe { crate::src::qemu::c_buf_mut(dst, len as usize) }) else {
@@ -34,7 +35,7 @@ pub unsafe extern "C" fn r300_read_raw(
 /// Reads `dst.len()` bytes of guest memory at GPU address `gpu_addr` into `dst`: from VRAM when
 /// the range lies there, otherwise page by page through the GART/AGP tables. Returns false if a
 /// page cannot be reached; the bytes read before that stay in `dst`.
-pub fn r300_read_gpu_bytes(s: &mut PPCMacGPUState, mut gpu_addr: uint32_t, mut dst: &mut [u8]) -> bool {
+pub fn r300_read_gpu_bytes(s: &mut PPCMacGPUFields, mut gpu_addr: uint32_t, mut dst: &mut [u8]) -> bool {
     let fb_base: uint32_t =
         (s.regs.mc_fb_location & 0xffff as uint32_t) << 16 as ::core::ffi::c_int;
     if gpu_addr >= fb_base
@@ -65,7 +66,7 @@ pub fn r300_read_gpu_bytes(s: &mut PPCMacGPUState, mut gpu_addr: uint32_t, mut d
 /// Writes the 4 bytes `bytes` to GPU address `gpu_addr`: into VRAM when it lies there (after
 /// flushing the renderer), otherwise through the AGP or GART translation to guest memory.
 /// Returns false if the address is mapped nowhere.
-pub fn r300_write_raw(s: &mut PPCMacGPUState, gpu_addr: uint32_t, bytes: &[u8; 4]) -> bool {
+pub fn r300_write_raw(s: &mut PPCMacGPUFields, gpu_addr: uint32_t, bytes: &[u8; 4]) -> bool {
     let fb_base: uint32_t =
         (s.regs.mc_fb_location & 0xffff as uint32_t) << 16 as ::core::ffi::c_int;
     let mut phys: hwaddr = 0;
@@ -114,7 +115,7 @@ pub fn r300_zpass_log() -> bool {
     }
     return on.get() != 0;
 }
-pub fn r300_zpass_write(s: &mut PPCMacGPUState, addr: uint32_t, val: uint32_t) {
+pub fn r300_zpass_write(s: &mut PPCMacGPUFields, addr: uint32_t, val: uint32_t) {
     if r300_zpass_log() {
         crate::src::logs::err(format_args!("ZPASS {} {:08x} active {}\n", crate::src::qemu::cstr(if addr == 0x4f58 as uint32_t {
                 c"DATA".as_ptr()
@@ -150,7 +151,7 @@ pub fn r300_zpass_write(s: &mut PPCMacGPUState, addr: uint32_t, val: uint32_t) {
     }
 }
 pub fn r300_cb_samples(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     off: uint32_t,
 ) -> uint32_t {
     let ns: uint32_t = crate::src::qemu::aa_samples(s.r3_ref());
@@ -161,7 +162,7 @@ pub fn r300_cb_samples(
     };
 }
 pub fn r300_zb_samples(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     gpu_off: uint32_t,
 ) -> uint32_t {
     let ns: uint32_t = crate::src::qemu::aa_samples(s.r3_ref());
@@ -179,7 +180,7 @@ pub fn r300_zb_samples(
         ns
     };
 }
-pub fn r300_zmask_clear(s: &mut PPCMacGPUState) {
+pub fn r300_zmask_clear(s: &mut PPCMacGPUFields) {
     let fb_base: uint32_t =
         (s.regs.mc_fb_location & 0xffff as uint32_t) << 16 as ::core::ffi::c_int;
     let mut off: uint32_t = r300_reg(s.r3_ref(), 0x4f20 as uint32_t) & !(0x1f as uint32_t);
@@ -239,7 +240,7 @@ pub fn r300_zmask_clear(s: &mut PPCMacGPUState) {
         crate::src::logs::qemu(format_args!("ppc-mac-gpu r300: 3D_CLEAR_ZMASK: depth at 0x{:x}, {} rows of {} bytes <- {:08x}\n", ((off) as u32), ((rows) as u32), ((bpr as ::core::ffi::c_ulonglong) as u64), ((r300_reg(s.r3_ref(), 0x4f28 as uint32_t)) as u32)));
     }
 }
-pub fn r300_cmask_clear(s: &mut PPCMacGPUState) {
+pub fn r300_cmask_clear(s: &mut PPCMacGPUFields) {
     let fb_base: uint32_t =
         (s.regs.mc_fb_location & 0xffff as uint32_t) << 16 as ::core::ffi::c_int;
     let mut off: uint32_t = r300_reg(s.r3_ref(), 0x4e28 as uint32_t) & !(0x1f as uint32_t);
@@ -323,7 +324,7 @@ pub fn r300_cmask_clear(s: &mut PPCMacGPUState) {
 }
 /// If the `len`-byte range at the GPU address `*addr` lies in VRAM, rewrites `*addr` to the VRAM
 /// offset and returns true; otherwise leaves it alone and returns false.
-pub fn r300_to_vram(s: &mut PPCMacGPUState, addr: &mut uint32_t, len: uint64_t) -> bool {
+pub fn r300_to_vram(s: &mut PPCMacGPUFields, addr: &mut uint32_t, len: uint64_t) -> bool {
     let fb_base: uint32_t =
         (s.regs.mc_fb_location & 0xffff as uint32_t) << 16 as ::core::ffi::c_int;
     if *addr < fb_base
@@ -408,7 +409,7 @@ pub fn r300_draw_release(pkt: &mut R300DrawPacket) {
 /// Logs one R300 draw (register snapshot, vertex words, and the microcode disassembly when
 /// R300_USDISASM is set) to the draw log. Does nothing unless the draw log is open.
 pub fn r300_drawlog_draw(
-    s: &PPCMacGPUState,
+    s: &PPCMacGPUFields,
     opcode: uint32_t,
     d: &[uint32_t],
     body_dw: uint32_t,
@@ -466,7 +467,7 @@ static SEEN_FORMATS: std::sync::Mutex<Vec<uint32_t>> = std::sync::Mutex::new(Vec
 const MAX_SEEN_FORMATS: usize = 128;
 
 /// Logs the colour-buffer and texture formats of this draw the first time each is seen.
-pub fn r300_note_formats(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
+pub fn r300_note_formats(s: &mut PPCMacGPUFields, pkt: &R300DrawPacket) {
     let mut keys: [uint32_t; 17] = [0; 17];
     let mut nk: ::core::ffi::c_uint = 0 as ::core::ffi::c_uint;
     let fresh15 = nk;
@@ -528,7 +529,7 @@ pub fn r300_note_formats(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
         i += 1;
     }
 }
-pub fn r300_note_features(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
+pub fn r300_note_features(s: &mut PPCMacGPUFields, pkt: &R300DrawPacket) {
     let r: &R300State = s.r3_ref();
     static seen: crate::src::global::Global<uint32_t> = crate::src::global::Global::<uint32_t>::new(0);
     let mut f: uint32_t = 0 as uint32_t;
@@ -651,7 +652,7 @@ pub fn r300_note_features(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
         f >>= 1 as ::core::ffi::c_int;
     }
 }
-pub fn r300_aa_resolve(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
+pub fn r300_aa_resolve(s: &mut PPCMacGPUFields, pkt: &R300DrawPacket) {
     let ctl: u32 = r300_reg(s.r3_ref(), 0x4e88);
     let mut dst: u32 = r300_reg(s.r3_ref(), 0x4e80) & !0x1f;
     let dpitch: u32 = (r300_reg(s.r3_ref(), 0x4e84) & 0x3ffe).wrapping_mul(4);

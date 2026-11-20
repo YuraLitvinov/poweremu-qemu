@@ -28,7 +28,7 @@ const MAX_GART_TEXTURE_BYTES: uint64_t = 1 << 30;
 /// GART/AGP memory are copied into host memory. A texture that cannot be read is unbound,
 /// and its slot in the shader's texture info is cleared.
 pub fn r300_prepare_textures(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     pkt: &mut R300DrawPacket,
     vram: crate::src::qemu::Vram,
 ) {
@@ -42,7 +42,7 @@ pub fn r300_prepare_textures(
 /// Makes one bound texture available to the renderer. Returns false (and unbinds it) if it
 /// is in neither VRAM nor readable GART memory.
 fn r300_bind_texture(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     td: &mut R300TexDesc,
     vram: crate::src::qemu::Vram,
 ) -> bool {
@@ -75,7 +75,7 @@ fn r300_bind_texture(
 /// Copies a texture from GART/AGP guest memory at `ga` into a fresh host buffer in
 /// `td.host_data`. On failure the buffer is released and `host_data` is left null.
 fn r300_read_gart_texture(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     td: &mut R300TexDesc,
     ga: uint32_t,
     tlen: uint64_t,
@@ -241,7 +241,7 @@ impl GartColourBuffer {
     /// Redirects the packet's colour buffer (at guest address `guest_addr`) to scratch VRAM.
     /// Returns None if that is not possible (the caller warns and drops the draw).
     pub fn begin(
-        s: &mut PPCMacGPUState,
+        s: &mut PPCMacGPUFields,
         pkt: &mut R300DrawPacket,
         guest_addr: uint32_t,
         rt_len: uint64_t,
@@ -278,7 +278,7 @@ impl GartColourBuffer {
     /// Copies the rows the draw touched from the scratch area back to the guest's GART pages.
     pub fn write_back(
         &self,
-        s: &mut PPCMacGPUState,
+        s: &mut PPCMacGPUFields,
         pitch_bytes: uint32_t,
         vram: crate::src::qemu::Vram,
     ) {
@@ -304,14 +304,14 @@ impl GartColourBuffer {
     }
 
     /// Puts the scratch area's previous contents back.
-    pub fn restore(self, s: &mut PPCMacGPUState, vram: crate::src::qemu::Vram) {
+    pub fn restore(self, s: &mut PPCMacGPUFields, vram: crate::src::qemu::Vram) {
         vram.write_bytes(self.scratch as u64, &self.saved[..self.len as usize]);
         gpu_vram_dirty(s, self.scratch as uint64_t, self.len);
     }
 }
 
 /// Loads the vertex array pointers (AOS) the draw will fetch from.
-pub fn r300_load_vertex_arrays(s: &mut PPCMacGPUState) {
+pub fn r300_load_vertex_arrays(s: &mut PPCMacGPUFields) {
     const AOS_WORDS: usize = 1 + 3 * 8;
     let mut aos = [0 as uint32_t; AOS_WORDS];
     for (k, word) in aos.iter_mut().enumerate() {
@@ -323,7 +323,7 @@ pub fn r300_load_vertex_arrays(s: &mut PPCMacGPUState) {
 /// Builds the draw packet from the CP state (indexed if `idx` is non-null). Returns whether
 /// it worked and the builder's error message (a static C string) when it did not.
 pub fn r300_build_draw_packet(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     pkt: &mut R300DrawPacket,
     opcode: uint32_t,
     d: &[uint32_t],
@@ -335,7 +335,7 @@ pub fn r300_build_draw_packet(
 
 /// Marks the draw's colour buffers dirty for the display and fixes the present pitch when
 /// the draw targets the scanout surface with a different stride.
-pub fn r300_mark_draw_dirty(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
+pub fn r300_mark_draw_dirty(s: &mut PPCMacGPUFields, pkt: &R300DrawPacket) {
             let len: uint64_t = (pkt.rt_pitch as uint64_t)
                 .wrapping_mul(pkt.rt_bpp as uint64_t)
                 .wrapping_mul(pkt.rt_height as uint64_t);
@@ -363,7 +363,7 @@ pub fn r300_mark_draw_dirty(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
 /// Emulates the colour-buffer/Z-buffer fast clear (CBZB): fills the depth buffer rows the
 /// draw covered with the cleared value, after the renderer drew the colour part.
 pub fn r300_emulate_cbzb_clear(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     pkt: &R300DrawPacket,
     vram: crate::src::qemu::Vram,
 ) {
@@ -432,7 +432,7 @@ pub fn r300_emulate_cbzb_clear(
         }
 
 /// Sets the state the draw builder reads about the renderer and the screen.
-pub fn r300_prepare_draw_state(s: &mut PPCMacGPUState) {
+pub fn r300_prepare_draw_state(s: &mut PPCMacGPUFields) {
     s.r3_mut().glsl_flags = if s.renderer.is_null() { 0 } else { s.renderer_ref().r300_glsl_flags };
     if s.disp.height == 0 {
         ppc_mac_gpu_update_display_mode(s);
@@ -444,7 +444,7 @@ pub fn r300_prepare_draw_state(s: &mut PPCMacGPUState) {
 /// case it is redirected to scratch VRAM and returned as a `GartColourBuffer`. Err names the
 /// buffer that could not be mapped.
 pub fn r300_map_colour_buffers(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     pkt: &mut R300DrawPacket,
     vram: crate::src::qemu::Vram,
 ) -> Result<Option<GartColourBuffer>, &'static str> {
@@ -489,7 +489,7 @@ pub fn r300_map_colour_buffers(
 /// Decides the CBZB fast-clear case, converts Z-buffer contents when needed, and maps the
 /// depth buffer into VRAM (dropping the attachment if it cannot be). Returns whether this
 /// draw is a CBZB clear.
-pub fn r300_map_depth_buffer(s: &mut PPCMacGPUState, pkt: &mut R300DrawPacket) -> bool {
+pub fn r300_map_depth_buffer(s: &mut PPCMacGPUFields, pkt: &mut R300DrawPacket) -> bool {
     let ns = pkt.aa_samples;
     let cbzb_clear: bool = r300_reg(s.r3_ref(), 0x4f1c as uint32_t) & 0x20 as uint32_t
         != 0 as uint32_t
@@ -538,7 +538,7 @@ pub fn r300_map_depth_buffer(s: &mut PPCMacGPUState, pkt: &mut R300DrawPacket) -
 }
 
 /// Remembers which surface is multisampled so a later resolve knows its sample count.
-pub fn r300_note_multisampling(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
+pub fn r300_note_multisampling(s: &mut PPCMacGPUFields, pkt: &R300DrawPacket) {
     let ns = pkt.aa_samples;
     if ns > 1 as uint32_t {
         static said_0: crate::src::global::Global<bool> = crate::src::global::Global::<bool>::new(false);
@@ -556,7 +556,7 @@ pub fn r300_note_multisampling(s: &mut PPCMacGPUState, pkt: &R300DrawPacket) {
 /// Hands the built packet to the renderer under the big lock, then does the follow-up the
 /// draw needs: CBZB clear, GART write-back and scratch restore, dirty marking and tracing.
 pub fn r300_submit_draw(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     pkt: &mut R300DrawPacket,
     gart_rt: &mut Option<GartColourBuffer>,
     cbzb_clear: bool,

@@ -1,5 +1,5 @@
 use super::*;
-pub fn gpu_guest_dw(_s: &mut PPCMacGPUState, raw: uint32_t) -> uint32_t {
+pub fn gpu_guest_dw(_s: &mut PPCMacGPUFields, raw: uint32_t) -> uint32_t {
     return raw;
 }
 pub fn gpu_diag_on() -> bool {
@@ -9,7 +9,7 @@ pub fn gpu_diag_on() -> bool {
     }
     return on.get() != 0;
 }
-pub fn gpu_sync_at(s: &mut PPCMacGPUState, _why: uint32_t) {
+pub fn gpu_sync_at(s: &mut PPCMacGPUFields, _why: uint32_t) {
     if !s.renderer.is_null() && s.renderer_ref().flush_sync.is_some() {
         // SAFETY: flush_sync is the renderer's callback, set together with renderer_opaque
         // when the renderer was attached; both stay valid while renderer is non-null.
@@ -24,7 +24,7 @@ pub fn gpu_sync_at(s: &mut PPCMacGPUState, _why: uint32_t) {
     }
 }
 pub fn gpu_vram_dirty(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     addr: uint64_t,
     size: uint64_t,
 ) {
@@ -42,7 +42,7 @@ pub fn gpu_vram_dirty(
     unsafe { memory_region_set_dirty(&raw mut s.vram, addr as hwaddr, size as hwaddr) };
 }
 pub fn gpu_vram_access(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     lo: uint64_t,
     hi: uint64_t,
     write_access: bool,
@@ -90,7 +90,7 @@ pub fn gpu_tracked_reg(addr: hwaddr) -> bool {
     };
 }
 pub fn gpu_set_present_pitch(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     dst_pitch: uint32_t,
 ) {
     let min: uint32_t = s.disp.width.wrapping_mul(
@@ -118,7 +118,7 @@ fn dac6(b: u8) -> u32 {
     let b = u32::from(b);
     (b << 2) | (b >> 4)
 }
-pub fn gpu_dac_get(s: &PPCMacGPUState, i: u32) -> u32 {
+pub fn gpu_dac_get(s: &PPCMacGPUFields, i: u32) -> u32 {
     if s.legacy_vga {
         let vga = s.vga_ref();
         let idx = (i & 0xff) as usize;
@@ -133,7 +133,7 @@ pub fn gpu_dac_get(s: &PPCMacGPUState, i: u32) -> u32 {
     s.regs.palette[(i & 0xff) as usize] & 0x00ff_ffff
 }
 pub fn gpu_dac_set(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     i: ::core::ffi::c_uint,
     rgb: uint32_t,
 ) {
@@ -148,7 +148,7 @@ pub fn gpu_dac_set(
         slot[2] = ((rgb & 0xff) >> sh) as uint8_t;
     }
 }
-pub fn gpu_po_offset(s: &mut PPCMacGPUState, po: uint32_t) -> uint32_t {
+pub fn gpu_po_offset(s: &mut PPCMacGPUFields, po: uint32_t) -> uint32_t {
     let mut off: uint32_t =
         (po & 0x3fffff as ::core::ffi::c_int as uint32_t) << 10 as ::core::ffi::c_int;
     let fb: uint32_t =
@@ -166,7 +166,7 @@ pub fn gpu_gmc_bpp(gmc: uint32_t) -> uint32_t {
     };
 }
 pub fn gpu_px_ptr(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     a: uint64_t,
     bpp: uint32_t,
@@ -197,7 +197,7 @@ pub fn gpu_px_ptr(
     }
 }
 pub fn gpu_px_get(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     a: uint64_t,
     bpp: uint32_t,
@@ -219,7 +219,7 @@ pub fn gpu_px_get(
     crate::src::qemu::px_read(s, p, bpp as usize)
 }
 pub fn gpu_px_put(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     a: uint64_t,
     v: uint32_t,
@@ -242,7 +242,7 @@ pub fn gpu_px_put(
     }
 }
 pub fn gpu_mc_copy(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     mut da: uint64_t,
     mut sa: uint64_t,
@@ -354,7 +354,7 @@ pub fn gpu_rop3(
 pub fn gpu_unified_2d() -> bool {
     return 1 as ::core::ffi::c_int != 0;
 }
-pub fn gpu_agp_page(s: &mut PPCMacGPUState, gpu_addr: uint32_t) -> *mut uint8_t {
+pub fn gpu_agp_page(s: &mut PPCMacGPUFields, gpu_addr: uint32_t) -> *mut uint8_t {
     let page: uint32_t = gpu_addr >> 12 as ::core::ffi::c_int;
     let i: usize = (page as usize) & (r200_agp_tc_mut().len() - 1);
     let hit = r200_agp_tc_mut()[i];
@@ -473,7 +473,7 @@ pub fn gpu_slow_limit_ns() -> int64_t {
     }
     lim.get()
 }
-impl PPCMacGPUState {
+impl PPCMacGPUFields {
     /// The renderer vtable. Callers have already checked `renderer` is non-null (the
     /// vtable is a static table that outlives the device).
     pub fn renderer_ref(&self) -> &'static PPCMacGPURenderer {
@@ -482,7 +482,7 @@ impl PPCMacGPUState {
         unsafe { &*self.renderer }
     }
 }
-impl PPCMacGPUState {
+impl PPCMacGPUFields {
     /// The R300 register/state block (allocated at realize, freed at unrealize).
     pub fn r3_ref(&self) -> &'static R300State {
         debug_assert!(!self.r3.is_null());
@@ -501,7 +501,7 @@ impl PPCMacGPUState {
 pub fn dw(d: &[uint32_t], i: usize) -> uint32_t {
     d.get(i).copied().unwrap_or(0)
 }
-impl PPCMacGPUState {
+impl PPCMacGPUFields {
     /// The embedded VGA core (owned by this device, valid from realize on).
     pub fn vga_ref(&self) -> &'static VGACommonState {
         debug_assert!(!self.vga.is_null());

@@ -14,7 +14,7 @@ pub fn I2CDDC(obj: *const ::core::ffi::c_void) -> *mut I2CDDCState {
         c"I2CDDC",
     )
 }
-pub fn PPC_MAC_GPU(obj: *const ::core::ffi::c_void) -> *mut PPCMacGPUState {
+pub fn PPC_MAC_GPU(obj: *const ::core::ffi::c_void) -> *mut PPCMacGPUFields {
     crate::src::qemu::qom_object_cast(
         obj,
         c"ppc-mac-gpu",
@@ -135,7 +135,7 @@ pub fn gmc_dst_bpp(gmc: uint32_t) -> uint32_t {
     return r200_datatype_bpp(gmc >> 8 as ::core::ffi::c_int);
 }
 pub fn host_data_put_narrow(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     val: uint32_t,
     bpp: uint32_t,
@@ -177,7 +177,7 @@ pub fn host_data_put_narrow(
     return *cy < h;
 }
 pub fn fill_vram_px(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     addr: uint64_t,
     color: uint32_t,
@@ -277,7 +277,7 @@ pub extern "C" fn run_static_initializers() {
         Property {
             name: c"vgamem_mb".as_ptr(),
             info: &raw const qdev_prop_uint32,
-            offset: ::core::mem::offset_of!(PPCMacGPUState, vram_size_mb) as ptrdiff_t,
+            offset: foff(::core::mem::offset_of!(PPCMacGPUFields, vram_size_mb)) as ptrdiff_t,
             link_type: ::core::ptr::null::<::core::ffi::c_char>(),
             bitmask: 0,
             defval: C2RustUnnamed_81 { u: 128 },
@@ -290,7 +290,7 @@ pub extern "C" fn run_static_initializers() {
         Property {
             name: c"host-aspect-modes".as_ptr(),
             info: &raw const qdev_prop_bool,
-            offset: ::core::mem::offset_of!(PPCMacGPUState, host_aspect_modes) as ptrdiff_t,
+            offset: foff(::core::mem::offset_of!(PPCMacGPUFields, host_aspect_modes)) as ptrdiff_t,
             link_type: ::core::ptr::null::<::core::ffi::c_char>(),
             bitmask: 0,
             defval: C2RustUnnamed_81 { u: 0 },
@@ -303,7 +303,7 @@ pub extern "C" fn run_static_initializers() {
         Property {
             name: c"legacy-vga".as_ptr(),
             info: &raw const qdev_prop_bool,
-            offset: ::core::mem::offset_of!(PPCMacGPUState, legacy_vga) as ptrdiff_t,
+            offset: foff(::core::mem::offset_of!(PPCMacGPUFields, legacy_vga)) as ptrdiff_t,
             link_type: ::core::ptr::null::<::core::ffi::c_char>(),
             bitmask: 0,
             defval: C2RustUnnamed_81 { u: 0 },
@@ -316,7 +316,7 @@ pub extern "C" fn run_static_initializers() {
         Property {
             name: c"biosrom".as_ptr(),
             info: &raw const qdev_prop_string,
-            offset: ::core::mem::offset_of!(PPCMacGPUState, biosrom) as ptrdiff_t,
+            offset: foff(::core::mem::offset_of!(PPCMacGPUFields, biosrom)) as ptrdiff_t,
             link_type: ::core::ptr::null::<::core::ffi::c_char>(),
             bitmask: 0,
             defval: C2RustUnnamed_81 { i: 0 },
@@ -329,7 +329,7 @@ pub extern "C" fn run_static_initializers() {
         Property {
             name: c"renderer".as_ptr(),
             info: &raw const qdev_prop_string,
-            offset: ::core::mem::offset_of!(PPCMacGPUState, renderer_name) as ptrdiff_t,
+            offset: foff(::core::mem::offset_of!(PPCMacGPUFields, renderer_name)) as ptrdiff_t,
             link_type: ::core::ptr::null::<::core::ffi::c_char>(),
             bitmask: 0,
             defval: C2RustUnnamed_81 { i: 0 },
@@ -345,17 +345,22 @@ pub extern "C" fn run_static_initializers() {
     let bool_info = &raw const vmstate_info_bool;
     let buffer_info = &raw const vmstate_info_buffer;
     let fields: &'static [VMStateField] = Box::leak(Box::new([
-        ppc_vmfield(
-            c"pci".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, pci),
-            ::core::mem::size_of::<PCIDevice>(),
-            ::core::ptr::null(),
-            VMS_STRUCT,
-            0,
-        ),
+        // VMSTATE_PCI_DEVICE: a VMS_STRUCT field must carry the sub-description, or QEMU dereferences a
+        // null `vmsd` while saving (savevm crashed in vmsd_can_compress).
+        VMStateField {
+            vmsd: &raw const pci_sys::vmstate_pci_device,
+            ..ppc_vmfield(
+                c"pci".as_ptr(),
+                ::core::mem::offset_of!(PPCMacGPUState, pci),
+                ::core::mem::size_of::<PCIDevice>(),
+                ::core::ptr::null(),
+                VMS_STRUCT,
+                0,
+            )
+        },
         ppc_vmfield(
             c"regs_size".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, regs_size),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, regs_size)),
             ::core::mem::size_of::<uint32_t>(),
             &raw const vmstate_info_uint32_equal,
             VMS_SINGLE,
@@ -363,7 +368,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"regs".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, regs),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, regs)),
             ::core::mem::size_of::<PPCMacGPURegs>(),
             buffer_info,
             VMS_BUFFER,
@@ -371,7 +376,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"display_invalid".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, display_invalid),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, display_invalid)),
             ::core::mem::size_of::<bool>(),
             bool_info,
             VMS_SINGLE,
@@ -379,7 +384,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"disp_stride_override_active".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, disp_stride_override_active),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, disp_stride_override_active)),
             ::core::mem::size_of::<bool>(),
             bool_info,
             VMS_SINGLE,
@@ -387,7 +392,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"disp_stride_override_value".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, disp_stride_override_value),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, disp_stride_override_value)),
             ::core::mem::size_of::<uint32_t>(),
             &raw const vmstate_info_uint32,
             VMS_SINGLE,
@@ -395,7 +400,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"compositor_base".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, compositor_base),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, compositor_base)),
             ::core::mem::size_of::<uint32_t>(),
             u32_info,
             VMS_SINGLE,
@@ -403,7 +408,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"compositor_pitch".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, compositor_pitch),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, compositor_pitch)),
             ::core::mem::size_of::<uint32_t>(),
             u32_info,
             VMS_SINGLE,
@@ -411,7 +416,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"compositor_valid".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, compositor_valid),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, compositor_valid)),
             ::core::mem::size_of::<bool>(),
             bool_info,
             VMS_SINGLE,
@@ -419,7 +424,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"tiled_surfaces".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, tiled_surfaces),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, tiled_surfaces)),
             ::core::mem::size_of::<[C2RustUnnamed_91; 8]>(),
             buffer_info,
             VMS_BUFFER,
@@ -427,7 +432,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"hwc_pix".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, hwc_pix),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, hwc_pix)),
             ::core::mem::size_of::<[uint32_t; 4096]>(),
             buffer_info,
             VMS_BUFFER,
@@ -435,7 +440,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"hwc_w".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, hwc_w),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, hwc_w)),
             ::core::mem::size_of::<uint32_t>(),
             u32_info,
             VMS_SINGLE,
@@ -443,7 +448,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"hwc_h".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, hwc_h),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, hwc_h)),
             ::core::mem::size_of::<uint32_t>(),
             u32_info,
             VMS_SINGLE,
@@ -451,7 +456,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"hwc_idx".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, hwc_idx),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, hwc_idx)),
             ::core::mem::size_of::<uint32_t>(),
             u32_info,
             VMS_SINGLE,
@@ -459,7 +464,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"hwc_x".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, hwc_x),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, hwc_x)),
             ::core::mem::size_of::<int32_t>(),
             &raw const vmstate_info_int32,
             VMS_SINGLE,
@@ -467,7 +472,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"hwc_y".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, hwc_y),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, hwc_y)),
             ::core::mem::size_of::<int32_t>(),
             &raw const vmstate_info_int32,
             VMS_SINGLE,
@@ -475,7 +480,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"hwc_visible".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, hwc_visible),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, hwc_visible)),
             ::core::mem::size_of::<bool>(),
             bool_info,
             VMS_SINGLE,
@@ -483,7 +488,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"r300_shadow".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, r300_shadow),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, r300_shadow)),
             ::core::mem::size_of::<[uint32_t; 5120]>(),
             buffer_info,
             VMS_BUFFER,
@@ -491,7 +496,7 @@ pub extern "C" fn run_static_initializers() {
         ),
         ppc_vmfield(
             c"mc_ind_index".as_ptr(),
-            ::core::mem::offset_of!(PPCMacGPUState, mc_ind_index),
+            foff(::core::mem::offset_of!(PPCMacGPUFields, mc_ind_index)),
             ::core::mem::size_of::<uint32_t>(),
             u32_info,
             VMS_SINGLE,
@@ -501,7 +506,7 @@ pub extern "C" fn run_static_initializers() {
             num: 128,
             ..ppc_vmfield(
                 c"mc_ind".as_ptr(),
-                ::core::mem::offset_of!(PPCMacGPUState, mc_ind),
+                foff(::core::mem::offset_of!(PPCMacGPUFields, mc_ind)),
                 ::core::mem::size_of::<uint32_t>(),
                 u32_info,
                 VMS_ARRAY,

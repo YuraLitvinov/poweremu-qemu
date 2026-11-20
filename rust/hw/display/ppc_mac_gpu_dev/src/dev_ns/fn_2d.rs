@@ -1,5 +1,5 @@
 use super::*;
-pub fn ppc_mac_gpu_2d_op(s: &mut PPCMacGPUState, op: & Gpu2DOp) {
+pub fn ppc_mac_gpu_2d_op(s: &mut PPCMacGPUFields, op: & Gpu2DOp) {
     let gmc: uint32_t = op.gmc;
     let doff: uint32_t = op.dst_off;
     let dpitch: uint32_t = op.dst_pitch;
@@ -518,7 +518,7 @@ pub fn ppc_mac_gpu_2d_op(s: &mut PPCMacGPUState, op: & Gpu2DOp) {
     }
 }
 pub fn ppc_mac_gpu_2d(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     w: uint32_t,
     h: uint32_t,
     legacy: bool,
@@ -575,7 +575,7 @@ pub fn ppc_mac_gpu_2d(
     }
     ppc_mac_gpu_2d_op(s, &op);
 }
-pub fn ppc_mac_gpu_2d_line(s: &mut PPCMacGPUState, end: uint32_t) {
+pub fn ppc_mac_gpu_2d_line(s: &mut PPCMacGPUFields, end: uint32_t) {
     let gmc: uint32_t = s.regs.dp_gui_master_cntl;
     let po: uint32_t =
         if gmc & ((1 as ::core::ffi::c_int) << 1 as ::core::ffi::c_int) as uint32_t != 0 {

@@ -1,6 +1,6 @@
 use super::*;
 pub fn r200_fill_notify(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     offset: uint32_t,
     pitch: uint32_t,
     x: uint32_t,
@@ -16,7 +16,7 @@ pub fn r200_fill_notify(
 /// Each retired entry is written back to its scratch register; the rest are shifted to the
 /// front of the queue.  The queue is bounded by its array length, so a corrupt count cannot
 /// index past it.
-pub fn r200_fence_drain(s: &mut PPCMacGPUState, done: uint32_t) {
+pub fn r200_fence_drain(s: &mut PPCMacGPUFields, done: uint32_t) {
     let pending = (s.regs.r200_fence_n as usize).min(s.regs.r200_fence_q.len());
     let mut n: usize = 0;
     while n < pending {
@@ -34,22 +34,24 @@ pub fn r200_fence_drain(s: &mut PPCMacGPUState, done: uint32_t) {
 }
 pub unsafe extern "C" fn r200_fence_bh_cb(opaque: *mut ::core::ffi::c_void) {
     // SAFETY: `opaque` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(opaque) }) else {
         return;
     };
+    let s = &mut *s_guard;
     let fence_now: uint32_t =
         crate::src::qemu::fence_done_atomic(s).load(::core::sync::atomic::Ordering::Relaxed);
     r200_fence_drain(s, fence_now);
 }
 pub unsafe extern "C" fn r200_fence_done_cb(arg: *mut ::core::ffi::c_void, seq: uint32_t) {
     // SAFETY: `arg` is the device state QEMU registered with this callback.
-    let Some(s) = (unsafe { crate::src::qemu::state_of_opaque(arg) }) else {
+    let Some(mut s_guard) = (unsafe { crate::src::qemu::state_of_opaque(arg) }) else {
         return;
     };
+    let s = &mut *s_guard;
     crate::src::qemu::fence_done_atomic(s).store(seq, ::core::sync::atomic::Ordering::Relaxed);
     crate::src::qemu::fence_bh_schedule();
 }
-pub fn r200_scratch_read_wait(s: &mut PPCMacGPUState, idx: ::core::ffi::c_int) -> bool {
+pub fn r200_scratch_read_wait(s: &mut PPCMacGPUFields, idx: ::core::ffi::c_int) -> bool {
     let mut want: uint32_t = 0;
     let mut pending: bool = false;
     // Entries past the queue length (a corrupt count) are ignored, never indexed.
@@ -78,7 +80,7 @@ pub fn r200_scratch_read_wait(s: &mut PPCMacGPUState, idx: ::core::ffi::c_int) -
     }
     true
 }
-pub fn r200_scratch_write(s: &mut PPCMacGPUState, idx: ::core::ffi::c_int, val: uint32_t) {
+pub fn r200_scratch_write(s: &mut PPCMacGPUFields, idx: ::core::ffi::c_int, val: uint32_t) {
     let mut seq: uint32_t = 0;
     if s.regs.aic_ctrl & 1 as uint32_t != 0 {
         r200_agp_tc_flush();

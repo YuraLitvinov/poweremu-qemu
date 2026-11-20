@@ -93,7 +93,7 @@ pub fn blit_overlaps(
         || dst_y.wrapping_add(h) <= src_y);
 }
 pub fn blit_rect_untiled(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     src_offset: uint32_t,
     src_pitch: uint32_t,

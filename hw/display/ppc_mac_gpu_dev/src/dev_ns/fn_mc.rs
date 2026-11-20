@@ -1,6 +1,6 @@
 use super::*;
 pub fn mc_register_tiled_surface(
-    _s: &mut PPCMacGPUState,
+    _s: &mut PPCMacGPUFields,
     _base: uint32_t,
     _pitch: uint32_t,
     _label: *const ::core::ffi::c_char,
@@ -19,7 +19,7 @@ pub fn mc_register_tiled_surface(
     return -(1 as ::core::ffi::c_int);
 }
 pub fn mc_find_tiled_surface(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     linear_addr: uint64_t,
     surf_base: &mut uint32_t,
     surf_pitch: &mut uint32_t,
@@ -52,7 +52,7 @@ pub fn mc_find_tiled_surface(
     }
 }
 pub fn mc_rect_is_tiled(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     offset: uint32_t,
     pitch: uint32_t,
     x: uint32_t,
@@ -68,7 +68,7 @@ pub fn mc_rect_is_tiled(
         >= 0 as ::core::ffi::c_int;
 }
 pub fn mc_vram_write32(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     linear_addr: uint64_t,
     value: uint32_t,
@@ -127,7 +127,7 @@ pub fn mc_vram_write32(
     }
 }
 pub fn mc_vram_read32(
-    s: &mut PPCMacGPUState,
+    s: &mut PPCMacGPUFields,
     vram: crate::src::qemu::Vram,
     linear_addr: uint64_t,
 ) -> uint32_t {
