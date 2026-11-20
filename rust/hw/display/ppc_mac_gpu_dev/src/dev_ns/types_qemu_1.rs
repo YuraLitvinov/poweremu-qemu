@@ -300,7 +300,13 @@ pub union C2RustUnnamed_5 {
     pub tqe_next: *mut MemoryListener,
     pub tqe_circ: QTailQLink,
 }
-pub type hwaddr = uint64_t;
+pub use system::bindings::hwaddr;
+const _: () = {
+    use core::mem::{align_of, size_of};
+    type T = hwaddr;
+    assert!(size_of::<T>() == 8);
+    assert!(align_of::<T>() == 8);
+};
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct MemoryRegionSection {
@@ -516,7 +522,13 @@ pub type device_endian = ::core::ffi::c_uint;
 pub const DEVICE_LITTLE_ENDIAN: device_endian = 2;
 pub const DEVICE_BIG_ENDIAN: device_endian = 1;
 pub const DEVICE_NATIVE_ENDIAN: device_endian = 0;
-pub type MemTxResult = uint32_t;
+pub use system::bindings::MemTxResult;
+const _: () = {
+    use core::mem::{align_of, size_of};
+    type T = MemTxResult;
+    assert!(size_of::<T>() == 4);
+    assert!(align_of::<T>() == 4);
+};
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct DeviceState {
