@@ -684,7 +684,7 @@ pub static mut vmstate_ppc_mac_gpu: VMStateDescription = VMStateDescription {
     early_setup: false,
     version_id: 0,
     minimum_version_id: 0,
-    priority: MIG_PRI_UNINITIALIZED,
+    priority: migration_sys::MigrationPriority::MIG_PRI_UNINITIALIZED,
     pre_load: None,
     pre_load_errp: None,
     post_load: None,
@@ -707,7 +707,7 @@ pub static mut ati_radeon_9700_type_info: TypeInfo = unsafe {
         instance_init: None,
         instance_post_init: None,
         instance_finalize: None,
-        abstract_0: false,
+        abstract_: false,
         secure: false,
         class_size: 0,
         class_init: Some(
@@ -725,12 +725,12 @@ pub static mut ppc_mac_gpu_type_info: TypeInfo = unsafe {
     TypeInfo {
         name: c"ppc-mac-gpu".as_ptr(),
         parent: c"pci-device".as_ptr(),
-        instance_size: ::core::mem::size_of::<PPCMacGPUState>() as size_t,
+        instance_size: ::core::mem::size_of::<PPCMacGPUState>(),
         instance_align: 0,
         instance_init: None,
         instance_post_init: None,
         instance_finalize: None,
-        abstract_0: false,
+        abstract_: false,
         secure: false,
         class_size: 0,
         class_init: Some(
@@ -742,10 +742,10 @@ pub static mut ppc_mac_gpu_type_info: TypeInfo = unsafe {
         is_available: None,
         interfaces: [
             InterfaceInfo {
-                type_0: c"conventional-pci-device".as_ptr(),
+                type_: c"conventional-pci-device".as_ptr(),
             },
             InterfaceInfo {
-                type_0: ::core::ptr::null::<::core::ffi::c_char>(),
+                type_: ::core::ptr::null::<::core::ffi::c_char>(),
             },
         ]
         .as_ptr() as *mut InterfaceInfo,

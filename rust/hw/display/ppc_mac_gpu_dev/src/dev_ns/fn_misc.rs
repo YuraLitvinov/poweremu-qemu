@@ -264,8 +264,8 @@ fn ppc_vmfield(
 ) -> VMStateField {
     VMStateField {
         name,
-        offset: offset as size_t,
-        size: size as size_t,
+        offset: offset as usize,
+        size: size as usize,
         size_indirect: VMStateStructMember { offset: 0, size: 0 },
         num_indirect: VMStateStructMember { offset: 0, size: 0 },
         start: 0,
@@ -526,7 +526,7 @@ pub extern "C" fn run_static_initializers() {
         early_setup: false,
         version_id: 2,
         minimum_version_id: 1,
-        priority: MIG_PRI_UNINITIALIZED,
+        priority: migration_sys::MigrationPriority::MIG_PRI_UNINITIALIZED,
         pre_load: None,
         pre_load_errp: None,
         post_load: Some(ppc_mac_gpu_post_load),

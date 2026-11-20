@@ -190,6 +190,17 @@ pub fn clock_realtime_ns() -> i64 {
     unsafe { super::dev_ns::qemu_clock_get_ns(super::dev_ns::QEMU_CLOCK_REALTIME) }
 }
 
+// QOM requires the parent object at offset 0 of the instance, and the instance_size registered with the
+// TypeInfo is size_of::<PPCMacGPUState>(); PCIDevice itself is pinned to the C layout in the `pci` crate.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    type S = super::dev_ns::PPCMacGPUState;
+    assert!(offset_of!(S, pci) == 0);
+    assert!(size_of::<super::dev_ns::PCIDevice>() == 2768);
+    assert!(size_of::<S>() >= size_of::<super::dev_ns::PCIDevice>());
+    assert!(align_of::<S>() >= align_of::<super::dev_ns::PCIDevice>());
+};
+
 // Layout of QEMU's MemTxAttrs (include/exec/memattrs.h): a 32-bit bitfield word, then `unspecified` (bool),
 // `_reserved1` (u8) and `_reserved2` (u16).  The device passes it by value to address_space_*, so the
 // bindgen type from QEMU's `system` crate must match this exactly.

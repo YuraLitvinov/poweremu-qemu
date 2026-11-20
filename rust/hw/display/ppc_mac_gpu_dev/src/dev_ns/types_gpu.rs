@@ -1,5 +1,4 @@
 use super::*;
-#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct CPUState {
     pub parent_obj: DeviceState,
@@ -203,7 +202,6 @@ pub struct C2RustUnnamed_78 {
     pub sqh_first: *mut qemu_work_item,
     pub sqh_last: *mut *mut qemu_work_item,
 }
-#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct CPUClass {
     pub parent_class: DeviceClass,
@@ -830,7 +828,6 @@ pub struct PPCMacGPUDisplayMode {
     pub format: pixman_format_code_t,
     pub crtc_ext: bool,
 }
-#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct PPCMacGPUState {
     pub pci: PCIDevice,

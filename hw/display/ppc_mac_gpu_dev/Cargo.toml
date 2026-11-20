@@ -18,6 +18,10 @@ qom = { path = "../../../rust/qom" }
 pci = { path = "../../../rust/hw/pci" }
 hwcore = { path = "../../../rust/hw/core" }
 pci-sys = { path = "../../../rust/bindings/pci-sys" }
+hwcore-sys = { path = "../../../rust/bindings/hwcore-sys" }
+qom-sys = { path = "../../../rust/bindings/qom-sys" }
+migration-sys = { path = "../../../rust/bindings/migration-sys" }
+util-sys = { path = "../../../rust/bindings/util-sys" }
 display-sys = { path = "../../../rust/bindings/display-sys" }
 ash = "0.37"
 

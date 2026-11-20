@@ -1,4 +1,10 @@
 use super::*;
+// QEMU's own bindgen types for the PCI/QOM cluster, instead of the c2rust copies.
+pub use hwcore_sys::{DeviceClass, DeviceState};
+pub use pci_sys::{PCIDevice, PCIDeviceClass};
+pub use qom_sys::{InterfaceInfo, Object, ObjectClass, TypeInfo};
+pub use migration_sys::{VMStateDescription, VMStateField, VMStateFlags, VMStateInfo, VMStateStructMember};
+pub use util_sys::Error;
 pub type __int128_t = i128;
 pub type __builtin_va_list = [__va_list_tag; 1];
 #[derive(Copy, Clone)]
@@ -423,26 +429,7 @@ pub struct C2RustUnnamed_9 {
     pub le_next: *mut RamDiscardSourceEntry,
     pub le_prev: *mut *mut RamDiscardSourceEntry,
 }
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct Object {
-    pub class: *mut ObjectClass,
-    pub free: Option<ObjectFree>,
-    pub properties: *mut GHashTable,
-    pub ref_0: uint32_t,
-    pub parent: *mut Object,
-}
 pub type ObjectFree = unsafe extern "C" fn(*mut ::core::ffi::c_void) -> ();
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct ObjectClass {
-    pub type_0: Type,
-    pub interfaces: *mut GSList,
-    pub object_cast_cache: [*const ::core::ffi::c_char; 4],
-    pub class_cast_cache: [*const ::core::ffi::c_char; 4],
-    pub unparent: Option<ObjectUnparent>,
-    pub properties: *mut GHashTable,
-}
 pub type ObjectUnparent = unsafe extern "C" fn(*mut Object) -> ();
 pub type Type = *mut TypeImpl;
 #[derive(Copy, Clone)]
@@ -529,28 +516,6 @@ const _: () = {
     assert!(size_of::<T>() == 4);
     assert!(align_of::<T>() == 4);
 };
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct DeviceState {
-    pub parent_obj: Object,
-    pub id: *mut ::core::ffi::c_char,
-    pub canonical_path: *mut ::core::ffi::c_char,
-    pub realized: bool,
-    pub pending_deleted_event: bool,
-    pub pending_deleted_expires_ms: int64_t,
-    pub hotplugged: ::core::ffi::c_int,
-    pub allow_unplug_during_migration: bool,
-    pub parent_bus: *mut BusState,
-    pub gpios: NamedGPIOListHead,
-    pub clocks: NamedClockListHead,
-    pub child_bus: BusStateHead,
-    pub num_child_bus: ::core::ffi::c_int,
-    pub instance_id_alias: ::core::ffi::c_int,
-    pub alias_required_for_version: ::core::ffi::c_int,
-    pub reset: ResettableState,
-    pub unplug_blockers: *mut GSList,
-    pub mem_reentrancy_guard: MemReentrancyGuard,
-}
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct MemReentrancyGuard {
@@ -1419,132 +1384,21 @@ pub const SYS_EMU_TARGET_AVR: SysEmuTarget = 3;
 pub const SYS_EMU_TARGET_ARM: SysEmuTarget = 2;
 pub const SYS_EMU_TARGET_ALPHA: SysEmuTarget = 1;
 pub const SYS_EMU_TARGET_AARCH64: SysEmuTarget = 0;
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct DeviceClass {
-    pub parent_class: ObjectClass,
-    pub categories: [::core::ffi::c_ulong; 1],
-    pub fw_name: *const ::core::ffi::c_char,
-    pub desc: *const ::core::ffi::c_char,
-    pub props_: *const Property,
-    pub props_count_: uint16_t,
-    pub user_creatable: bool,
-    pub hotpluggable: bool,
-    pub legacy_reset: DeviceReset,
-    pub realize: DeviceRealize,
-    pub unrealize: DeviceUnrealize,
-    pub sync_config: DeviceSyncConfig,
-    pub vmsd: *const VMStateDescription,
-    pub bus_type: *const ::core::ffi::c_char,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct VMStateDescription {
-    pub name: *const ::core::ffi::c_char,
-    pub unmigratable: bool,
-    pub early_setup: bool,
-    pub version_id: ::core::ffi::c_int,
-    pub minimum_version_id: ::core::ffi::c_int,
-    pub priority: MigrationPriority,
-    pub pre_load: Option<unsafe extern "C" fn(*mut ::core::ffi::c_void) -> ::core::ffi::c_int>,
-    pub pre_load_errp:
-        Option<unsafe extern "C" fn(*mut ::core::ffi::c_void, *mut *mut Error) -> bool>,
-    pub post_load: Option<
-        unsafe extern "C" fn(*mut ::core::ffi::c_void, ::core::ffi::c_int) -> ::core::ffi::c_int,
-    >,
-    pub post_load_errp: Option<
-        unsafe extern "C" fn(*mut ::core::ffi::c_void, ::core::ffi::c_int, *mut *mut Error) -> bool,
-    >,
-    pub pre_save: Option<unsafe extern "C" fn(*mut ::core::ffi::c_void) -> ::core::ffi::c_int>,
-    pub pre_save_errp:
-        Option<unsafe extern "C" fn(*mut ::core::ffi::c_void, *mut *mut Error) -> bool>,
-    pub post_save: Option<unsafe extern "C" fn(*mut ::core::ffi::c_void) -> ()>,
-    pub needed: Option<unsafe extern "C" fn(*mut ::core::ffi::c_void) -> bool>,
-    pub dev_unplug_pending: Option<unsafe extern "C" fn(*mut ::core::ffi::c_void) -> bool>,
-    pub fields: *const VMStateField,
-    pub subsections: *const *const VMStateDescription,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct VMStateField {
-    pub name: *const ::core::ffi::c_char,
-    pub offset: size_t,
-    pub size: size_t,
-    pub size_indirect: VMStateStructMember,
-    pub num_indirect: VMStateStructMember,
-    pub start: size_t,
-    pub num: ::core::ffi::c_int,
-    pub info: *const VMStateInfo,
-    pub flags: VMStateFlags,
-    pub vmsd: *const VMStateDescription,
-    pub version_id: ::core::ffi::c_int,
-    pub struct_version_id: ::core::ffi::c_int,
-    pub field_exists:
-        Option<unsafe extern "C" fn(*mut ::core::ffi::c_void, ::core::ffi::c_int) -> bool>,
-}
-pub type VMStateFlags = ::core::ffi::c_uint;
-pub const VMS_END: VMStateFlags = 131072;
-pub const VMS_ARRAY_OF_POINTER_AUTO_ALLOC: VMStateFlags = 65536;
-pub const VMS_VSTRUCT: VMStateFlags = 32768;
-pub const VMS_ALLOC: VMStateFlags = 8192;
-pub const VMS_MUST_EXIST: VMStateFlags = 4096;
-pub const VMS_MULTIPLY: VMStateFlags = 512;
-pub const VMS_VBUFFER: VMStateFlags = 256;
-pub const VMS_NO_STATE: VMStateFlags = 128;
-pub const VMS_ARRAY_OF_POINTER: VMStateFlags = 64;
-pub const VMS_BUFFER: VMStateFlags = 32;
-pub const VMS_VARRAY: VMStateFlags = 16;
-pub const VMS_STRUCT: VMStateFlags = 8;
-pub const VMS_ARRAY: VMStateFlags = 4;
-pub const VMS_POINTER: VMStateFlags = 2;
-pub const VMS_SINGLE: VMStateFlags = 1;
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct VMStateInfo {
-    pub name: *const ::core::ffi::c_char,
-    pub get: Option<
-        unsafe extern "C" fn(
-            *mut QEMUFile,
-            *mut ::core::ffi::c_void,
-            size_t,
-            *const VMStateField,
-        ) -> ::core::ffi::c_int,
-    >,
-    pub put: Option<
-        unsafe extern "C" fn(
-            *mut QEMUFile,
-            *mut ::core::ffi::c_void,
-            size_t,
-            *const VMStateField,
-            *mut JSONWriter,
-        ) -> ::core::ffi::c_int,
-    >,
-    pub load: Option<
-        unsafe extern "C" fn(
-            *mut QEMUFile,
-            *mut ::core::ffi::c_void,
-            size_t,
-            *const VMStateField,
-            *mut *mut Error,
-        ) -> bool,
-    >,
-    pub save: Option<
-        unsafe extern "C" fn(
-            *mut QEMUFile,
-            *mut ::core::ffi::c_void,
-            size_t,
-            *const VMStateField,
-            *mut JSONWriter,
-            *mut *mut Error,
-        ) -> bool,
-    >,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct VMStateStructMember {
-    pub offset: uint32_t,
-    pub size: uint8_t,
-}
+pub const VMS_END: VMStateFlags = VMStateFlags(131072);
+pub const VMS_ARRAY_OF_POINTER_AUTO_ALLOC: VMStateFlags = VMStateFlags(65536);
+pub const VMS_VSTRUCT: VMStateFlags = VMStateFlags(32768);
+pub const VMS_ALLOC: VMStateFlags = VMStateFlags(8192);
+pub const VMS_MUST_EXIST: VMStateFlags = VMStateFlags(4096);
+pub const VMS_MULTIPLY: VMStateFlags = VMStateFlags(512);
+pub const VMS_VBUFFER: VMStateFlags = VMStateFlags(256);
+pub const VMS_NO_STATE: VMStateFlags = VMStateFlags(128);
+pub const VMS_ARRAY_OF_POINTER: VMStateFlags = VMStateFlags(64);
+pub const VMS_BUFFER: VMStateFlags = VMStateFlags(32);
+pub const VMS_VARRAY: VMStateFlags = VMStateFlags(16);
+pub const VMS_STRUCT: VMStateFlags = VMStateFlags(8);
+pub const VMS_ARRAY: VMStateFlags = VMStateFlags(4);
+pub const VMS_POINTER: VMStateFlags = VMStateFlags(2);
+pub const VMS_SINGLE: VMStateFlags = VMStateFlags(1);
 pub type MigrationPriority = ::core::ffi::c_uint;
 pub const MIG_PRI_MAX: MigrationPriority = 10;
 pub const MIG_PRI_GICV3: MigrationPriority = 9;
@@ -1765,72 +1619,10 @@ pub struct C2RustUnnamed_83 {
     pub le_next: *mut I2CNode,
     pub le_prev: *mut *mut I2CNode,
 }
-#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct I2CSlave {
     pub qdev: DeviceState,
     pub address: uint8_t,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct PCIDevice {
-    pub qdev: DeviceState,
-    pub partially_hotplugged: bool,
-    pub enabled: bool,
-    pub loadparm: *mut ::core::ffi::c_char,
-    pub config: *mut uint8_t,
-    pub cmask: *mut uint8_t,
-    pub wmask: *mut uint8_t,
-    pub w1cmask: *mut uint8_t,
-    pub used: *mut uint8_t,
-    pub devfn: int32_t,
-    pub requester_id_cache: PCIReqIDCache,
-    pub name: [::core::ffi::c_char; 64],
-    pub io_regions: [PCIIORegion; 7],
-    pub bus_master_as: AddressSpace,
-    pub is_master: bool,
-    pub bus_master_container_region: MemoryRegion,
-    pub bus_master_enable_region: MemoryRegion,
-    pub config_read: Option<PCIConfigReadFunc>,
-    pub config_write: Option<PCIConfigWriteFunc>,
-    pub vga_regions: [*mut MemoryRegion; 3],
-    pub has_vga: bool,
-    pub irq_state: uint8_t,
-    pub cap_present: uint32_t,
-    pub pm_cap: uint8_t,
-    pub msix_cap: uint8_t,
-    pub msix_entries_nr: ::core::ffi::c_int,
-    pub msix_table: *mut uint8_t,
-    pub msix_pba: *mut uint8_t,
-    pub irq_opaque: *mut ::core::ffi::c_void,
-    pub msi_trigger: Option<MSITriggerFunc>,
-    pub msi_prepare_message: Option<MSIPrepareMessageFunc>,
-    pub msix_prepare_message: Option<MSIxPrepareMessageFunc>,
-    pub msix_exclusive_bar: MemoryRegion,
-    pub msix_table_mmio: MemoryRegion,
-    pub msix_pba_mmio: MemoryRegion,
-    pub msix_entry_used: *mut ::core::ffi::c_uint,
-    pub msix_function_masked: bool,
-    pub version_id: int32_t,
-    pub msi_cap: uint8_t,
-    pub exp: PCIExpressDevice,
-    pub shpc: *mut SHPCDevice,
-    pub romfile: *mut ::core::ffi::c_char,
-    pub romsize: uint32_t,
-    pub has_rom: bool,
-    pub rom: MemoryRegion,
-    pub rom_bar: int32_t,
-    pub intx_routing_notifier: PCIINTxRoutingNotifier,
-    pub msix_vector_use_notifier: MSIVectorUseNotifier,
-    pub msix_vector_release_notifier: MSIVectorReleaseNotifier,
-    pub msix_vector_poll_notifier: MSIVectorPollNotifier,
-    pub spdm_port: uint16_t,
-    pub spdm_trans: SpdmTransportType,
-    pub doe_spdm: DOECap,
-    pub failover_pair_id: *mut ::core::ffi::c_char,
-    pub acpi_index: uint32_t,
-    pub max_bounce_buffer_size: uint32_t,
-    pub sriov_pf: *mut ::core::ffi::c_char,
 }
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -1999,32 +1791,6 @@ pub type QemuFileType = ::core::ffi::c_uint;
 pub const QEMU_FILE_TYPE_KEYMAP: QemuFileType = 2;
 pub const QEMU_FILE_TYPE_DTB: QemuFileType = 1;
 pub const QEMU_FILE_TYPE_BIOS: QemuFileType = 0;
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct TypeInfo {
-    pub name: *const ::core::ffi::c_char,
-    pub parent: *const ::core::ffi::c_char,
-    pub instance_size: size_t,
-    pub instance_align: size_t,
-    pub instance_init: Option<unsafe extern "C" fn(*mut Object) -> ()>,
-    pub instance_post_init: Option<unsafe extern "C" fn(*mut Object) -> ()>,
-    pub instance_finalize: Option<unsafe extern "C" fn(*mut Object) -> ()>,
-    pub abstract_0: bool,
-    pub secure: bool,
-    pub class_size: size_t,
-    pub class_init:
-        Option<unsafe extern "C" fn(*mut ObjectClass, *const ::core::ffi::c_void) -> ()>,
-    pub class_base_init:
-        Option<unsafe extern "C" fn(*mut ObjectClass, *const ::core::ffi::c_void) -> ()>,
-    pub class_data: *const ::core::ffi::c_void,
-    pub is_available: Option<unsafe extern "C" fn() -> bool>,
-    pub interfaces: *const InterfaceInfo,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct InterfaceInfo {
-    pub type_0: *const ::core::ffi::c_char,
-}
 pub type RCUReadAuto = ();
 pub type RCUReadAuto_autoptr = *mut ::core::ffi::c_void;
 pub type QEMUBHFunc = unsafe extern "C" fn(*mut ::core::ffi::c_void) -> ();
@@ -2063,23 +1829,6 @@ pub const DEVICE_CATEGORY_STORAGE: DeviceCategory = 2;
 pub const DEVICE_CATEGORY_USB: DeviceCategory = 1;
 pub const DEVICE_CATEGORY_BRIDGE: DeviceCategory = 0;
 pub type PCIUnregisterFunc = unsafe extern "C" fn(*mut PCIDevice) -> ();
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct PCIDeviceClass {
-    pub parent_class: DeviceClass,
-    pub realize: Option<unsafe extern "C" fn(*mut PCIDevice, *mut *mut Error) -> ()>,
-    pub exit: Option<PCIUnregisterFunc>,
-    pub config_read: Option<PCIConfigReadFunc>,
-    pub config_write: Option<PCIConfigWriteFunc>,
-    pub vendor_id: uint16_t,
-    pub device_id: uint16_t,
-    pub revision: uint8_t,
-    pub class_id: uint16_t,
-    pub subsystem_vendor_id: uint16_t,
-    pub subsystem_id: uint16_t,
-    pub romfile: *const ::core::ffi::c_char,
-    pub sriov_vf_user_creatable: bool,
-}
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct QemuUIInfo {

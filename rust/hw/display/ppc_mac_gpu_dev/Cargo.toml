@@ -16,5 +16,9 @@ qom = { path = "../../../qom" }
 pci = { path = "../../../hw/pci" }
 hwcore = { path = "../../../hw/core" }
 pci-sys = { path = "../../../bindings/pci-sys" }
+hwcore-sys = { path = "../../../bindings/hwcore-sys" }
+qom-sys = { path = "../../../bindings/qom-sys" }
+migration-sys = { path = "../../../bindings/migration-sys" }
+util-sys = { path = "../../../bindings/util-sys" }
 display-sys = { path = "../../../bindings/display-sys" }
 ash = "0.37"

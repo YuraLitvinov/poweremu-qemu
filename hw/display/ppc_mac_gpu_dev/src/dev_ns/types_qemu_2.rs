@@ -153,7 +153,6 @@ pub struct qemu_edid_info {
     pub maxy: uint32_t,
     pub refresh_rate: uint32_t,
 }
-#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct I2CDDCState {
     pub i2c: I2CSlave,
@@ -253,7 +252,6 @@ opaque!(IRQState);
 opaque!(RAMBlock);
 opaque!(AddressSpaceDispatch);
 opaque!(FlatRange);
-opaque!(Error);
 opaque!(QEMUTimerList);
 opaque!(KVMState);
 opaque!(qemu_work_item);
