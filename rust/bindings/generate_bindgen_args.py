@@ -109,6 +109,11 @@ def main() -> int:
         help="Base path for --allowlist-file/--blocklist-file",
     )
     parser.add_argument("--source-dir", default=os.getcwd(), help="Source directory")
+    parser.add_argument(
+        "--project-root",
+        default=None,
+        help="QEMU source root, base for source-root-files",
+    )
     parser.add_argument("-o", "--output", required=True, help="Output file")
     parser.add_argument("--dep-file", help="Dependency file to write")
     args = parser.parse_args()
@@ -139,6 +144,16 @@ def main() -> int:
             includes = extract_includes(f)
         for allowlist_file in includes + metadata.get("additional-files", []):
             allowlist_path = Path(include_root) / allowlist_file
+            cmd_args.extend(["--allowlist-file", str(allowlist_path)])
+            prev_allowlist_files.setdefault(str(allowlist_path), True)
+        # Private headers live under the source root, not under include/;
+        # source-root-files lists them relative to --project-root.
+        # bindgen matches --allowlist-file as a regex against the path clang
+        # reports; the root is passed as "-I<root>/." so clang reports
+        # "<root>/./<file>", hence the "/./" in the pattern.
+        project_root = args.project_root or os.path.dirname(include_root)
+        for source_file in metadata.get("source-root-files", []):
+            allowlist_path = f"{project_root}/./{source_file}"
             cmd_args.extend(["--allowlist-file", str(allowlist_path)])
             prev_allowlist_files.setdefault(str(allowlist_path), True)
 

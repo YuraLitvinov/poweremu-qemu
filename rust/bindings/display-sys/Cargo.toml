@@ -28,3 +28,4 @@ workspace = true
 
 [package.metadata.bindgen]
 header = "wrapper.h"
+source-root-files = ["hw/display/vga_int.h"]

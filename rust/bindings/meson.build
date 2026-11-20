@@ -14,6 +14,7 @@ bindgen_dirs = [
 bindgen_args_file = configure_file(
   command: [files('generate_bindgen_args.py'),
             '-I', meson.project_source_root() / 'include',
+            '--project-root', meson.project_source_root(),
             '--source-dir', meson.current_source_dir(),
             '-o', '@OUTPUT@', '--dep-file', '@DEPFILE@'] + bindgen_dirs,
   output: 'bindgen_args.mak',

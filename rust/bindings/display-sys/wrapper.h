@@ -9,6 +9,7 @@
 
 #include "ui/console.h"
 #include "hw/display/vga.h"
+#include "hw/display/vga_int.h"
 #include "hw/display/edid.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/bitbang_i2c.h"

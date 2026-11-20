@@ -19,11 +19,11 @@
     clippy::too_many_arguments
 )]
 
-use glib_sys::GSList;
+use glib_sys::{GArray, GSList};
 use hwcore_sys::{qemu_irq, BusState, DeviceClass, DeviceState};
 use migration_sys::VMStateDescription;
 use qom_sys::{Object, ObjectClass};
-use system_sys::{MemoryRegion, MemoryRegionSection};
+use system_sys::{hwaddr, MemoryRegion, MemoryRegionOps, MemoryRegionSection};
 use util_sys::{Error, QemuOpts, QEMUBH};
 
 /// `QemuConsole` is defined in ui/console-priv.h, a private header; the public API only passes it
