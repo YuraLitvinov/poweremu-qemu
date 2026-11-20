@@ -212,6 +212,20 @@ unsafe impl qom::ObjectType for super::dev_ns::PPCMacGPUState {
 }
 qom::qom_isa!(super::dev_ns::PPCMacGPUState: pci::PCIDevice, hwcore::DeviceState, qom::Object);
 
+// The type's registration info comes from the Rust type itself: name, parent ("pci-device", from
+// `ParentType`), instance size/alignment, class size (`PCIDeviceClass`), `Drop` at finalize.  The
+// `conventional-pci-device` interface is added in `register_device_types`, and the class setup is the
+// existing `ppc_mac_gpu_class_init` (realize, exit, config space, reset, properties and vmstate).
+impl qom::ObjectImpl for super::dev_ns::PPCMacGPUState {
+    type ParentType = pci::PCIDevice;
+    const CLASS_INIT: fn(&mut super::dev_ns::PCIDeviceClass) = |k| {
+        super::dev_ns::ppc_mac_gpu_class_init(
+            (k as *mut super::dev_ns::PCIDeviceClass).cast::<super::dev_ns::ObjectClass>(),
+            core::ptr::null(),
+        );
+    };
+}
+
 // Layout of QEMU's MemTxAttrs (include/exec/memattrs.h): a 32-bit bitfield word, then `unspecified` (bool),
 // `_reserved1` (u8) and `_reserved2` (u16).  The device passes it by value to address_space_*, so the
 // bindgen type from QEMU's `system` crate must match this exactly.
@@ -2073,10 +2087,17 @@ pub fn class_add_trace_property(
 
 /// Registers the device type and its companion type with QOM (`type_register_static`).
 pub fn register_device_types() {
-    // SAFETY: both TypeInfo statics are complete and fixed after their constructor; QOM copies
-    // them during registration.
+    // The interface list is only read during registration (QOM copies the names), so a local array is fine.
+    let interfaces = [
+        super::dev_ns::InterfaceInfo { type_: c"conventional-pci-device".as_ptr() },
+        super::dev_ns::InterfaceInfo { type_: core::ptr::null() },
+    ];
+    let mut info = <super::dev_ns::PPCMacGPUState as qom::ObjectImpl>::TYPE_INFO;
+    info.interfaces = interfaces.as_ptr();
+    // SAFETY: `info` and the companion TypeInfo are complete; QOM copies them (and the interface names)
+    // during registration.
     unsafe {
-        super::dev_ns::type_register_static(&raw const super::dev_ns::ppc_mac_gpu_type_info);
+        super::dev_ns::type_register_static(&raw const info);
         super::dev_ns::type_register_static(&raw const super::dev_ns::ati_radeon_9700_type_info);
     }
 }

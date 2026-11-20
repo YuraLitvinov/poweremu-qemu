@@ -720,37 +720,6 @@ pub static mut ati_radeon_9700_type_info: TypeInfo = unsafe {
         interfaces: ::core::ptr::null::<InterfaceInfo>(),
     }
 };
-#[no_mangle]
-pub static mut ppc_mac_gpu_type_info: TypeInfo = unsafe {
-    TypeInfo {
-        name: c"ppc-mac-gpu".as_ptr(),
-        parent: c"pci-device".as_ptr(),
-        instance_size: ::core::mem::size_of::<PPCMacGPUState>(),
-        instance_align: 0,
-        instance_init: None,
-        instance_post_init: None,
-        instance_finalize: None,
-        abstract_: false,
-        secure: false,
-        class_size: 0,
-        class_init: Some(
-            ppc_mac_gpu_class_init
-                as unsafe extern "C" fn(*mut ObjectClass, *const ::core::ffi::c_void) -> (),
-        ),
-        class_base_init: None,
-        class_data: ::core::ptr::null::<::core::ffi::c_void>(),
-        is_available: None,
-        interfaces: [
-            InterfaceInfo {
-                type_: c"conventional-pci-device".as_ptr(),
-            },
-            InterfaceInfo {
-                type_: ::core::ptr::null::<::core::ffi::c_char>(),
-            },
-        ]
-        .as_ptr() as *mut InterfaceInfo,
-    }
-};
 #[used]
 #[cfg_attr(target_os = "linux", link_section = ".init_array")]
 #[cfg_attr(target_os = "windows", link_section = ".CRT$XIB")]
