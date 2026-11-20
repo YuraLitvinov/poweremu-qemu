@@ -20,15 +20,16 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "cpu.h"
-#include "exec/exec-all.h"
 #include "exec/page-protection.h"
+#include "exec/target_page.h"
 #include "qemu/error-report.h"
 #include "qemu/qemu-print.h"
 #include "system/hw_accel.h"
+#include "system/memory.h"
 #include "kvm_ppc.h"
 #include "mmu-hash64.h"
 #include "exec/log.h"
-#include "hw/hw.h"
+#include "hw/core/hw-error.h"
 #include "internal.h"
 #include "mmu-book3s-v3.h"
 #include "mmu-books.h"
@@ -103,7 +104,7 @@ void dump_slb(PowerPCCPU *cpu)
 }
 
 #ifdef CONFIG_TCG
-void helper_SLBIA(CPUPPCState *env, uint32_t ih)
+void HELPER(SLBIA)(CPUPPCState *env, uint32_t ih)
 {
     PowerPCCPU *cpu = env_archcpu(env);
     int starting_entry;
@@ -176,7 +177,7 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
 }
 
 #if defined(TARGET_PPC64)
-void helper_SLBIAG(CPUPPCState *env, target_ulong rs, uint32_t l)
+void HELPER(SLBIAG)(CPUPPCState *env, target_ulong rs, uint32_t l)
 {
     PowerPCCPU *cpu = env_archcpu(env);
     int n;
@@ -226,12 +227,12 @@ static void __helper_slbie(CPUPPCState *env, target_ulong addr,
     }
 }
 
-void helper_SLBIE(CPUPPCState *env, target_ulong addr)
+void HELPER(SLBIE)(CPUPPCState *env, target_ulong addr)
 {
     __helper_slbie(env, addr, false);
 }
 
-void helper_SLBIEG(CPUPPCState *env, target_ulong addr)
+void HELPER(SLBIEG)(CPUPPCState *env, target_ulong addr)
 {
     __helper_slbie(env, addr, true);
 }
@@ -338,7 +339,7 @@ static int ppc_find_slb_vsid(PowerPCCPU *cpu, target_ulong rb,
     return 0;
 }
 
-void helper_SLBMTE(CPUPPCState *env, target_ulong rb, target_ulong rs)
+void HELPER(SLBMTE)(CPUPPCState *env, target_ulong rb, target_ulong rs)
 {
     PowerPCCPU *cpu = env_archcpu(env);
 
@@ -348,7 +349,7 @@ void helper_SLBMTE(CPUPPCState *env, target_ulong rb, target_ulong rs)
     }
 }
 
-target_ulong helper_SLBMFEE(CPUPPCState *env, target_ulong rb)
+target_ulong HELPER(SLBMFEE)(CPUPPCState *env, target_ulong rb)
 {
     PowerPCCPU *cpu = env_archcpu(env);
     target_ulong rt = 0;
@@ -360,7 +361,7 @@ target_ulong helper_SLBMFEE(CPUPPCState *env, target_ulong rb)
     return rt;
 }
 
-target_ulong helper_SLBFEE(CPUPPCState *env, target_ulong rb)
+target_ulong HELPER(SLBFEE)(CPUPPCState *env, target_ulong rb)
 {
     PowerPCCPU *cpu = env_archcpu(env);
     target_ulong rt = 0;
@@ -372,7 +373,7 @@ target_ulong helper_SLBFEE(CPUPPCState *env, target_ulong rb)
     return rt;
 }
 
-target_ulong helper_SLBMFEV(CPUPPCState *env, target_ulong rb)
+target_ulong HELPER(SLBMFEV)(CPUPPCState *env, target_ulong rb)
 {
     PowerPCCPU *cpu = env_archcpu(env);
     target_ulong rt = 0;
@@ -1065,7 +1066,7 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 
         *raddrp = raddr;
         *protp = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
-        *psizep = TARGET_PAGE_BITS;
+        *psizep = qemu_target_page_bits();
         return true;
     }
 
@@ -1219,7 +1220,7 @@ void ppc_hash64_tlb_flush_hpte(PowerPCCPU *cpu, target_ulong ptex,
 }
 
 #ifdef CONFIG_TCG
-void helper_store_lpcr(CPUPPCState *env, target_ulong val)
+void HELPER(store_lpcr)(CPUPPCState *env, target_ulong val)
 {
     PowerPCCPU *cpu = env_archcpu(env);
 

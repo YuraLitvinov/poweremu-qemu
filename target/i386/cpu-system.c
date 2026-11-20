@@ -18,13 +18,16 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
+#include "system/kvm.h"
 #include "cpu.h"
 #include "qapi/error.h"
 #include "qapi/qapi-visit-run-state.h"
 #include "qobject/qdict.h"
 #include "qapi/qobject-input-visitor.h"
 #include "qom/qom-qobject.h"
-#include "qapi/qapi-commands-machine-target.h"
+#include "qapi/qapi-commands-machine.h"
+#include "system/qmp-cpu.h"
 
 #include "cpu-internal.h"
 
@@ -187,9 +190,9 @@ out:
 }
 
 CpuModelExpansionInfo *
-qmp_query_cpu_model_expansion(CpuModelExpansionType type,
-                                                      CpuModelInfo *model,
-                                                      Error **errp)
+qmp_query_i386_cpu_model_expansion(CpuModelExpansionType type,
+                                   CpuModelInfo *model,
+                                   Error **errp)
 {
     X86CPU *xc = NULL;
     Error *err = NULL;
@@ -271,6 +274,26 @@ GuestPanicInformation *x86_cpu_get_crash_info(CPUState *cs)
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
     GuestPanicInformation *panic_info = NULL;
+
+#ifdef CONFIG_KVM
+    if (kvm_enabled()) {
+        struct kvm_run *run = cs->kvm_run;
+
+        if (run->exit_reason == KVM_EXIT_SYSTEM_EVENT &&
+            run->system_event.type == KVM_SYSTEM_EVENT_SEV_TERM) {
+            panic_info = g_new0(GuestPanicInformation, 1);
+
+            panic_info->type = GUEST_PANIC_INFORMATION_TYPE_SEV;
+            /* There should always be one data item, otherwise use zeroes.  */
+            if (run->system_event.ndata > 0) {
+                panic_info->u.sev.set = (run->system_event.data[0] >> 12) & 0xf;
+                panic_info->u.sev.code = (run->system_event.data[0] >> 16) & 0xff;
+            } else {
+                warn_report("Hypervisor did not provide any data for SEV-ES termination");
+            }
+        }
+    } else
+#endif
 
     if (hyperv_feat_enabled(cpu, HYPERV_FEAT_CRASH)) {
         panic_info = g_new0(GuestPanicInformation, 1);

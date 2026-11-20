@@ -11,6 +11,11 @@
 #include "qemu/osdep.h"
 #include "translate.h"
 
+static int plus_1(DisasContext *ctx, int x)
+{
+    return x + 1;
+}
+
 /* Include the auto-generated decoders.  */
 #include "decode-rel6.c.inc"
 
@@ -32,4 +37,16 @@ static bool trans_DLSA(DisasContext *ctx, arg_r *a)
         return false;
     }
     return gen_dlsa(ctx, a->rd, a->rt, a->rs, a->sa);
+}
+
+static bool trans_CRC32(DisasContext *ctx, arg_special3_crc *a)
+{
+    if (unlikely(!ctx->crcp)
+        || unlikely((a->sz == 3) && (!(ctx->hflags & MIPS_HFLAG_64)))
+        || unlikely((a->c >= 2))) {
+        gen_reserved_instruction(ctx);
+        return true;
+    }
+    gen_crc32(ctx, a->rt, a->rs, a->rt, a->sz, a->c);
+    return true;
 }

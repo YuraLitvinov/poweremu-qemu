@@ -6,6 +6,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/target_long.h"
 #include <sys/ioctl.h>
 #include <linux/kvm.h>
 #include "asm-loongarch/kvm_para.h"
@@ -18,12 +19,12 @@
 #include "system/kvm_int.h"
 #include "hw/pci/pci.h"
 #include "exec/memattrs.h"
-#include "exec/address-spaces.h"
-#include "hw/boards.h"
-#include "hw/irq.h"
+#include "system/address-spaces.h"
+#include "hw/core/boards.h"
+#include "hw/core/irq.h"
 #include "hw/loongarch/virt.h"
 #include "qemu/log.h"
-#include "hw/loader.h"
+#include "hw/core/loader.h"
 #include "system/runstate.h"
 #include "cpu-csr.h"
 #include "kvm_loongarch.h"
@@ -45,12 +46,12 @@ static int kvm_get_stealtime(CPUState *cs)
         .addr = (uint64_t)&env->stealtime.guest_addr,
     };
 
-    err = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, attr);
+    err = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, &attr);
     if (err) {
         return 0;
     }
 
-    err = kvm_vcpu_ioctl(cs, KVM_GET_DEVICE_ATTR, attr);
+    err = kvm_vcpu_ioctl(cs, KVM_GET_DEVICE_ATTR, &attr);
     if (err) {
         error_report("PVTIME: KVM_GET_DEVICE_ATTR: %s", strerror(errno));
         return err;
@@ -69,12 +70,12 @@ static int kvm_set_stealtime(CPUState *cs)
         .addr = (uint64_t)&env->stealtime.guest_addr,
     };
 
-    err = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, attr);
+    err = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, &attr);
     if (err) {
         return 0;
     }
 
-    err = kvm_vcpu_ioctl(cs, KVM_SET_DEVICE_ATTR, attr);
+    err = kvm_vcpu_ioctl(cs, KVM_SET_DEVICE_ATTR, &attr);
     if (err) {
         error_report("PVTIME: KVM_SET_DEVICE_ATTR %s with gpa "TARGET_FMT_lx,
                       strerror(errno), env->stealtime.guest_addr);
@@ -95,13 +96,13 @@ static int kvm_set_pv_features(CPUState *cs)
         .addr = (uint64_t)&val,
     };
 
-    err = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, attr);
+    err = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, &attr);
     if (err) {
         return 0;
     }
 
     val = env->pv_features;
-    err = kvm_vcpu_ioctl(cs, KVM_SET_DEVICE_ATTR, attr);
+    err = kvm_vcpu_ioctl(cs, KVM_SET_DEVICE_ATTR, &attr);
     if (err) {
         error_report("Fail to set pv feature "TARGET_FMT_lx " with error %s",
                       val, strerror(errno));
@@ -155,348 +156,430 @@ static int kvm_loongarch_put_regs_core(CPUState *cs)
     return ret;
 }
 
-static int kvm_loongarch_get_csr(CPUState *cs)
+static int kvm_loongarch_put_pmu(CPUState *cs)
 {
-    int ret = 0;
+    int i, ret = 0;
     CPULoongArchState *env = cpu_env(cs);
+    LoongArchCPU *cpu = LOONGARCH_CPU(cs);
+    CPUSysState *sys = env_sys(env);
 
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CRMD),
-                           &env->CSR_CRMD);
+    if (cpu->pmu != ON_OFF_AUTO_ON) {
+        return 0;
+    }
 
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRMD),
-                           &env->CSR_PRMD);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_EUEN),
-                           &env->CSR_EUEN);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MISC),
-                           &env->CSR_MISC);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ECFG),
-                           &env->CSR_ECFG);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ESTAT),
-                           &env->CSR_ESTAT);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ERA),
-                           &env->CSR_ERA);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_BADV),
-                           &env->CSR_BADV);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_BADI),
-                           &env->CSR_BADI);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_EENTRY),
-                           &env->CSR_EENTRY);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBIDX),
-                           &env->CSR_TLBIDX);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBEHI),
-                           &env->CSR_TLBEHI);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBELO0),
-                           &env->CSR_TLBELO0);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBELO1),
-                           &env->CSR_TLBELO1);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ASID),
-                           &env->CSR_ASID);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGDL),
-                           &env->CSR_PGDL);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGDH),
-                           &env->CSR_PGDH);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGD),
-                           &env->CSR_PGD);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PWCL),
-                           &env->CSR_PWCL);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PWCH),
-                           &env->CSR_PWCH);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_STLBPS),
-                           &env->CSR_STLBPS);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_RVACFG),
-                           &env->CSR_RVACFG);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CPUID),
-                           &env->CSR_CPUID);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG1),
-                           &env->CSR_PRCFG1);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG2),
-                           &env->CSR_PRCFG2);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG3),
-                           &env->CSR_PRCFG3);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(0)),
-                           &env->CSR_SAVE[0]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(1)),
-                           &env->CSR_SAVE[1]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(2)),
-                           &env->CSR_SAVE[2]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(3)),
-                           &env->CSR_SAVE[3]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(4)),
-                           &env->CSR_SAVE[4]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(5)),
-                           &env->CSR_SAVE[5]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(6)),
-                           &env->CSR_SAVE[6]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(7)),
-                           &env->CSR_SAVE[7]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TID),
-                           &env->CSR_TID);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CNTC),
-                           &env->CSR_CNTC);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TICLR),
-                           &env->CSR_TICLR);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_LLBCTL),
-                           &env->CSR_LLBCTL);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_IMPCTL1),
-                           &env->CSR_IMPCTL1);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_IMPCTL2),
-                           &env->CSR_IMPCTL2);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRENTRY),
-                           &env->CSR_TLBRENTRY);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRBADV),
-                           &env->CSR_TLBRBADV);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRERA),
-                           &env->CSR_TLBRERA);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRSAVE),
-                           &env->CSR_TLBRSAVE);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRELO0),
-                           &env->CSR_TLBRELO0);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRELO1),
-                           &env->CSR_TLBRELO1);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBREHI),
-                           &env->CSR_TLBREHI);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRPRMD),
-                           &env->CSR_TLBRPRMD);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(0)),
-                           &env->CSR_DMW[0]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(1)),
-                           &env->CSR_DMW[1]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(2)),
-                           &env->CSR_DMW[2]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(3)),
-                           &env->CSR_DMW[3]);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TVAL),
-                           &env->CSR_TVAL);
-
-    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TCFG),
-                           &env->CSR_TCFG);
+    for (i = 0; i < env->perf_event_num; i++) {
+        ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PERFCTRL(i)),
+                               &sys->CSR_PERFCTRL[i]);
+        ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PERFCNTR(i)),
+                               &sys->CSR_PERFCNTR[i]);
+    }
 
     return ret;
 }
 
-static int kvm_loongarch_put_csr(CPUState *cs, int level)
+static int kvm_loongarch_get_pmu(CPUState *cs)
+{
+    int i, ret = 0;
+    CPULoongArchState *env = cpu_env(cs);
+    LoongArchCPU *cpu = LOONGARCH_CPU(cs);
+    CPUSysState *sys = env_sys(env);
+
+    if (cpu->pmu != ON_OFF_AUTO_ON) {
+        return 0;
+    }
+
+    for (i = 0; i < env->perf_event_num; i++) {
+        ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PERFCTRL(i)),
+                               &sys->CSR_PERFCTRL[i]);
+        ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PERFCNTR(i)),
+                               &sys->CSR_PERFCNTR[i]);
+    }
+
+    return ret;
+}
+
+static int kvm_loongarch_get_csr(CPUState *cs)
 {
     int ret = 0;
     CPULoongArchState *env = cpu_env(cs);
+    CPUSysState *sys = env_sys(env);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CRMD),
+                           &sys->CSR_CRMD);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRMD),
+                           &sys->CSR_PRMD);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_EUEN),
+                           &sys->CSR_EUEN);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MISC),
+                           &sys->CSR_MISC);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ECFG),
+                           &sys->CSR_ECFG);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ESTAT),
+                           &sys->CSR_ESTAT);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ERA),
+                           &sys->CSR_ERA);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_BADV),
+                           &sys->CSR_BADV);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_BADI),
+                           &sys->CSR_BADI);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_EENTRY),
+                           &sys->CSR_EENTRY);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBIDX),
+                           &sys->CSR_TLBIDX);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBEHI),
+                           &sys->CSR_TLBEHI);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBELO0),
+                           &sys->CSR_TLBELO0);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBELO1),
+                           &sys->CSR_TLBELO1);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ASID),
+                           &sys->CSR_ASID);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGDL),
+                           &sys->CSR_PGDL);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGDH),
+                           &sys->CSR_PGDH);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGD),
+                           &sys->CSR_PGD);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PWCL),
+                           &sys->CSR_PWCL);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PWCH),
+                           &sys->CSR_PWCH);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_STLBPS),
+                           &sys->CSR_STLBPS);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_RVACFG),
+                           &sys->CSR_RVACFG);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CPUID),
+                           &sys->CSR_CPUID);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG1),
+                           &sys->CSR_PRCFG1);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG2),
+                           &sys->CSR_PRCFG2);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG3),
+                           &sys->CSR_PRCFG3);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(0)),
+                           &sys->CSR_SAVE[0]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(1)),
+                           &sys->CSR_SAVE[1]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(2)),
+                           &sys->CSR_SAVE[2]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(3)),
+                           &sys->CSR_SAVE[3]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(4)),
+                           &sys->CSR_SAVE[4]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(5)),
+                           &sys->CSR_SAVE[5]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(6)),
+                           &sys->CSR_SAVE[6]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(7)),
+                           &sys->CSR_SAVE[7]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TID),
+                           &sys->CSR_TID);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CNTC),
+                           &sys->CSR_CNTC);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TICLR),
+                           &sys->CSR_TICLR);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_LLBCTL),
+                           &sys->CSR_LLBCTL);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_IMPCTL1),
+                           &sys->CSR_IMPCTL1);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_IMPCTL2),
+                           &sys->CSR_IMPCTL2);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRENTRY),
+                           &sys->CSR_TLBRENTRY);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRBADV),
+                           &sys->CSR_TLBRBADV);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRERA),
+                           &sys->CSR_TLBRERA);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRSAVE),
+                           &sys->CSR_TLBRSAVE);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRELO0),
+                           &sys->CSR_TLBRELO0);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRELO1),
+                           &sys->CSR_TLBRELO1);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBREHI),
+                           &sys->CSR_TLBREHI);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRPRMD),
+                           &sys->CSR_TLBRPRMD);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(0)),
+                           &sys->CSR_DMW[0]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(1)),
+                           &sys->CSR_DMW[1]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(2)),
+                           &sys->CSR_DMW[2]);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(3)),
+                           &sys->CSR_DMW[3]);
+
+    ret |= kvm_loongarch_get_pmu(cs);
+
+    /*
+     * CSR register MSGIS getting must be put after CSR register CSR_ESTAT,
+     * Since register CSR_ESTAT will sync software pending MSGINT status to
+     * hardware register and modify HW CSR MSGIS registers.
+     */
+    if (cpu_has_msgint(env)) {
+        ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(0)),
+                               &sys->CSR_MSGIS[0]);
+
+        ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(1)),
+                               &sys->CSR_MSGIS[1]);
+
+        ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(2)),
+                               &sys->CSR_MSGIS[2]);
+
+        ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(3)),
+                               &sys->CSR_MSGIS[3]);
+    }
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TVAL),
+                           &sys->CSR_TVAL);
+
+    ret |= kvm_get_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TCFG),
+                           &sys->CSR_TCFG);
+
+    return ret;
+}
+
+static int kvm_loongarch_put_csr(CPUState *cs, KvmPutState level)
+{
+    int ret = 0;
+    CPULoongArchState *env = cpu_env(cs);
+    CPUSysState *sys = env_sys(env);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CRMD),
-                           &env->CSR_CRMD);
+                           &sys->CSR_CRMD);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRMD),
-                           &env->CSR_PRMD);
+                           &sys->CSR_PRMD);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_EUEN),
-                           &env->CSR_EUEN);
+                           &sys->CSR_EUEN);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MISC),
-                           &env->CSR_MISC);
+                           &sys->CSR_MISC);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ECFG),
-                           &env->CSR_ECFG);
+                           &sys->CSR_ECFG);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ESTAT),
-                           &env->CSR_ESTAT);
+                           &sys->CSR_ESTAT);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ERA),
-                           &env->CSR_ERA);
+                           &sys->CSR_ERA);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_BADV),
-                           &env->CSR_BADV);
+                           &sys->CSR_BADV);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_BADI),
-                           &env->CSR_BADI);
+                           &sys->CSR_BADI);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_EENTRY),
-                           &env->CSR_EENTRY);
+                           &sys->CSR_EENTRY);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBIDX),
-                           &env->CSR_TLBIDX);
+                           &sys->CSR_TLBIDX);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBEHI),
-                           &env->CSR_TLBEHI);
+                           &sys->CSR_TLBEHI);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBELO0),
-                           &env->CSR_TLBELO0);
+                           &sys->CSR_TLBELO0);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBELO1),
-                           &env->CSR_TLBELO1);
+                           &sys->CSR_TLBELO1);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_ASID),
-                           &env->CSR_ASID);
+                           &sys->CSR_ASID);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGDL),
-                           &env->CSR_PGDL);
+                           &sys->CSR_PGDL);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGDH),
-                           &env->CSR_PGDH);
+                           &sys->CSR_PGDH);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PGD),
-                           &env->CSR_PGD);
+                           &sys->CSR_PGD);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PWCL),
-                           &env->CSR_PWCL);
+                           &sys->CSR_PWCL);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PWCH),
-                           &env->CSR_PWCH);
+                           &sys->CSR_PWCH);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_STLBPS),
-                           &env->CSR_STLBPS);
+                           &sys->CSR_STLBPS);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_RVACFG),
-                           &env->CSR_RVACFG);
+                           &sys->CSR_RVACFG);
 
     /* CPUID is constant after poweron, it should be set only once */
     if (level >= KVM_PUT_FULL_STATE) {
         ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CPUID),
-                           &env->CSR_CPUID);
+                           &sys->CSR_CPUID);
     }
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG1),
-                           &env->CSR_PRCFG1);
+                           &sys->CSR_PRCFG1);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG2),
-                           &env->CSR_PRCFG2);
+                           &sys->CSR_PRCFG2);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_PRCFG3),
-                           &env->CSR_PRCFG3);
+                           &sys->CSR_PRCFG3);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(0)),
-                           &env->CSR_SAVE[0]);
+                           &sys->CSR_SAVE[0]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(1)),
-                           &env->CSR_SAVE[1]);
+                           &sys->CSR_SAVE[1]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(2)),
-                           &env->CSR_SAVE[2]);
+                           &sys->CSR_SAVE[2]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(3)),
-                           &env->CSR_SAVE[3]);
+                           &sys->CSR_SAVE[3]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(4)),
-                           &env->CSR_SAVE[4]);
+                           &sys->CSR_SAVE[4]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(5)),
-                           &env->CSR_SAVE[5]);
+                           &sys->CSR_SAVE[5]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(6)),
-                           &env->CSR_SAVE[6]);
+                           &sys->CSR_SAVE[6]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_SAVE(7)),
-                           &env->CSR_SAVE[7]);
+                           &sys->CSR_SAVE[7]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TID),
-                           &env->CSR_TID);
+                           &sys->CSR_TID);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_CNTC),
-                           &env->CSR_CNTC);
+                           &sys->CSR_CNTC);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TICLR),
-                           &env->CSR_TICLR);
+                           &sys->CSR_TICLR);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_LLBCTL),
-                           &env->CSR_LLBCTL);
+                           &sys->CSR_LLBCTL);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_IMPCTL1),
-                           &env->CSR_IMPCTL1);
+                           &sys->CSR_IMPCTL1);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_IMPCTL2),
-                           &env->CSR_IMPCTL2);
+                           &sys->CSR_IMPCTL2);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRENTRY),
-                           &env->CSR_TLBRENTRY);
+                           &sys->CSR_TLBRENTRY);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRBADV),
-                           &env->CSR_TLBRBADV);
+                           &sys->CSR_TLBRBADV);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRERA),
-                           &env->CSR_TLBRERA);
+                           &sys->CSR_TLBRERA);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRSAVE),
-                           &env->CSR_TLBRSAVE);
+                           &sys->CSR_TLBRSAVE);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRELO0),
-                           &env->CSR_TLBRELO0);
+                           &sys->CSR_TLBRELO0);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRELO1),
-                           &env->CSR_TLBRELO1);
+                           &sys->CSR_TLBRELO1);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBREHI),
-                           &env->CSR_TLBREHI);
+                           &sys->CSR_TLBREHI);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TLBRPRMD),
-                           &env->CSR_TLBRPRMD);
+                           &sys->CSR_TLBRPRMD);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(0)),
-                           &env->CSR_DMW[0]);
+                           &sys->CSR_DMW[0]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(1)),
-                           &env->CSR_DMW[1]);
+                           &sys->CSR_DMW[1]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(2)),
-                           &env->CSR_DMW[2]);
+                           &sys->CSR_DMW[2]);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_DMW(3)),
-                           &env->CSR_DMW[3]);
+                           &sys->CSR_DMW[3]);
+
+    ret |= kvm_loongarch_put_pmu(cs);
+
+    if (cpu_has_msgint(env)) {
+        ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(0)),
+                               &sys->CSR_MSGIS[0]);
+
+        ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(1)),
+                               &sys->CSR_MSGIS[1]);
+
+        ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(2)),
+                               &sys->CSR_MSGIS[2]);
+
+        ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_MSGIS(3)),
+                               &sys->CSR_MSGIS[3]);
+    }
+
     /*
      * timer cfg must be put at last since it is used to enable
      * guest timer
      */
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TVAL),
-                           &env->CSR_TVAL);
+                           &sys->CSR_TVAL);
 
     ret |= kvm_set_one_reg(cs, KVM_IOC_CSRID(LOONGARCH_CSR_TCFG),
-                           &env->CSR_TCFG);
+                           &sys->CSR_TCFG);
     return ret;
 }
 
@@ -663,11 +746,11 @@ static int kvm_loongarch_get_cpucfg(CPUState *cs)
     CPULoongArchState *env = cpu_env(cs);
 
     for (i = 0; i < 21; i++) {
-        ret = kvm_get_one_reg(cs, KVM_IOC_CPUCFG(i), &val);
-        if (ret < 0) {
-            trace_kvm_failed_get_cpucfg(strerror(errno));
+        int r = kvm_get_one_reg(cs, KVM_IOC_CPUCFG(i), &val);
+        ret |= r;
+        if (!r) {
+            env->cpucfg[i] = (uint32_t)val;
         }
-        env->cpucfg[i] = (uint32_t)val;
     }
     return ret;
 }
@@ -675,7 +758,7 @@ static int kvm_loongarch_get_cpucfg(CPUState *cs)
 static int kvm_check_cpucfg2(CPUState *cs)
 {
     int ret;
-    uint64_t val;
+    uint64_t val = 0;
     struct kvm_device_attr attr = {
         .group = KVM_LOONGARCH_VCPU_CPUCFG,
         .attr = 2,
@@ -686,8 +769,17 @@ static int kvm_check_cpucfg2(CPUState *cs)
     ret = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, &attr);
 
     if (!ret) {
-        kvm_vcpu_ioctl(cs, KVM_GET_DEVICE_ATTR, &attr);
-        env->cpucfg[2] &= val;
+        /*
+         * The &= mask is best-effort feature negotiation. If HAS succeeded,
+         * a GET failure is most likely a copy_{from,to}_user issue; warn and
+         * keep the cpucfg2 the guest already has rather than failing the sync.
+         */
+        int r = kvm_vcpu_ioctl(cs, KVM_GET_DEVICE_ATTR, &attr);
+        if (r) {
+            warn_report("CPUCFG2: KVM_GET_DEVICE_ATTR: %s", strerror(errno));
+        } else {
+            env->cpucfg[2] &= val;
+        }
 
         if (FIELD_EX32(env->cpucfg[2], CPUCFG2, FP)) {
             /* The FP minimal version is 1. */
@@ -711,16 +803,13 @@ static int kvm_loongarch_put_cpucfg(CPUState *cs)
 
     for (i = 0; i < 21; i++) {
 	if (i == 2) {
-            ret = kvm_check_cpucfg2(cs);
-            if (ret) {
-                return ret;
+            int r = kvm_check_cpucfg2(cs);
+            if (r) {
+                return r;
             }
 	}
         val = env->cpucfg[i];
-        ret = kvm_set_one_reg(cs, KVM_IOC_CPUCFG(i), &val);
-        if (ret < 0) {
-            trace_kvm_failed_put_cpucfg(strerror(errno));
-        }
+        ret |= kvm_set_one_reg(cs, KVM_IOC_CPUCFG(i), &val);
     }
     return ret;
 }
@@ -763,7 +852,7 @@ int kvm_arch_get_registers(CPUState *cs, Error **errp)
     return ret;
 }
 
-int kvm_arch_put_registers(CPUState *cs, int level, Error **errp)
+int kvm_arch_put_registers(CPUState *cs, KvmPutState level, Error **errp)
 {
     int ret;
     static int once;
@@ -931,6 +1020,24 @@ static bool kvm_feature_supported(CPUState *cs, enum loongarch_features feature)
         ret = kvm_vm_ioctl(kvm_state, KVM_HAS_DEVICE_ATTR, &attr);
         return (ret == 0);
 
+    case LOONGARCH_FEATURE_PTW:
+        attr.group = KVM_LOONGARCH_VM_FEAT_CTRL;
+        attr.attr = KVM_LOONGARCH_VM_FEAT_PTW;
+        ret = kvm_vm_ioctl(kvm_state, KVM_HAS_DEVICE_ATTR, &attr);
+        return (ret == 0);
+
+    case LOONGARCH_FEATURE_MSGINT:
+        attr.group = KVM_LOONGARCH_VM_FEAT_CTRL;
+        attr.attr = KVM_LOONGARCH_VM_FEAT_MSGINT;
+        ret = kvm_vm_ioctl(kvm_state, KVM_HAS_DEVICE_ATTR, &attr);
+        return (ret == 0);
+
+    case LOONGARCH_FEATURE_PV_PREEMPT:
+        attr.group = KVM_LOONGARCH_VM_FEAT_CTRL;
+        attr.attr = KVM_LOONGARCH_VM_FEAT_PV_PREEMPT,
+        ret = kvm_vm_ioctl(kvm_state, KVM_HAS_DEVICE_ATTR, &attr);
+        return (ret == 0);
+
     default:
         return false;
     }
@@ -1021,10 +1128,41 @@ static int kvm_cpu_check_pmu(CPUState *cs, Error **errp)
     }
 
     if (kvm_supported) {
+        /*
+         * TODO: Will add supported perf event number query interface
+         * from host, set perf event number with 4 by default
+         */
+        cpu->pmu = ON_OFF_AUTO_ON;
+        env->perf_event_num = 4;
         env->cpucfg[6] = FIELD_DP32(env->cpucfg[6], CPUCFG6, PMP, 1);
-        env->cpucfg[6] = FIELD_DP32(env->cpucfg[6], CPUCFG6, PMNUM, 3);
+        env->cpucfg[6] = FIELD_DP32(env->cpucfg[6], CPUCFG6, PMNUM,
+                                    env->perf_event_num  - 1);
         env->cpucfg[6] = FIELD_DP32(env->cpucfg[6], CPUCFG6, PMBITS, 63);
         env->cpucfg[6] = FIELD_DP32(env->cpucfg[6], CPUCFG6, UPM, 1);
+    }
+    return 0;
+}
+
+static int kvm_cpu_check_ptw(CPUState *cs, Error **errp)
+{
+    LoongArchCPU *cpu = LOONGARCH_CPU(cs);
+    CPULoongArchState *env = cpu_env(cs);
+    bool kvm_supported;
+
+    env->cpucfg[2] = FIELD_DP32(env->cpucfg[2], CPUCFG2, HPTW, 0);
+    kvm_supported = kvm_feature_supported(cs, LOONGARCH_FEATURE_PTW);
+    if (cpu->ptw == ON_OFF_AUTO_ON) {
+        if (!kvm_supported) {
+            error_setg(errp, "'ptw' feature not supported by KVM on the host");
+            return -ENOTSUP;
+        }
+    } else if (cpu->ptw != ON_OFF_AUTO_AUTO) {
+        /* disable pmu if ON_OFF_AUTO_OFF is set */
+        kvm_supported = false;
+    }
+
+    if (kvm_supported) {
+        env->cpucfg[2] = FIELD_DP32(env->cpucfg[2], CPUCFG2, HPTW, 1);
     }
     return 0;
 }
@@ -1064,6 +1202,21 @@ static int kvm_cpu_check_pv_features(CPUState *cs, Error **errp)
         env->pv_features |= BIT(KVM_FEATURE_STEAL_TIME);
     }
 
+    kvm_supported = kvm_feature_supported(cs, LOONGARCH_FEATURE_PV_PREEMPT);
+    if (cpu->kvm_pv_preempt == ON_OFF_AUTO_ON) {
+        if (!kvm_supported) {
+            error_setg(errp, "'pv preempt' feature not supported by KVM host");
+            return -ENOTSUP;
+        }
+    } else if (cpu->kvm_pv_preempt != ON_OFF_AUTO_AUTO) {
+        kvm_supported = false;
+    }
+
+    /* Feature preempt_hint depends on steal_time */
+    if (kvm_supported && (cpu->kvm_pv_preempt == ON_OFF_AUTO_ON)) {
+        env->pv_features |= BIT(KVM_FEATURE_PREEMPT);
+     }
+
     if (object_dynamic_cast(OBJECT(ms), TYPE_LOONGARCH_VIRT_MACHINE)) {
         LoongArchVirtMachineState *lvms = LOONGARCH_VIRT_MACHINE(ms);
 
@@ -1071,15 +1224,99 @@ static int kvm_cpu_check_pv_features(CPUState *cs, Error **errp)
             env->pv_features |= BIT(KVM_FEATURE_VIRT_EXTIOI);
         }
     }
+    return 0;
+}
+
+static int kvm_cpu_check_msgint(CPUState *cs, Error **errp)
+{
+    CPULoongArchState *env = cpu_env(cs);
+    LoongArchCPU *cpu = LOONGARCH_CPU(cs);
+    bool kvm_supported;
+
+    kvm_supported = kvm_feature_supported(cs, LOONGARCH_FEATURE_MSGINT);
+    env->cpucfg[1] = FIELD_DP32(env->cpucfg[1], CPUCFG1, MSG_INT, 0);
+    if (cpu->msgint == ON_OFF_AUTO_ON) {
+        if (kvm_supported) {
+            env->cpucfg[1] = FIELD_DP32(env->cpucfg[1], CPUCFG1, MSG_INT, 1);
+        } else {
+            error_setg(errp, "'msgint' feature not supported by KVM on this host");
+            return -ENOTSUP;
+        }
+    } else if ((cpu->msgint == ON_OFF_AUTO_AUTO) && kvm_supported) {
+        env->cpucfg[1] = FIELD_DP32(env->cpucfg[1], CPUCFG1, MSG_INT, 1);
+    }
 
     return 0;
 }
 
-int kvm_arch_init_vcpu(CPUState *cs)
+/* Check LoongArch Instruction Set 1.1 others feature */
+static int kvm_cpu_check_misc_v1_1(CPUState *cs, Error **errp)
+{
+    int ret;
+    uint64_t val, field;
+    struct kvm_device_attr attr;
+    LoongArchCPU *cpu = LOONGARCH_CPU(cs);
+    uint32_t data;
+
+    val = 0;
+    attr.group = KVM_LOONGARCH_VCPU_CPUCFG;
+    attr.attr  = 2;
+    attr.addr  = (uint64_t)&val;
+    ret = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, &attr);
+    if (!ret) {
+        ret = kvm_vcpu_ioctl(cs, KVM_GET_DEVICE_ATTR, &attr);
+    }
+
+    /* Disable LA 1.1 features if host cpucfg2 get not supported */
+    if (ret) {
+        val = 0;
+    }
+
+    data = cpu->env.cpucfg[2];
+    val &= data;
+    field = FIELD_EX32((uint32_t)val, CPUCFG2, FRECIPE);
+    data  = FIELD_DP32(data, CPUCFG2, FRECIPE, field);
+    field = FIELD_EX32((uint32_t)val, CPUCFG2, LAM_BH);
+    data = FIELD_DP32(data, CPUCFG2, LAM_BH, field);
+    field = FIELD_EX32((uint32_t)val, CPUCFG2, LAMCAS);
+    data = FIELD_DP32(data, CPUCFG2, LAMCAS, field);
+    field = FIELD_EX32((uint32_t)val, CPUCFG2, LLACQ_SCREL);
+    data = FIELD_DP32(data, CPUCFG2, LLACQ_SCREL, field);
+    field = FIELD_EX32((uint32_t)val, CPUCFG2, SCQ);
+    data = FIELD_DP32(data, CPUCFG2, SCQ, field);
+    cpu->env.cpucfg[2] = data;
+
+    val = 0;
+    attr.group = KVM_LOONGARCH_VCPU_CPUCFG;
+    attr.attr  = 3;
+    attr.addr  = (uint64_t)&val;
+    ret = kvm_vcpu_ioctl(cs, KVM_HAS_DEVICE_ATTR, &attr);
+    if (!ret) {
+        ret = kvm_vcpu_ioctl(cs, KVM_GET_DEVICE_ATTR, &attr);
+    }
+
+    /* Disable LA 1.1 features if host cpucfg3 get not supported */
+    if (ret) {
+        val = 0;
+    }
+
+    data = cpu->env.cpucfg[3];
+    val &= data;
+    field = FIELD_EX32((uint32_t)val, CPUCFG3, DBAR_HINTS);
+    data  = FIELD_DP32(data, CPUCFG3, DBAR_HINTS, field);
+    cpu->env.cpucfg[3] = data;
+    return 0;
+}
+
+int kvm_arch_pre_create_vcpu(CPUState *cpu, Error **errp)
+{
+    return 0;
+}
+
+int kvm_arch_init_vcpu(CPUState *cs, Error **errp)
 {
     uint64_t val;
     int ret;
-    Error *local_err = NULL;
     LoongArchCPU *cpu = LOONGARCH_CPU(cs);
 
     cpu->vmsentry = qemu_add_vm_change_state_handler(
@@ -1089,33 +1326,43 @@ int kvm_arch_init_vcpu(CPUState *cs)
         brk_insn = val;
     }
 
-    ret = kvm_cpu_check_lsx(cs, &local_err);
+    ret = kvm_cpu_check_lsx(cs, errp);
     if (ret < 0) {
-        error_report_err(local_err);
         return ret;
     }
 
-    ret = kvm_cpu_check_lasx(cs, &local_err);
+    ret = kvm_cpu_check_lasx(cs, errp);
     if (ret < 0) {
-        error_report_err(local_err);
         return ret;
     }
 
-    ret = kvm_cpu_check_lbt(cs, &local_err);
+    ret = kvm_cpu_check_lbt(cs, errp);
     if (ret < 0) {
-        error_report_err(local_err);
         return ret;
     }
 
-    ret = kvm_cpu_check_pmu(cs, &local_err);
+    ret = kvm_cpu_check_pmu(cs, errp);
     if (ret < 0) {
-        error_report_err(local_err);
         return ret;
     }
 
-    ret = kvm_cpu_check_pv_features(cs, &local_err);
+    ret = kvm_cpu_check_pv_features(cs, errp);
     if (ret < 0) {
-        error_report_err(local_err);
+        return ret;
+    }
+
+    ret = kvm_cpu_check_ptw(cs, errp);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = kvm_cpu_check_msgint(cs, errp);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = kvm_cpu_check_misc_v1_1(cs, errp);
+    if (ret < 0) {
         return ret;
     }
 
@@ -1170,6 +1417,18 @@ static void kvm_steal_time_set(Object *obj, bool value, Error **errp)
     cpu->kvm_steal_time = value ? ON_OFF_AUTO_ON : ON_OFF_AUTO_OFF;
 }
 
+static bool kvm_pv_preempt_get(Object *obj, Error **errp)
+{
+    return LOONGARCH_CPU(obj)->kvm_pv_preempt != ON_OFF_AUTO_OFF;
+}
+
+static void kvm_pv_preempt_set(Object *obj, bool value, Error **errp)
+{
+    LoongArchCPU *cpu = LOONGARCH_CPU(obj);
+
+    cpu->kvm_pv_preempt = value ? ON_OFF_AUTO_ON : ON_OFF_AUTO_OFF;
+}
+
 void kvm_loongarch_cpu_post_init(LoongArchCPU *cpu)
 {
     cpu->lbt = ON_OFF_AUTO_AUTO;
@@ -1195,6 +1454,12 @@ void kvm_loongarch_cpu_post_init(LoongArchCPU *cpu)
                              kvm_steal_time_set);
     object_property_set_description(OBJECT(cpu), "kvm-steal-time",
                                     "Set off to disable KVM steal time.");
+
+    cpu->kvm_pv_preempt = ON_OFF_AUTO_OFF;
+    object_property_add_bool(OBJECT(cpu), "kvm-pv-preempt", kvm_pv_preempt_get,
+                             kvm_pv_preempt_set);
+    object_property_set_description(OBJECT(cpu), "kvm-pv-preempt",
+                                    "Set off to disable KVM paravirt preempt.");
 }
 
 int kvm_arch_destroy_vcpu(CPUState *cs)
@@ -1236,6 +1501,22 @@ void kvm_arch_init_irq_routing(KVMState *s)
 {
 }
 
+void kvm_loongarch_init_irq_routing(void)
+{
+    int i;
+
+    kvm_async_interrupts_allowed = true;
+    kvm_msi_via_irqfd_allowed = kvm_irqfds_enabled();
+    if (kvm_has_gsi_routing()) {
+        for (i = 0; i < KVM_IRQCHIP_NUM_PINS; ++i) {
+            kvm_irqchip_add_irq_route(kvm_state, i, 0, i);
+        }
+
+        kvm_gsi_routing_allowed = true;
+        kvm_irqchip_commit_routes(kvm_state);
+    }
+}
+
 int kvm_arch_get_default_type(MachineState *ms)
 {
     return 0;
@@ -1249,7 +1530,12 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
 
 int kvm_arch_irqchip_create(KVMState *s)
 {
-    return 0;
+    if (kvm_kernel_irqchip_split()) {
+        error_report("kernel_irqchip=split is not supported on LoongArch");
+        exit(1);
+    }
+
+    return kvm_check_extension(s, KVM_CAP_DEVICE_CTRL);
 }
 
 void kvm_arch_pre_run(CPUState *cs, struct kvm_run *run)
@@ -1301,17 +1587,19 @@ int kvm_arch_remove_sw_breakpoint(CPUState *cs, struct kvm_sw_breakpoint *bp)
     return 0;
 }
 
-int kvm_arch_insert_hw_breakpoint(vaddr addr, vaddr len, int type)
+int kvm_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
+                                          GdbBreakpointType type)
 {
     return -ENOSYS;
 }
 
-int kvm_arch_remove_hw_breakpoint(vaddr addr, vaddr len, int type)
+int kvm_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
+                                          GdbBreakpointType type)
 {
     return -ENOSYS;
 }
 
-void kvm_arch_remove_all_hw_breakpoints(void)
+void kvm_arch_remove_all_gdbstub_hw_breakpoints(void)
 {
 }
 
@@ -1321,7 +1609,7 @@ static bool kvm_loongarch_handle_debug(CPUState *cs, struct kvm_run *run)
     CPULoongArchState *env = &cpu->env;
 
     kvm_cpu_synchronize_state(cs);
-    if (cs->singlestep_enabled) {
+    if (cpu_single_stepping(cs)) {
         return true;
     }
 

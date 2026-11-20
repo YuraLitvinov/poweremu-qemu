@@ -1,0 +1,255 @@
+/*
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HEXAGON_SYS_MACROS_H
+#define HEXAGON_SYS_MACROS_H
+
+/*
+ * Macro definitions for Hexagon system mode
+ */
+
+#ifndef CONFIG_USER_ONLY
+
+#include "system/physmem.h"
+
+#ifdef QEMU_GENERATE
+#define GET_SSR_FIELD(RES, FIELD) \
+    GET_FIELD(RES, FIELD, hex_t_sreg[HEX_SREG_SSR])
+#else
+
+#define GET_SSR_FIELD(FIELD, REGIN) \
+    (uint32_t)GET_FIELD(FIELD, REGIN)
+#define GET_SYSCFG_FIELD(FIELD, REGIN) \
+    (uint32_t)GET_FIELD(FIELD, REGIN)
+#define SET_SYSTEM_FIELD(ENV, REG, FIELD, VAL) \
+    do { \
+        HexagonCPU *_sf_cpu = env_archcpu(ENV); \
+        uint32_t regval; \
+        if ((REG) < HEX_SREG_GLB_START) { \
+            regval = (ENV)->t_sreg[(REG)]; \
+        } else { \
+            regval = _sf_cpu->globalregs ? \
+                hexagon_globalreg_read(_sf_cpu->globalregs, (REG), \
+                                       (ENV)->threadId) : 0; \
+        } \
+        fINSERT_BITS(regval, reg_field_info[FIELD].width, \
+                     reg_field_info[FIELD].offset, (VAL)); \
+        if ((REG) < HEX_SREG_GLB_START) { \
+            (ENV)->t_sreg[(REG)] = regval; \
+        } else if (_sf_cpu->globalregs) { \
+            hexagon_globalreg_write(_sf_cpu->globalregs, (REG), regval, \
+                                    (ENV)->threadId); \
+        } \
+    } while (0)
+#define SET_SSR_FIELD(ENV, FIELD, VAL) \
+    SET_SYSTEM_FIELD(ENV, HEX_SREG_SSR, FIELD, VAL)
+#define SET_SYSCFG_FIELD(ENV, FIELD, VAL) \
+    SET_SYSTEM_FIELD(ENV, HEX_SREG_SYSCFG, FIELD, VAL)
+
+#define CCR_FIELD_SET(ENV, FIELD) \
+    (!!GET_FIELD(FIELD, (ENV)->t_sreg[HEX_SREG_CCR]))
+
+#endif
+
+#define fREAD_ELR() (env->t_sreg[HEX_SREG_ELR])
+
+#define fLOAD_PHYS(NUM, SIZE, SIGN, SRC1, SRC2, DST) { \
+  const uintptr_t rs = ((unsigned long)(unsigned)(SRC1)) & 0x7ff; \
+  const uintptr_t rt = ((unsigned long)(unsigned)(SRC2)) << 11; \
+  const uintptr_t addr = rs + rt;         \
+  physical_memory_read(addr, &DST, sizeof(uint32_t)); \
+}
+
+#define fPOW2_HELP_ROUNDUP(VAL) \
+    ((VAL) | \
+     ((VAL) >> 1) | \
+     ((VAL) >> 2) | \
+     ((VAL) >> 4) | \
+     ((VAL) >> 8) | \
+     ((VAL) >> 16))
+#define fPOW2_ROUNDUP(VAL) (fPOW2_HELP_ROUNDUP((VAL) - 1) + 1)
+
+#define fTRAP(TRAPTYPE, IMM) \
+    register_trap_exception(env, TRAPTYPE, IMM, PC)
+
+#ifdef QEMU_GENERATE
+#define fFRAMECHECK(ADDR, EA) gen_framecheck(ctx, ADDR, EA)
+#endif
+
+#define fVIRTINSN_SPSWAP(IMM, REG) \
+    do { \
+        if (GET_FIELD(GSR_UM, env->greg[HEX_GREG_GSR])) { \
+            uint32_t tmp = (REG); \
+            (REG) = env->greg[HEX_GREG_GOSP]; \
+            env->greg[HEX_GREG_GOSP] = tmp; \
+        } \
+        env->gpr[HEX_REG_PC] = next_PC; \
+    } while (0)
+#define fVIRTINSN_GETIE(IMM, REG) \
+    do { \
+        (REG) = CCR_FIELD_SET(env, CCR_GIE); \
+        env->gpr[HEX_REG_PC] = next_PC; \
+    } while (0)
+#define fVIRTINSN_SETIE(IMM, REG) \
+    do { \
+        uint32_t old_gie = CCR_FIELD_SET(env, CCR_GIE); \
+        uint32_t new_gie = (REG) & 1; \
+        SET_SYSTEM_FIELD(env, HEX_SREG_CCR, CCR_GIE, new_gie); \
+        (REG) = old_gie; \
+        env->gpr[HEX_REG_PC] = next_PC; \
+    } while (0)
+#define fVIRTINSN_RTE(IMM, REG) hexagon_vmrte(env)
+#define fGRE_ENABLED() \
+    GET_FIELD(CCR_GRE, env->t_sreg[HEX_SREG_CCR])
+/* Virtual instructions execute only in guest mode. */
+#define fTRAP1_VIRTINSN(IMM) \
+    (get_cpu_mode(env) == HEX_CPU_MODE_GUEST && fGRE_ENABLED() && \
+        (((IMM) == 1) || ((IMM) == 3) || ((IMM) == 4) || \
+         ((IMM) == 6)))
+
+/* Not modeled in qemu */
+
+#define MARK_LATE_PRED_WRITE(RNUM)
+#define fICINVIDX(REG)
+#define fICKILL()
+#define fDCKILL()
+#define fL2KILL()
+#define fL2UNLOCK()
+#define fL2CLEAN()
+#define fL2CLEANINV()
+#define fL2CLEANPA(REG)
+#define fL2CLEANINVPA(REG)
+#define fL2CLEANINVIDX(REG)
+#define fL2CLEANIDX(REG)
+#define fL2INVIDX(REG)
+#define fL2TAGR(INDEX, DST, DSTREG)
+#define fL2UNLOCKA(VA) ((void) VA)
+#define fL2TAGW(INDEX, PART2)
+#define fDCCLEANIDX(REG)
+#define fDCCLEANINVIDX(REG)
+
+/* Always succeed: */
+#define fL2LOCKA(EA, PDV, PDN) ((void) EA, PDV = 0xFF)
+#define fCLEAR_RTE_EX() \
+    do { \
+        uint32_t tmp = env->t_sreg[HEX_SREG_SSR]; \
+        fINSERT_BITS(tmp, reg_field_info[SSR_EX].width, \
+                     reg_field_info[SSR_EX].offset, 0); \
+        log_sreg_write(env, HEX_SREG_SSR, tmp, slot); \
+    } while (0)
+
+#define fDCINVIDX(REG)
+#define fDCINVA(REG) do { REG = REG; } while (0) /* Nothing to do in qemu */
+
+#define fSET_TLB_LOCK()       hex_tlb_lock(env, PC);
+#define fCLEAR_TLB_LOCK()     hex_tlb_unlock(env);
+
+#define fSET_K0_LOCK()        hex_k0_lock(env, PC);
+#define fCLEAR_K0_LOCK()      hex_k0_unlock(env);
+
+#define fTLB_IDXMASK(INDEX) \
+    ((INDEX) & (fPOW2_ROUNDUP( \
+        fCAST4u(hexagon_tlb_get_num_entries(env_archcpu(env)->tlb))) - 1))
+
+#define fTLB_NONPOW2WRAP(INDEX) \
+    (((INDEX) >= hexagon_tlb_get_num_entries(env_archcpu(env)->tlb)) ? \
+         ((INDEX) - hexagon_tlb_get_num_entries(env_archcpu(env)->tlb)) : \
+         (INDEX))
+
+
+#define fTLBW(INDEX, VALUE) \
+    hex_tlbw(env, (INDEX), (VALUE))
+#define fTLBW_EXTENDED(INDEX, VALUE) \
+    hex_tlbw(env, (INDEX), (VALUE))
+#define fTLB_ENTRY_OVERLAP(VALUE) \
+    (hex_tlb_check_overlap(env, VALUE, -1) != -2)
+#define fTLB_ENTRY_OVERLAP_IDX(VALUE) \
+    hex_tlb_check_overlap(env, VALUE, -1)
+#define fTLBR(INDEX) \
+    hexagon_tlb_read(env_archcpu(env)->tlb, \
+                     fTLB_NONPOW2WRAP(fTLB_IDXMASK(INDEX)))
+#define fTLBR_EXTENDED(INDEX) \
+    hexagon_tlb_read(env_archcpu(env)->tlb, \
+                     fTLB_NONPOW2WRAP(fTLB_IDXMASK(INDEX)))
+#define fTLBP(TLBHI) \
+    hex_tlb_lookup(env, ((TLBHI) >> 12), ((TLBHI) << 12))
+#define fTLBPP(TLBHI) ({ \
+    qemu_log_mask(LOG_UNIMP, "tlbpp is not implemented\n"); \
+    0; })
+#define iic_flush_cache(p)
+
+#define fIN_DEBUG_MODE(TNUM) ({ \
+    HexagonCPU *_cpu = env_archcpu(env); \
+    bool _is_v81 = _cpu->cfg.hex_def->hex_version >= HEX_VER_V81; \
+    uint32_t _isdbst = _cpu->globalregs ? \
+        hexagon_globalreg_read(_cpu->globalregs, \
+                                _is_v81 ? HEX_SREG_ISDBST2 : HEX_SREG_ISDBST, \
+                                env->threadId) : 0; \
+    ((_is_v81 ? \
+      GET_FIELD(ISDBST2_DEBUGMODE, _isdbst) : \
+      GET_FIELD(ISDBST_DEBUGMODE, _isdbst)) \
+        & (0x1 << (TNUM))) != 0; })
+
+#define fIN_DEBUG_MODE_NO_ISDB(TNUM) false
+#define fIN_DEBUG_MODE_WARN(TNUM) false
+
+#ifdef QEMU_GENERATE
+
+/*
+ * Read tags back as zero for now:
+ *
+ * tag value in RD[31:10] for 32k, RD[31:9] for 16k
+ */
+#define fICTAGR(RS, RD, RD2) \
+    do { \
+        RD = ctx->zero; \
+    } while (0)
+#define fICTAGW(RS, RD)
+#define fICDATAR(RS, RD) \
+    do { \
+        RD = ctx->zero; \
+    } while (0)
+#define fICDATAW(RS, RD)
+
+#define fDCTAGW(RS, RT)
+/* tag: RD[23:0], state: RD[30:29] */
+#define fDCTAGR(INDEX, DST, DST_REG_NUM) \
+    do { \
+        DST = ctx->zero; \
+    } while (0)
+#else
+
+/*
+ * Read tags back as zero for now:
+ *
+ * tag value in RD[31:10] for 32k, RD[31:9] for 16k
+ */
+#define fICTAGR(RS, RD, RD2) \
+    do { \
+        RD = 0x00; \
+    } while (0)
+#define fICTAGW(RS, RD)
+#define fICDATAR(RS, RD) \
+    do { \
+        RD = 0x00; \
+    } while (0)
+#define fICDATAW(RS, RD)
+
+#define fDCTAGW(RS, RT)
+/* tag: RD[23:0], state: RD[30:29] */
+#define fDCTAGR(INDEX, DST, DST_REG_NUM) \
+    do { \
+        DST = 0; \
+    } while (0)
+#endif
+
+#endif
+
+#define NUM_TLB_REGS(x) (hexagon_tlb_get_num_entries(env_archcpu(env)->tlb))
+
+#define fDO_NMI(THREAD_MASK) hexagon_nmi(env, THREAD_MASK)
+
+#endif

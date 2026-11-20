@@ -22,17 +22,14 @@
 typedef enum X86OpType {
     X86_TYPE_None,
 
-    X86_TYPE_A, /* Implicit */
     X86_TYPE_B, /* VEX.vvvv selects a GPR */
     X86_TYPE_C, /* REG in the modrm byte selects a control register */
     X86_TYPE_D, /* REG in the modrm byte selects a debug register */
     X86_TYPE_E, /* ALU modrm operand */
-    X86_TYPE_F, /* EFLAGS/RFLAGS */
     X86_TYPE_G, /* REG in the modrm byte selects a GPR */
     X86_TYPE_H, /* For AVX, VEX.vvvv selects an XMM/YMM register */
     X86_TYPE_I, /* Immediate */
     X86_TYPE_J, /* Relative offset for a jump */
-    X86_TYPE_L, /* The upper 4 bits of the immediate select a 128-bit register */
     X86_TYPE_M, /* modrm byte selects a memory operand */
     X86_TYPE_N, /* R/M in the modrm byte selects an MMX register */
     X86_TYPE_O, /* Absolute address encoded in the instruction */
@@ -43,8 +40,6 @@ typedef enum X86OpType {
     X86_TYPE_U, /* R/M in the modrm byte selects an XMM/YMM register */
     X86_TYPE_V, /* reg in the modrm byte selects an XMM/YMM register */
     X86_TYPE_W, /* XMM/YMM modrm operand */
-    X86_TYPE_X, /* string source */
-    X86_TYPE_Y, /* string destination */
 
     /* Custom */
     X86_TYPE_EM, /* modrm byte selects an ALU memory operand */
@@ -53,6 +48,7 @@ typedef enum X86OpType {
     X86_TYPE_nop, /* modrm operand decoded but not loaded into s->T{0,1} */
     X86_TYPE_2op, /* 2-operand RMW instruction */
     X86_TYPE_LoBits, /* encoded in bits 0-2 of the operand + REX.B */
+    X86_TYPE_ZERO, /* Constant zero, for CFCMOV */
     X86_TYPE_0, /* Hard-coded GPRs (RAX..RDI) */
     X86_TYPE_1,
     X86_TYPE_2,
@@ -77,15 +73,11 @@ typedef enum X86OpSize {
     X86_SIZE_d,  /* 32-bit */
     X86_SIZE_dq, /* SSE/AVX 128-bit */
     X86_SIZE_p,  /* Far pointer */
-    X86_SIZE_pd, /* SSE/AVX packed double precision */
-    X86_SIZE_pi, /* MMX */
-    X86_SIZE_ps, /* SSE/AVX packed single precision */
     X86_SIZE_q,  /* 64-bit */
     X86_SIZE_qq, /* AVX 256-bit */
     X86_SIZE_s,  /* Descriptor */
     X86_SIZE_sd, /* SSE/AVX scalar double precision */
     X86_SIZE_ss, /* SSE/AVX scalar single precision */
-    X86_SIZE_si, /* 32-bit GPR */
     X86_SIZE_v,  /* 16/32/64-bit, based on operand size */
     X86_SIZE_w,  /* 16-bit */
     X86_SIZE_x,  /* 128/256-bit, based on operand size */
@@ -148,6 +140,12 @@ typedef enum X86OpUnit {
     X86_OP_MMX,     /* address in either s->ptrX or s->A0 depending on has_ea */
 } X86OpUnit;
 
+typedef enum X86OpExt {
+    X86_EXT_None,
+    X86_EXT_Signed,
+    X86_EXT_Unsigned,
+} X86OpExt;
+
 typedef enum X86InsnCheck {
     /* Illegal or exclusive to 64-bit mode */
     X86_CHECK_i64 = 1,
@@ -181,6 +179,15 @@ typedef enum X86InsnCheck {
     /* Vendor-specific checks for Intel/AMD differences */
     X86_CHECK_i64_amd = 2048,
     X86_CHECK_o64_intel = 4096,
+
+    /* No REX2 prefix allowed */
+    X86_CHECK_no_rex2 = 8192,
+
+    /* No 0x67 prefix allowed */
+    X86_CHECK_no_adr = 16384,
+
+    /* EVEX.NF bit not allowed */
+    X86_CHECK_nf0 = 32768,
 } X86InsnCheck;
 
 typedef enum X86InsnSpecial {
@@ -226,12 +233,14 @@ typedef enum X86InsnSpecial {
      */
     X86_SPECIAL_MMX,
 
-    /* When loaded into s->T0, register operand 1 is zero/sign extended.  */
-    X86_SPECIAL_SExtT0,
-    X86_SPECIAL_ZExtT0,
-
     /* Memory operand size of MOV from segment register is MO_16 */
     X86_SPECIAL_Op0_Mw,
+
+    /*
+     * If the address uses ESP as the base register, use the value
+     * of ESP after the pop.
+     */
+    X86_SPECIAL_PopESP,
 } X86InsnSpecial;
 
 /*
@@ -242,6 +251,11 @@ typedef enum X86InsnSpecial {
  * section of the manual.
  */
 typedef enum X86VEXSpecial {
+    X86_VEX_None,
+
+    /* SSE and AVX instructions use different encoding */
+    X86_VEX_SSEOnly,
+
     /* Legacy SSE instructions that allow unaligned operands */
     X86_VEX_SSEUnaligned,
 
@@ -261,8 +275,21 @@ typedef enum X86VEXSpecial {
      * operands, and thus handled by decode_op_size.
      */
     X86_VEX_AVX2_256,
+
+    /*
+     * Instructions that do not care about VEX.L; used for scalar operands, because
+     * they *should* be used only with VEX.L=0 but may accept VEX.L=1 on some machines.
+     */
+    X86_VEX_LIG,
 } X86VEXSpecial;
 
+typedef enum X86EVEXClass {
+    /* Non-vector instruction that can use APX EGPRs.  */
+    X86_EVEX_APX = 128,
+    X86_EVEX_APX_cmp = 129,
+    X86_EVEX_APX_pp2 = 130,
+    X86_EVEX_APX_zu = 131,
+} X86EVEXClass;
 
 typedef struct X86OpEntry  X86OpEntry;
 typedef struct X86DecodedInsn X86DecodedInsn;
@@ -292,6 +319,10 @@ struct X86OpEntry {
     X86OpSize    s3:8;
 
     X86InsnSpecial special:8;
+    X86OpExt     ext0:2;
+    X86OpExt     ext1:2;
+    X86OpExt     ext2:2;
+    unsigned     :2;
     X86CPUIDFeature cpuid:8;
     unsigned     vex_class:8;
     X86VEXSpecial vex_special:8;
@@ -306,6 +337,7 @@ typedef struct X86DecodedOp {
     int8_t n;
     MemOp ot;     /* For b/c/d/p/s/q/v/w/y/z */
     X86OpUnit unit;
+    X86OpExt ext;
     bool has_ea;
     int offset;   /* For MMX and SSE */
 

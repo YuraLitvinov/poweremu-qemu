@@ -20,7 +20,6 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
-#include "exec/tb-flush.h"
 #include "exec/helper-proto.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -28,22 +27,17 @@
 
 
 /* PALcode support special instructions */
-void helper_tbia(CPUAlphaState *env)
+void HELPER(tbia)(CPUAlphaState *env)
 {
     tlb_flush(env_cpu(env));
 }
 
-void helper_tbis(CPUAlphaState *env, uint64_t p)
+void HELPER(tbis)(CPUAlphaState *env, uint64_t p)
 {
     tlb_flush_page(env_cpu(env), p);
 }
 
-void helper_tb_flush(CPUAlphaState *env)
-{
-    tb_flush(env_cpu(env));
-}
-
-void helper_halt(uint64_t restart)
+void HELPER(halt)(uint64_t restart)
 {
     if (restart) {
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
@@ -52,17 +46,17 @@ void helper_halt(uint64_t restart)
     }
 }
 
-uint64_t helper_get_vmtime(void)
+uint64_t HELPER(get_vmtime)(void)
 {
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
-uint64_t helper_get_walltime(void)
+uint64_t HELPER(get_walltime)(void)
 {
     return qemu_clock_get_ns(rtc_clock);
 }
 
-void helper_set_alarm(CPUAlphaState *env, uint64_t expire)
+void HELPER(set_alarm)(CPUAlphaState *env, uint64_t expire)
 {
     AlphaCPU *cpu = env_archcpu(env);
 
@@ -72,4 +66,9 @@ void helper_set_alarm(CPUAlphaState *env, uint64_t expire)
     } else {
         timer_del(cpu->alarm_timer);
     }
+}
+
+uint64_t HELPER(whami)(CPUAlphaState *env)
+{
+    return env_cpu(env)->cpu_index;
 }

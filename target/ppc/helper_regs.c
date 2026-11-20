@@ -27,6 +27,7 @@
 #include "power8-pmu.h"
 #include "cpu-models.h"
 #include "spr_common.h"
+#include "internal.h"
 
 /* Swap temporary saved registers with GPRs */
 void hreg_swap_gpr_tgpr(CPUPPCState *env)
@@ -181,17 +182,12 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
     if (env->spr[SPR_LPCR] & LPCR_GTSE) {
         hflags |= 1 << HFLAGS_GTSE;
     }
-    /*
-     * The FPSCR state in which the A-form FP ops run inline on the host
-     * FPU (see native_fp_op() in translate/fp-impl.c.inc).  Only
-     * ppc_store_fpscr() changes these bits, and it recomputes hflags.
-     */
-    if (!(env->fpscr & (FP_VE | FP_OE | FP_UE | FP_ZE | FP_XE |
-                        FP_NI | FP_RN))) {
-        hflags |= 1 << HFLAGS_FP_FAST;
-    }
     if (env->spr[SPR_LPCR] & LPCR_HR) {
         hflags |= 1 << HFLAGS_HR;
+    }
+    if (unlikely(ppc_flags & POWERPC_FLAG_PPE42)) {
+        /* PPE42 has a single address space and no problem state */
+        msr = 0;
     }
 
 #ifndef CONFIG_USER_ONLY
@@ -264,26 +260,26 @@ void hreg_update_pmu_hflags(CPUPPCState *env)
     env->hflags |= hreg_compute_pmu_hflags_value(env);
 }
 
-#ifdef CONFIG_DEBUG_TCG
-void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
-                          uint64_t *cs_base, uint32_t *flags)
+#ifdef CONFIG_TCG
+TCGTBCPUState ppc_get_tb_cpu_state(CPUState *cs)
 {
+    CPUPPCState *env = cpu_env(cs);
     uint32_t hflags_current = env->hflags;
-    uint32_t hflags_rebuilt;
 
-    *pc = env->nip;
-    *cs_base = ppc_tb_cs_base(env);
-    *flags = hflags_current;
-
-    hflags_rebuilt = hreg_compute_hflags_value(env);
+#ifdef CONFIG_DEBUG_TCG
+    uint32_t hflags_rebuilt = hreg_compute_hflags_value(env);
     if (unlikely(hflags_current != hflags_rebuilt)) {
         cpu_abort(env_cpu(env),
                   "TCG hflags mismatch (current:0x%08x rebuilt:0x%08x)\n",
                   hflags_current, hflags_rebuilt);
     }
-}
 #endif
 
+    return (TCGTBCPUState){ .pc = env->nip, .flags = hflags_current };
+}
+#endif /* CONFIG_TCG */
+
+#ifndef CONFIG_USER_ONLY
 void cpu_interrupt_exittb(CPUState *cs)
 {
     /*
@@ -295,6 +291,7 @@ void cpu_interrupt_exittb(CPUState *cs)
         cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
     }
 }
+#endif
 
 int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
 {
@@ -316,9 +313,6 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
         value &= ~(1 << MSR_ME);
         value |= env->msr & (1 << MSR_ME);
     }
-    if ((value ^ env->msr) & (R_MSR_IR_MASK | R_MSR_DR_MASK)) {
-        cpu_interrupt_exittb(cs);
-    }
     if ((env->mmu_model == POWERPC_MMU_BOOKE ||
          env->mmu_model == POWERPC_MMU_BOOKE206) &&
         ((value ^ env->msr) & R_MSR_GS_MASK)) {
@@ -329,8 +323,14 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
         /* Swap temporary saved registers with GPRs */
         hreg_swap_gpr_tgpr(env);
     }
-    if (unlikely((value ^ env->msr) & R_MSR_EP_MASK)) {
-        env->excp_prefix = FIELD_EX64(value, MSR, EP) * 0xFFF00000;
+    /* PPE42 uses IR, DR and EP MSR bits for other purposes */
+    if (likely(!(env->flags & POWERPC_FLAG_PPE42))) {
+        if ((value ^ env->msr) & (R_MSR_IR_MASK | R_MSR_DR_MASK)) {
+            cpu_interrupt_exittb(cs);
+        }
+        if (unlikely((value ^ env->msr) & R_MSR_EP_MASK)) {
+            env->excp_prefix = FIELD_EX64(value, MSR, EP) * 0xFFF00000;
+        }
     }
     /*
      * If PR=1 then EE, IR and DR must be 1
@@ -381,45 +381,14 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
-        env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
-        env->tlb_flush_npages = 0;
         tlb_flush_all_cpus_synced(cs);
-        ppc_mmu_slots_reset(env);
         return;
     }
 
     /* Then handle local ones */
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
-        env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
-        env->tlb_flush_npages = 0;
         tlb_flush(cs);
-        ppc_mmu_slots_reset(env);
-        return;
-    }
-
-    /*
-     * Otherwise only the pages tlbie named have to go, in every segment:
-     * tlbie ignores the segment number, and the page may also be mapped
-     * through another segment register, as Mac OS X's copyin window does,
-     * or in another set's TLB (see ppc_mmu_slot_sync).  Real-mode
-     * translations don't depend on the page table.
-     */
-    if (env->tlb_need_flush & TLB_NEED_PAGE_FLUSH) {
-        env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
-        for (int i = 0; i < env->tlb_flush_npages; i++) {
-            for (uint32_t seg = 0; seg < 16; seg++) {
-                tlb_flush_page_by_mmuidx(cs, (seg << 28) |
-                                         (env->tlb_flush_pages[i] & 0x0fffffff),
-                                         0x3333);
-            }
-        }
-        env->tlb_flush_npages = 0;
-    }
-
-    if (env->tlb_need_flush & TLB_NEED_SR_SWITCH) {
-        env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
-        ppc_mmu_slot_sync(env);
     }
 }
 #endif /* !CONFIG_USER_ONLY */
@@ -503,6 +472,23 @@ void register_generic_sprs(PowerPCCPU *cpu)
                  SPR_NOACCESS, SPR_NOACCESS,
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
+
+    spr_register(env, SPR_PVR, "PVR",
+                 /* Linux permits userspace to read PVR */
+#if defined(CONFIG_LINUX_USER)
+                 &spr_read_generic,
+#else
+                 SPR_NOACCESS,
+#endif
+                 SPR_NOACCESS,
+                 &spr_read_generic, SPR_NOACCESS,
+                 pcc->pvr);
+
+    /* PPE42 doesn't support SPRG1-3, SVR or TB regs */
+    if (env->insns_flags2 & PPC2_PPE42) {
+        return;
+    }
+
     spr_register(env, SPR_SPRG1, "SPRG1",
                  SPR_NOACCESS, SPR_NOACCESS,
                  &spr_read_generic, &spr_write_generic,
@@ -515,17 +501,6 @@ void register_generic_sprs(PowerPCCPU *cpu)
                  SPR_NOACCESS, SPR_NOACCESS,
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
-
-    spr_register(env, SPR_PVR, "PVR",
-                 /* Linux permits userspace to read PVR */
-#if defined(CONFIG_LINUX_USER)
-                 &spr_read_generic,
-#else
-                 SPR_NOACCESS,
-#endif
-                 SPR_NOACCESS,
-                 &spr_read_generic, SPR_NOACCESS,
-                 pcc->pvr);
 
     /* Register SVR if it's defined to anything else than POWERPC_SVR_NONE */
     if (pcc->svr != POWERPC_SVR_NONE) {

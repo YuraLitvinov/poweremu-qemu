@@ -22,6 +22,7 @@
 #include "cpu-models.h"
 #include "cpu-qom.h"
 #include "exec/log.h"
+#include "exec/watchpoint.h"
 #include "fpu/softfloat-helpers.h"
 #include "mmu-hash64.h"
 #include "helper_regs.h"
@@ -146,6 +147,8 @@ void ppc_update_daw(CPUPPCState *env, int rid)
     vaddr len;
     int flags;
 
+    assert(tcg_enabled());
+
     if (env->dawr_watchpoint[rid]) {
         cpu_watchpoint_remove_by_ref(cs, env->dawr_watchpoint[rid]);
         env->dawr_watchpoint[rid] = NULL;
@@ -239,8 +242,6 @@ static inline void fpscr_set_rounding_mode(CPUPPCState *env)
 
 void ppc_store_fpscr(CPUPPCState *env, target_ulong val)
 {
-    target_ulong old = env->fpscr;
-
     val &= FPSCR_MTFS_MASK;
     if (val & FPSCR_IX) {
         val |= FP_VX;
@@ -248,16 +249,10 @@ void ppc_store_fpscr(CPUPPCState *env, target_ulong val)
     if ((val >> FPSCR_XX) & (val >> FPSCR_XE) & 0x1f) {
         val |= FP_FEX;
     }
-    ppc_fprf_clear(env);
     env->fpscr = val;
-    env->fp_status.rebias_overflow  = (FP_OE & env->fpscr) ? true : false;
-    env->fp_status.rebias_underflow = (FP_UE & env->fpscr) ? true : false;
+    set_float_rebias_overflow(FP_OE & env->fpscr, &env->fp_status);
+    set_float_rebias_underflow(FP_UE & env->fpscr, &env->fp_status);
     if (tcg_enabled()) {
         fpscr_set_rounding_mode(env);
-        /* HFLAGS_FP_FAST follows these; see hreg_compute_hflags_value() */
-        if ((old ^ val) & (FP_VE | FP_OE | FP_UE | FP_ZE | FP_XE |
-                           FP_NI | FP_RN)) {
-            hreg_compute_hflags(env);
-        }
     }
 }

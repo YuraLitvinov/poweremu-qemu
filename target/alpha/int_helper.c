@@ -19,12 +19,11 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
-#include "exec/exec-all.h"
 #include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
 
 
-uint64_t helper_zapnot(uint64_t val, uint64_t mskb)
+uint64_t HELPER(zapnot)(uint64_t val, uint64_t mskb)
 {
     uint64_t mask;
 
@@ -40,12 +39,12 @@ uint64_t helper_zapnot(uint64_t val, uint64_t mskb)
     return val & mask;
 }
 
-uint64_t helper_zap(uint64_t val, uint64_t mask)
+uint64_t HELPER(zap)(uint64_t val, uint64_t mask)
 {
-    return helper_zapnot(val, ~mask);
+    return HELPER(zapnot)(val, ~mask);
 }
 
-uint64_t helper_cmpbe0(uint64_t a)
+uint64_t HELPER(cmpbe0)(uint64_t a)
 {
     uint64_t m = 0x7f7f7f7f7f7f7f7fULL;
     uint64_t c = ~(((a & m) + m) | a | m);
@@ -59,7 +58,7 @@ uint64_t helper_cmpbe0(uint64_t a)
     return c >> 56;
 }
 
-uint64_t helper_cmpbge(uint64_t a, uint64_t b)
+uint64_t HELPER(cmpbge)(uint64_t a, uint64_t b)
 {
     uint64_t mask = 0x00ff00ff00ff00ffULL;
     uint64_t test = 0x0100010001000100ULL;
@@ -88,7 +87,7 @@ uint64_t helper_cmpbge(uint64_t a, uint64_t b)
     return cl >> 50;
 }
 
-uint64_t helper_minub8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minub8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint8_t opa, opb, opr;
@@ -103,7 +102,7 @@ uint64_t helper_minub8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_minsb8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minsb8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int8_t opa, opb;
@@ -119,7 +118,7 @@ uint64_t helper_minsb8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_minuw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minuw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint16_t opa, opb, opr;
@@ -134,7 +133,7 @@ uint64_t helper_minuw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_minsw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minsw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int16_t opa, opb;
@@ -150,7 +149,7 @@ uint64_t helper_minsw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxub8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxub8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint8_t opa, opb, opr;
@@ -165,7 +164,7 @@ uint64_t helper_maxub8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxsb8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxsb8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int8_t opa, opb;
@@ -181,7 +180,7 @@ uint64_t helper_maxsb8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxuw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxuw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint16_t opa, opb, opr;
@@ -196,7 +195,7 @@ uint64_t helper_maxuw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxsw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxsw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int16_t opa, opb;
@@ -212,7 +211,7 @@ uint64_t helper_maxsw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_perr(uint64_t op1, uint64_t op2)
+uint64_t HELPER(perr)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint8_t opa, opb, opr;
@@ -231,12 +230,12 @@ uint64_t helper_perr(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_pklb(uint64_t op1)
+uint64_t HELPER(pklb)(uint64_t op1)
 {
     return (op1 & 0xff) | ((op1 >> 24) & 0xff00);
 }
 
-uint64_t helper_pkwb(uint64_t op1)
+uint64_t HELPER(pkwb)(uint64_t op1)
 {
     return ((op1 & 0xff)
             | ((op1 >> 8) & 0xff00)
@@ -244,12 +243,12 @@ uint64_t helper_pkwb(uint64_t op1)
             | ((op1 >> 24) & 0xff000000));
 }
 
-uint64_t helper_unpkbl(uint64_t op1)
+uint64_t HELPER(unpkbl)(uint64_t op1)
 {
     return (op1 & 0xff) | ((op1 & 0xff00) << 24);
 }
 
-uint64_t helper_unpkbw(uint64_t op1)
+uint64_t HELPER(unpkbw)(uint64_t op1)
 {
     return ((op1 & 0xff)
             | ((op1 & 0xff00) << 8)
@@ -257,7 +256,7 @@ uint64_t helper_unpkbw(uint64_t op1)
             | ((op1 & 0xff000000) << 24));
 }
 
-void helper_check_overflow(CPUAlphaState *env, uint64_t op1, uint64_t op2)
+void HELPER(check_overflow)(CPUAlphaState *env, uint64_t op1, uint64_t op2)
 {
     if (unlikely(op1 != op2)) {
         arith_excp(env, GETPC(), EXC_M_IOV, 0);

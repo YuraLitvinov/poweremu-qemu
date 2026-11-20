@@ -241,8 +241,8 @@ static bool trans_parallel_compare(DisasContext *ctx, arg_r *a,
         return true;
     }
 
-    c0 = tcg_constant_tl(0);
-    c1 = tcg_constant_tl(0xffffffff);
+    c0 = tcg_constant_i64(0);
+    c1 = tcg_constant_i64(0xffffffff);
     ax = tcg_temp_new_i64();
     bx = tcg_temp_new_i64();
     t0 = tcg_temp_new_i64();
@@ -255,7 +255,7 @@ static bool trans_parallel_compare(DisasContext *ctx, arg_r *a,
     for (int i = 0; i < (64 / wlen); i++) {
         tcg_gen_sextract_i64(t0, ax, wlen * i, wlen);
         tcg_gen_sextract_i64(t1, bx, wlen * i, wlen);
-        tcg_gen_movcond_i64(cond, t2, t1, t0, c1, c0);
+        tcg_gen_movcond_i64(cond, t2, t0, t1, c1, c0);
         tcg_gen_deposit_i64(cpu_gpr[a->rd], cpu_gpr[a->rd], t2, wlen * i, wlen);
     }
     /* Upper half */
@@ -264,7 +264,7 @@ static bool trans_parallel_compare(DisasContext *ctx, arg_r *a,
     for (int i = 0; i < (64 / wlen); i++) {
         tcg_gen_sextract_i64(t0, ax, wlen * i, wlen);
         tcg_gen_sextract_i64(t1, bx, wlen * i, wlen);
-        tcg_gen_movcond_i64(cond, t2, t1, t0, c1, c0);
+        tcg_gen_movcond_i64(cond, t2, t0, t1, c1, c0);
         tcg_gen_deposit_i64(cpu_gpr_hi[a->rd], cpu_gpr_hi[a->rd], t2, wlen * i, wlen);
     }
     return true;
@@ -273,7 +273,7 @@ static bool trans_parallel_compare(DisasContext *ctx, arg_r *a,
 /* Parallel Compare for Greater Than Byte */
 static bool trans_PCGTB(DisasContext *ctx, arg_r *a)
 {
-    return trans_parallel_compare(ctx, a, TCG_COND_GE, 8);
+    return trans_parallel_compare(ctx, a, TCG_COND_GT, 8);
 }
 
 /* Parallel Compare for Equal Byte */
@@ -285,7 +285,7 @@ static bool trans_PCEQB(DisasContext *ctx, arg_r *a)
 /* Parallel Compare for Greater Than Halfword */
 static bool trans_PCGTH(DisasContext *ctx, arg_r *a)
 {
-    return trans_parallel_compare(ctx, a, TCG_COND_GE, 16);
+    return trans_parallel_compare(ctx, a, TCG_COND_GT, 16);
 }
 
 /* Parallel Compare for Equal Halfword */
@@ -297,7 +297,7 @@ static bool trans_PCEQH(DisasContext *ctx, arg_r *a)
 /* Parallel Compare for Greater Than Word */
 static bool trans_PCGTW(DisasContext *ctx, arg_r *a)
 {
-    return trans_parallel_compare(ctx, a, TCG_COND_GE, 32);
+    return trans_parallel_compare(ctx, a, TCG_COND_GT, 32);
 }
 
 /* Parallel Compare for Equal Word */
@@ -322,7 +322,7 @@ static bool trans_PCEQW(DisasContext *ctx, arg_r *a)
 static bool trans_LQ(DisasContext *ctx, arg_i *a)
 {
     TCGv_i64 t0;
-    TCGv addr;
+    TCGv_i64 addr;
 
     if (a->rt == 0) {
         /* nop */
@@ -330,14 +330,14 @@ static bool trans_LQ(DisasContext *ctx, arg_i *a)
     }
 
     t0 = tcg_temp_new_i64();
-    addr = tcg_temp_new();
+    addr = tcg_temp_new_i64();
 
     gen_base_offset_addr(ctx, addr, a->base, a->offset);
     /*
      * Clear least-significant four bits of the effective
      * address, effectively creating an aligned address.
      */
-    tcg_gen_andi_tl(addr, addr, ~0xf);
+    tcg_gen_andi_i64(addr, addr, ~0xf);
 
     /* Lower half */
     tcg_gen_qemu_ld_i64(t0, addr, ctx->mem_idx, mo_endian(ctx) | MO_UQ);
@@ -353,14 +353,14 @@ static bool trans_LQ(DisasContext *ctx, arg_i *a)
 static bool trans_SQ(DisasContext *ctx, arg_i *a)
 {
     TCGv_i64 t0 = tcg_temp_new_i64();
-    TCGv addr = tcg_temp_new();
+    TCGv_i64 addr = tcg_temp_new_i64();
 
     gen_base_offset_addr(ctx, addr, a->base, a->offset);
     /*
      * Clear least-significant four bits of the effective
      * address, effectively creating an aligned address.
      */
-    tcg_gen_andi_tl(addr, addr, ~0xf);
+    tcg_gen_andi_i64(addr, addr, ~0xf);
 
     /* Lower half */
     gen_load_gpr(t0, a->rt);

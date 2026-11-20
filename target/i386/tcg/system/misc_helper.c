@@ -21,49 +21,51 @@
 #include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
-#include "exec/cpu_ldst.h"
-#include "exec/address-spaces.h"
+#include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/cpu-loop.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "exec/cputlb.h"
 #include "tcg/helper-tcg.h"
 #include "hw/i386/apic.h"
 
-void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
+void HELPER(outb)(CPUX86State *env, uint32_t port, uint32_t data)
 {
     address_space_stb(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
 }
 
-target_ulong helper_inb(CPUX86State *env, uint32_t port)
+target_ulong HELPER(inb)(CPUX86State *env, uint32_t port)
 {
     return address_space_ldub(&address_space_io, port,
                               cpu_get_mem_attrs(env), NULL);
 }
 
-void helper_outw(CPUX86State *env, uint32_t port, uint32_t data)
+void HELPER(outw)(CPUX86State *env, uint32_t port, uint32_t data)
 {
-    address_space_stw(&address_space_io, port, data,
-                      cpu_get_mem_attrs(env), NULL);
+    address_space_stw_le(&address_space_io, port, data,
+                         cpu_get_mem_attrs(env), NULL);
 }
 
-target_ulong helper_inw(CPUX86State *env, uint32_t port)
+target_ulong HELPER(inw)(CPUX86State *env, uint32_t port)
 {
-    return address_space_lduw(&address_space_io, port,
-                              cpu_get_mem_attrs(env), NULL);
+    return address_space_lduw_le(&address_space_io, port,
+                                 cpu_get_mem_attrs(env), NULL);
 }
 
-void helper_outl(CPUX86State *env, uint32_t port, uint32_t data)
+void HELPER(outl)(CPUX86State *env, uint32_t port, uint32_t data)
 {
-    address_space_stl(&address_space_io, port, data,
-                      cpu_get_mem_attrs(env), NULL);
+    address_space_stl_le(&address_space_io, port, data,
+                         cpu_get_mem_attrs(env), NULL);
 }
 
-target_ulong helper_inl(CPUX86State *env, uint32_t port)
+target_ulong HELPER(inl)(CPUX86State *env, uint32_t port)
 {
-    return address_space_ldl(&address_space_io, port,
-                             cpu_get_mem_attrs(env), NULL);
+    return address_space_ldl_le(&address_space_io, port,
+                                cpu_get_mem_attrs(env), NULL);
 }
 
-target_ulong helper_read_cr8(CPUX86State *env)
+target_ulong HELPER(read_cr8)(CPUX86State *env)
 {
     if (!(env->hflags2 & HF2_VINTR_MASK)) {
         return cpu_get_apic_tpr(env_archcpu(env)->apic_state);
@@ -72,7 +74,7 @@ target_ulong helper_read_cr8(CPUX86State *env)
     }
 }
 
-void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
+void HELPER(write_crN)(CPUX86State *env, int reg, target_ulong t0)
 {
     switch (reg) {
     case 0:
@@ -128,7 +130,7 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
     }
 }
 
-void helper_wrmsr(CPUX86State *env)
+void HELPER(wrmsr)(CPUX86State *env)
 {
     uint64_t val;
     CPUState *cs = env_cpu(env);
@@ -298,7 +300,7 @@ void helper_wrmsr(CPUX86State *env)
         int index = (uint32_t)env->regs[R_ECX] - MSR_APIC_START;
 
         bql_lock();
-        ret = apic_msr_write(index, val);
+        ret = apic_msr_write(env_archcpu(env)->apic_state, index, val);
         bql_unlock();
         if (ret < 0) {
             goto error;
@@ -325,7 +327,7 @@ error:
     raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
 }
 
-void helper_rdmsr(CPUX86State *env)
+void HELPER(rdmsr)(CPUX86State *env)
 {
     X86CPU *x86_cpu = env_archcpu(env);
     uint64_t val;
@@ -476,7 +478,7 @@ void helper_rdmsr(CPUX86State *env)
         int index = (uint32_t)env->regs[R_ECX] - MSR_APIC_START;
 
         bql_lock();
-        ret = apic_msr_read(index, &val);
+        ret = apic_msr_read(x86_cpu->apic_state, index, &val);
         bql_unlock();
         if (ret < 0) {
             raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
@@ -500,12 +502,12 @@ void helper_rdmsr(CPUX86State *env)
     env->regs[R_EDX] = (uint32_t)(val >> 32);
 }
 
-void helper_flush_page(CPUX86State *env, target_ulong addr)
+void HELPER(flush_page)(CPUX86State *env, target_ulong addr)
 {
     tlb_flush_page(env_cpu(env), addr);
 }
 
-G_NORETURN void helper_hlt(CPUX86State *env)
+G_NORETURN void HELPER(hlt)(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);
 
@@ -515,7 +517,7 @@ G_NORETURN void helper_hlt(CPUX86State *env)
     cpu_loop_exit(cs);
 }
 
-void helper_monitor(CPUX86State *env, target_ulong ptr)
+void HELPER(monitor)(CPUX86State *env, target_ulong ptr)
 {
     if ((uint32_t)env->regs[R_ECX] != 0) {
         raise_exception_ra(env, EXCP0D_GPF, GETPC());
@@ -524,7 +526,7 @@ void helper_monitor(CPUX86State *env, target_ulong ptr)
     cpu_svm_check_intercept_param(env, SVM_EXIT_MONITOR, 0, GETPC());
 }
 
-G_NORETURN void helper_mwait(CPUX86State *env, int next_eip_addend)
+G_NORETURN void HELPER(mwait)(CPUX86State *env, int next_eip_addend)
 {
     CPUState *cs = env_cpu(env);
 
@@ -536,8 +538,8 @@ G_NORETURN void helper_mwait(CPUX86State *env, int next_eip_addend)
 
     /* XXX: not complete but not completely erroneous */
     if (cs->cpu_index != 0 || CPU_NEXT(cs) != NULL) {
-        helper_pause(env);
+        HELPER(pause)(env);
     } else {
-        helper_hlt(env);
+        HELPER(hlt)(env);
     }
 }

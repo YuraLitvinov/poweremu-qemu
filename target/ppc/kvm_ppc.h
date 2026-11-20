@@ -21,8 +21,6 @@
 
 uint32_t kvmppc_get_tbfreq(void);
 uint64_t kvmppc_get_clockfreq(void);
-bool kvmppc_get_host_model(char **buf);
-bool kvmppc_get_host_serial(char **buf);
 int kvmppc_get_hasidle(CPUPPCState *env);
 int kvmppc_get_hypercall(CPUPPCState *env, uint8_t *buf, int buf_len);
 int kvmppc_set_interrupt(PowerPCCPU *cpu, int irq, int level);
@@ -83,6 +81,8 @@ bool kvmppc_supports_ail_3(void);
 int kvmppc_enable_hwrng(void);
 int kvmppc_put_books_sregs(PowerPCCPU *cpu);
 PowerPCCPUClass *kvm_ppc_get_host_cpu_class(void);
+
+uint32_t kvm_ppc_host_compat_pvr(void);
 void kvmppc_check_papr_resize_hpt(Error **errp);
 int kvmppc_resize_hpt_prepare(PowerPCCPU *cpu, target_ulong flags, int shift);
 int kvmppc_resize_hpt_commit(PowerPCCPU *cpu, target_ulong flags, int shift);
@@ -127,16 +127,6 @@ static inline void kvmppc_icbi_range(PowerPCCPU *cpu, uint8_t *addr, int len)
 static inline uint32_t kvmppc_get_tbfreq(void)
 {
     return 0;
-}
-
-static inline bool kvmppc_get_host_model(char **buf)
-{
-    return false;
-}
-
-static inline bool kvmppc_get_host_serial(char **buf)
-{
-    return false;
 }
 
 static inline uint64_t kvmppc_get_clockfreq(void)
@@ -221,7 +211,6 @@ static inline int kvmppc_smt_threads(void)
 
 static inline void kvmppc_error_append_smt_possible_hint(Error *const *errp)
 {
-    return;
 }
 
 static inline int kvmppc_set_smt_threads(int smt)
@@ -259,7 +248,6 @@ static inline target_ulong kvmppc_configure_v3_mmu(PowerPCCPU *cpu,
 static inline void kvmppc_set_reg_ppc_online(PowerPCCPU *cpu,
                                              unsigned int online)
 {
-    return;
 }
 
 static inline void kvmppc_set_reg_tb_offset(PowerPCCPU *cpu, int64_t tb_offset)
@@ -454,9 +442,13 @@ static inline PowerPCCPUClass *kvm_ppc_get_host_cpu_class(void)
     return NULL;
 }
 
+static inline uint32_t kvm_ppc_host_compat_pvr(void)
+{
+    return 0;
+}
+
 static inline void kvmppc_check_papr_resize_hpt(Error **errp)
 {
-    return;
 }
 
 static inline int kvmppc_resize_hpt_prepare(PowerPCCPU *cpu,

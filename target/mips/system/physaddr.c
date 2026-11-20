@@ -18,8 +18,8 @@
  */
 #include "qemu/osdep.h"
 #include "cpu.h"
-#include "exec/exec-all.h"
 #include "exec/page-protection.h"
+#include "exec/target_page.h"
 #include "../internal.h"
 
 static int is_seg_am_mapped(unsigned int am, bool eu, int mmu_idx)
@@ -75,7 +75,7 @@ static int is_seg_am_mapped(unsigned int am, bool eu, int mmu_idx)
     };
 }
 
-static int get_seg_physical_address(CPUMIPSState *env, hwaddr *physical,
+static int get_seg_physical_address(const CPUMIPSState *env, hwaddr *physical,
                                     int *prot, target_ulong real_address,
                                     MMUAccessType access_type, int mmu_idx,
                                     unsigned int am, bool eu,
@@ -99,8 +99,9 @@ static int get_seg_physical_address(CPUMIPSState *env, hwaddr *physical,
     }
 }
 
-static int get_segctl_physical_address(CPUMIPSState *env, hwaddr *physical,
-                                       int *prot, target_ulong real_address,
+static int get_segctl_physical_address(const CPUMIPSState *env,
+                                       hwaddr *physical, int *prot,
+                                       target_ulong real_address,
                                        MMUAccessType access_type, int mmu_idx,
                                        uint16_t segctl, target_ulong segmask)
 {
@@ -113,7 +114,7 @@ static int get_segctl_physical_address(CPUMIPSState *env, hwaddr *physical,
                                     pa & ~(hwaddr)segmask);
 }
 
-int get_physical_address(CPUMIPSState *env, hwaddr *physical,
+int get_physical_address(const CPUMIPSState *env, hwaddr *physical,
                          int *prot, target_ulong real_address,
                          MMUAccessType access_type, int mmu_idx)
 {
@@ -127,7 +128,6 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
     int KX = (env->CP0_Status & (1 << CP0St_KX)) != 0;
 #endif
     int ret = TLBRET_MATCH;
-    /* effective address (modified for KVM T&E kernel segments) */
     target_ulong address = real_address;
 
     if (address <= USEG_LIMIT) {
@@ -229,7 +229,8 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
     return ret;
 }
 
-hwaddr mips_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
+bool mips_cpu_translate_for_debug(CPUState *cs, vaddr addr,
+                                  TranslateForDebugResult *result)
 {
     CPUMIPSState *env = cpu_env(cs);
     hwaddr phys_addr;
@@ -237,7 +238,12 @@ hwaddr mips_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
 
     if (get_physical_address(env, &phys_addr, &prot, addr, MMU_DATA_LOAD,
                              mips_env_mmu_index(env)) != 0) {
-        return -1;
+        return false;
     }
-    return phys_addr;
+    *result = (TranslateForDebugResult) {
+        .physaddr = phys_addr,
+        .lg_page_size = TARGET_PAGE_BITS,
+        .attrs.debug = 1,
+    };
+    return true;
 }

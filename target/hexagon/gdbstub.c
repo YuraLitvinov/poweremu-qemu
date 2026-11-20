@@ -16,9 +16,15 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "gdbstub/helpers.h"
 #include "cpu.h"
 #include "internal.h"
+#ifndef CONFIG_USER_ONLY
+#include "cpu_helper.h"
+#include "hw/hexagon/hexagon_globalreg.h"
+#include "hw/hexagon/hexagon_hlx.h"
+#endif
 
 int hexagon_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 {
@@ -29,11 +35,11 @@ int hexagon_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
         for (int i = 0; i < NUM_PREGS; i++) {
             p3_0 = deposit32(p3_0, i * 8, 8, env->pred[i]);
         }
-        return gdb_get_regl(mem_buf, p3_0);
+        return gdb_get_reg32(mem_buf, p3_0);
     }
 
     if (n < TOTAL_PER_THREAD_REGS) {
-        return gdb_get_regl(mem_buf, env->gpr[n]);
+        return gdb_get_reg32(mem_buf, env->gpr[n]);
     }
 
     n -= TOTAL_PER_THREAD_REGS;
@@ -56,12 +62,12 @@ int hexagon_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
         for (int i = 0; i < NUM_PREGS; i++) {
             env->pred[i] = extract32(p3_0, i * 8, 8);
         }
-        return sizeof(target_ulong);
+        return 4;
     }
 
     if (n < TOTAL_PER_THREAD_REGS) {
         env->gpr[n] = ldl_le_p(mem_buf);
-        return sizeof(target_ulong);
+        return 4;
     }
 
     n -= TOTAL_PER_THREAD_REGS;
@@ -76,12 +82,74 @@ int hexagon_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
     g_assert_not_reached();
 }
 
+#ifndef CONFIG_USER_ONLY
+int hexagon_sys_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
+{
+    CPUHexagonState *env = cpu_env(cs);
+    HexagonCPU *cpu = env_archcpu(env);
+    BQL_LOCK_GUARD();
+
+    if (n < NUM_SREGS) {
+        uint32_t val;
+        if (n < HEX_SREG_GLB_START) {
+            val = env->t_sreg[n];
+        } else {
+            val = cpu->globalregs ?
+                hexagon_globalreg_read(cpu->globalregs, n, env->threadId) : 0;
+        }
+        return gdb_get_reg32(mem_buf, val);
+    }
+    n -= NUM_SREGS;
+
+    if (n < NUM_GREGS) {
+        return gdb_get_reg32(mem_buf, hexagon_greg_read(env, n));
+    }
+    n -= NUM_GREGS;
+
+    g_assert_not_reached();
+}
+
+int hexagon_sys_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
+{
+    CPUHexagonState *env = cpu_env(cs);
+    HexagonCPU *cpu = env_archcpu(env);
+    BQL_LOCK_GUARD();
+
+    if (n < NUM_SREGS) {
+        uint32_t val = ldl_le_p(mem_buf);
+        if (n == HEX_SREG_SSR) {
+            uint32_t old = env->t_sreg[HEX_SREG_SSR];
+            env->t_sreg[HEX_SREG_SSR] = val;
+            hexagon_modify_ssr(env, val, old);
+        } else if (n == HEX_SREG_CCR) {
+            uint32_t old = env->t_sreg[HEX_SREG_CCR];
+            env->t_sreg[HEX_SREG_CCR] = val;
+            hexagon_modify_ccr(env, val, old);
+        } else if (n < HEX_SREG_GLB_START) {
+            env->t_sreg[n] = val;
+        } else if (cpu->globalregs) {
+            hexagon_globalreg_write(cpu->globalregs, n, val, env->threadId);
+        }
+        return sizeof(uint32_t);
+    }
+    n -= NUM_SREGS;
+
+    if (n < NUM_GREGS) {
+        hexagon_greg_write(env, n, ldl_le_p(mem_buf));
+        return sizeof(uint32_t);
+    }
+    n -= NUM_GREGS;
+
+    g_assert_not_reached();
+}
+#endif
+
 static int gdb_get_vreg(CPUHexagonState *env, GByteArray *mem_buf, int n)
 {
     int total = 0;
     int i;
-    for (i = 0; i < ARRAY_SIZE(env->VRegs[n].uw); i++) {
-        total += gdb_get_regl(mem_buf, env->VRegs[n].uw[i]);
+    for (i = 0; i < ARRAY_SIZE(hex_hvx(env)->VRegs[n].uw); i++) {
+        total += gdb_get_reg32(mem_buf, hex_hvx(env)->VRegs[n].uw[i]);
     }
     return total;
 }
@@ -90,8 +158,8 @@ static int gdb_get_qreg(CPUHexagonState *env, GByteArray *mem_buf, int n)
 {
     int total = 0;
     int i;
-    for (i = 0; i < ARRAY_SIZE(env->QRegs[n].uw); i++) {
-        total += gdb_get_regl(mem_buf, env->QRegs[n].uw[i]);
+    for (i = 0; i < ARRAY_SIZE(hex_hvx(env)->QRegs[n].uw); i++) {
+        total += gdb_get_reg32(mem_buf, hex_hvx(env)->QRegs[n].uw[i]);
     }
     return total;
 }
@@ -116,21 +184,21 @@ int hexagon_hvx_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 static int gdb_put_vreg(CPUHexagonState *env, uint8_t *mem_buf, int n)
 {
     int i;
-    for (i = 0; i < ARRAY_SIZE(env->VRegs[n].uw); i++) {
-        env->VRegs[n].uw[i] = ldl_le_p(mem_buf);
+    for (i = 0; i < ARRAY_SIZE(hex_hvx(env)->VRegs[n].uw); i++) {
+        hex_hvx(env)->VRegs[n].uw[i] = ldl_le_p(mem_buf);
         mem_buf += 4;
     }
-    return MAX_VEC_SIZE_BYTES;
+    return sizeof_field(MMVector, ub);
 }
 
 static int gdb_put_qreg(CPUHexagonState *env, uint8_t *mem_buf, int n)
 {
     int i;
-    for (i = 0; i < ARRAY_SIZE(env->QRegs[n].uw); i++) {
-        env->QRegs[n].uw[i] = ldl_le_p(mem_buf);
+    for (i = 0; i < ARRAY_SIZE(hex_hvx(env)->QRegs[n].uw); i++) {
+        hex_hvx(env)->QRegs[n].uw[i] = ldl_le_p(mem_buf);
         mem_buf += 4;
     }
-    return MAX_VEC_SIZE_BYTES / 8;
+    return sizeof(MMQReg);
 }
 
 int hexagon_hvx_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
@@ -148,4 +216,50 @@ int hexagon_hvx_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
     }
 
     g_assert_not_reached();
+}
+
+int hexagon_hlx_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
+{
+    CPUHexagonState *env = cpu_env(cs);
+    int total = 0;
+
+    BQL_LOCK_GUARD();
+
+    if (n < 0 || n >= NUM_LREGS) {
+        g_assert_not_reached();
+    }
+
+    /* Return zeroes when no HLX context is active. */
+    if (env->hlx_ctx == NULL) {
+        for (int i = 0; i < HLX_VEC_SIZE_BYTES; i++) {
+            g_byte_array_append(mem_buf, (const guint8 *)"\0", 1);
+        }
+        return HLX_VEC_SIZE_BYTES;
+    }
+
+    for (int i = 0; i < (int)ARRAY_SIZE(env->hlx_ctx->LRegs[n].uw); i++) {
+        total += gdb_get_reg32(mem_buf, env->hlx_ctx->LRegs[n].uw[i]);
+    }
+    return total;
+}
+
+int hexagon_hlx_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
+{
+    CPUHexagonState *env = cpu_env(cs);
+    BQL_LOCK_GUARD();
+
+    if (n < 0 || n >= NUM_LREGS) {
+        g_assert_not_reached();
+    }
+
+    /* Ignore writes without an active context. */
+    if (env->hlx_ctx == NULL) {
+        return HLX_VEC_SIZE_BYTES;
+    }
+
+    for (int i = 0; i < (int)ARRAY_SIZE(env->hlx_ctx->LRegs[n].uw); i++) {
+        env->hlx_ctx->LRegs[n].uw[i] = ldl_le_p(mem_buf);
+        mem_buf += 4;
+    }
+    return HLX_VEC_SIZE_BYTES;
 }

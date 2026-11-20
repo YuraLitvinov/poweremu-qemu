@@ -28,8 +28,9 @@
 
 typedef struct DisasContext {
     DisasContextBase base;
-    Packet *pkt;
+    Packet pkt;
     Insn *insn;
+    const HexagonCPUDef *hex_def;
     uint32_t next_PC;
     uint32_t mem_idx;
     uint32_t num_packets;
@@ -39,6 +40,24 @@ typedef struct DisasContext {
     int reg_log_idx;
     DECLARE_BITMAP(regs_written, TOTAL_PER_THREAD_REGS);
     DECLARE_BITMAP(predicated_regs, TOTAL_PER_THREAD_REGS);
+    bool pkt_ends_tb;
+    DECLARE_BITMAP(gpr_multi_write, TOTAL_PER_THREAD_REGS);
+    DECLARE_BITMAP(gpr_uncond, TOTAL_PER_THREAD_REGS);
+    bool implicit_usr_write;
+#ifndef CONFIG_USER_ONLY
+    uint32_t cpu_mode;
+    bool ss_active;
+    int greg_log[GREG_WRITES_MAX];
+    int greg_log_idx;
+    DECLARE_BITMAP(gregs_written, NUM_GREGS);
+    DECLARE_BITMAP(gregs_multi_write, NUM_GREGS);
+    int sreg_log[SREG_WRITES_MAX];
+    int sreg_log_idx;
+    DECLARE_BITMAP(sregs_written, NUM_SREGS);
+    DECLARE_BITMAP(sregs_multi_write, NUM_SREGS);
+    TCGv_i32 t_sreg_new_value[HEX_SREG_GLB_START];
+    TCGv_i32 greg_new_value[NUM_GREGS];
+#endif
     int preg_log[PRED_WRITES_MAX];
     int preg_log_idx;
     DECLARE_BITMAP(pregs_written, NUM_PREGS);
@@ -57,10 +76,14 @@ typedef struct DisasContext {
     DECLARE_BITMAP(vregs_select, NUM_VREGS);
     DECLARE_BITMAP(predicated_future_vregs, NUM_VREGS);
     DECLARE_BITMAP(predicated_tmp_vregs, NUM_VREGS);
+    DECLARE_BITMAP(vregs_multi_write, NUM_VREGS);
+    DECLARE_BITMAP(vregs_uncond, NUM_VREGS);
     DECLARE_BITMAP(insn_vregs_read, NUM_VREGS);
     int qreg_log[NUM_QREGS];
     int qreg_log_idx;
     DECLARE_BITMAP(qregs_written, NUM_QREGS);
+    DECLARE_BITMAP(qregs_multi_write, NUM_QREGS);
+    DECLARE_BITMAP(qregs_uncond, NUM_QREGS);
     DECLARE_BITMAP(insn_qregs_written, NUM_QREGS);
     DECLARE_BITMAP(insn_qregs_read, NUM_QREGS);
     bool pre_commit;
@@ -68,16 +91,109 @@ typedef struct DisasContext {
     TCGCond branch_cond;
     target_ulong branch_dest;
     bool is_tight_loop;
+    bool hlx_check_emitted;
     bool short_circuit;
+    bool ieee_fp_extension;
     bool read_after_write;
     bool has_hvx_overlap;
     TCGv new_value[TOTAL_PER_THREAD_REGS];
     TCGv new_pred_value[NUM_PREGS];
     TCGv branch_taken;
     TCGv dczero_addr;
+    bool hvx_coproc_enabled;
+    bool hvx_check_emitted;
+    bool hlx_coproc_enabled;
+    TCGv_ptr hlx_base;
+    bool     hlx_base_loaded;
+    int lreg_log[NUM_LREGS];
+    int lreg_log_idx;
+    int lreg_tmp_log[NUM_LREGS];
+    int lreg_tmp_log_idx;
+    DECLARE_BITMAP(lregs_updated, NUM_LREGS);
+    DECLARE_BITMAP(lregs_multi_write, NUM_LREGS);
+    DECLARE_BITMAP(lregs_updated_tmp, NUM_LREGS);
+    bool hmx_coproc_enabled;
+    bool hmx_check_emitted;
 } DisasContext;
 
 bool is_gather_store_insn(DisasContext *ctx);
+
+static inline TCGv_ptr ctx_get_hlx_base(DisasContext *ctx)
+{
+    if (!ctx->hlx_base_loaded) {
+        ctx->hlx_base = tcg_temp_new_ptr();
+        tcg_gen_ld_ptr(ctx->hlx_base, tcg_env,
+                       offsetof(CPUHexagonState, hlx_ctx));
+        ctx->hlx_base_loaded = true;
+    }
+    return ctx->hlx_base;
+}
+
+static inline void ctx_log_lreg_write(DisasContext *ctx, int rnum)
+{
+    if (test_bit(rnum, ctx->lregs_updated)) {
+        set_bit(rnum, ctx->lregs_multi_write);
+    } else {
+        ctx->lreg_log[ctx->lreg_log_idx] = rnum;
+        ctx->lreg_log_idx++;
+        set_bit(rnum, ctx->lregs_updated);
+    }
+}
+
+static inline void ctx_log_lreg_write_pair(DisasContext *ctx, int rnum)
+{
+    ctx_log_lreg_write(ctx, rnum ^ 0);
+    ctx_log_lreg_write(ctx, rnum ^ 1);
+}
+
+static inline void ctx_log_lreg_tmp_write(DisasContext *ctx, int rnum)
+{
+    if (!test_bit(rnum, ctx->lregs_updated_tmp)) {
+        ctx->lreg_tmp_log[ctx->lreg_tmp_log_idx] = rnum;
+        ctx->lreg_tmp_log_idx++;
+        set_bit(rnum, ctx->lregs_updated_tmp);
+    }
+}
+
+#ifndef CONFIG_USER_ONLY
+static inline void ctx_log_greg_write(DisasContext *ctx, int rnum)
+{
+    if (rnum > HEX_GREG_G3) {
+        return;
+    }
+    if (!test_bit(rnum, ctx->gregs_written)) {
+        set_bit(rnum, ctx->gregs_written);
+        ctx->greg_log[ctx->greg_log_idx] = rnum;
+        ctx->greg_log_idx++;
+    } else {
+        set_bit(rnum, ctx->gregs_multi_write);
+    }
+}
+
+static inline void ctx_log_greg_write_pair(DisasContext *ctx, int rnum)
+{
+    assert(!(rnum % 2));
+    ctx_log_greg_write(ctx, rnum);
+    ctx_log_greg_write(ctx, rnum + 1);
+}
+
+static inline void ctx_log_sreg_write(DisasContext *ctx, int rnum)
+{
+    if (!test_bit(rnum, ctx->sregs_written)) {
+        set_bit(rnum, ctx->sregs_written);
+        ctx->sreg_log[ctx->sreg_log_idx] = rnum;
+        ctx->sreg_log_idx++;
+    } else {
+        set_bit(rnum, ctx->sregs_multi_write);
+    }
+}
+
+static inline void ctx_log_sreg_write_pair(DisasContext *ctx, int rnum)
+{
+    ctx_log_sreg_write(ctx, rnum);
+    ctx_log_sreg_write(ctx, rnum + 1);
+}
+#endif
 
 static inline void ctx_log_pred_write(DisasContext *ctx, int pnum)
 {
@@ -112,9 +228,13 @@ static inline void ctx_log_reg_write(DisasContext *ctx, int rnum,
             ctx->reg_log[ctx->reg_log_idx] = rnum;
             ctx->reg_log_idx++;
             set_bit(rnum, ctx->regs_written);
+        } else {
+            set_bit(rnum, ctx->gpr_multi_write);
         }
         if (is_predicated) {
             set_bit(rnum, ctx->predicated_regs);
+        } else {
+            set_bit(rnum, ctx->gpr_uncond);
         }
     }
 }
@@ -145,9 +265,9 @@ static inline void ctx_log_reg_read_pair(DisasContext *ctx, int rnum)
 }
 
 intptr_t ctx_future_vreg_off(DisasContext *ctx, int regnum,
-                             int num, bool alloc_ok);
+                             int num, bool alloc_ok, TCGv_ptr *base);
 intptr_t ctx_tmp_vreg_off(DisasContext *ctx, int regnum,
-                          int num, bool alloc_ok);
+                          int num, bool alloc_ok, TCGv_ptr *base);
 
 static inline void ctx_start_hvx_insn(DisasContext *ctx)
 {
@@ -167,8 +287,13 @@ static inline void ctx_log_vreg_write(DisasContext *ctx,
             ctx->has_hvx_overlap = true;
         }
     }
-    set_bit(rnum, ctx->vregs_written);
+
     if (type != EXT_TMP) {
+        if (!test_bit(rnum, ctx->vregs_written)) {
+            set_bit(rnum, ctx->vregs_written);
+        } else {
+            set_bit(rnum, ctx->vregs_multi_write);
+        }
         if (!test_bit(rnum, ctx->vregs_updated)) {
             ctx->vreg_log[ctx->vreg_log_idx] = rnum;
             ctx->vreg_log_idx++;
@@ -178,6 +303,8 @@ static inline void ctx_log_vreg_write(DisasContext *ctx,
         set_bit(rnum, ctx->vregs_updated);
         if (is_predicated) {
             set_bit(rnum, ctx->predicated_future_vregs);
+        } else {
+            set_bit(rnum, ctx->vregs_uncond);
         }
     }
     if (type == EXT_NEW) {
@@ -239,7 +366,8 @@ static inline void ctx_log_vreg_read_pair(DisasContext *ctx, int rnum,
 }
 
 static inline void ctx_log_qreg_write(DisasContext *ctx,
-                                      int rnum, bool has_helper)
+                                       int rnum, bool predicated,
+                                       bool has_helper)
 {
     if (has_helper) {
         set_bit(rnum, ctx->insn_qregs_written);
@@ -247,7 +375,14 @@ static inline void ctx_log_qreg_write(DisasContext *ctx,
             ctx->has_hvx_overlap = true;
         }
     }
-    set_bit(rnum, ctx->qregs_written);
+    if (!test_bit(rnum, ctx->qregs_written)) {
+        set_bit(rnum, ctx->qregs_written);
+    } else {
+        set_bit(rnum, ctx->qregs_multi_write);
+    }
+    if (!predicated) {
+        set_bit(rnum, ctx->qregs_uncond);
+    }
     ctx->qreg_log[ctx->qreg_log_idx] = rnum;
     ctx->qreg_log_idx++;
 }
@@ -271,7 +406,7 @@ extern TCGv hex_pred[NUM_PREGS];
 extern TCGv hex_slot_cancelled;
 extern TCGv hex_new_value_usr;
 extern TCGv hex_store_addr[STORES_MAX];
-extern TCGv hex_store_width[STORES_MAX];
+extern TCGv_i32 hex_store_width[STORES_MAX];
 extern TCGv hex_store_val32[STORES_MAX];
 extern TCGv_i64 hex_store_val64[STORES_MAX];
 extern TCGv hex_llsc_addr;
@@ -280,6 +415,24 @@ extern TCGv_i64 hex_llsc_val_i64;
 extern TCGv hex_vstore_addr[VSTORES_MAX];
 extern TCGv hex_vstore_size[VSTORES_MAX];
 extern TCGv hex_vstore_pending[VSTORES_MAX];
+extern TCGv_i32 hex_cfi_active;
+extern TCGv_i32 hex_cfi_active_log;
+extern TCGv_i32 hex_cfi_updated;
+void gen_precise_exception(int cause, uint32_t pc);
+#ifdef CONFIG_USER_ONLY
+#define hex_hvx_ptr tcg_env
+#define HEX_HVX_OFFSET(member) offsetof(CPUHexagonState, hvx_ctx.member)
+#else
+extern TCGv_ptr hex_hvx_ptr;
+#define HEX_HVX_OFFSET(member) offsetof(HexagonHVXContext, member)
+#endif
+#ifndef CONFIG_USER_ONLY
+extern TCGv_i32 hex_greg[NUM_GREGS];
+extern TCGv_i32 hex_t_sreg[NUM_SREGS];
+#endif
+
+
+void hex_gen_exception_end_tb(DisasContext *ctx, int cause);
 
 void process_store(DisasContext *ctx, int slot_num);
 
@@ -292,5 +445,7 @@ FIELD(PROBE_PKT_SCALAR_HVX_STORES, HAS_HVX_STORES, 2, 1)
 FIELD(PROBE_PKT_SCALAR_HVX_STORES, S0_IS_PRED,     3, 1)
 FIELD(PROBE_PKT_SCALAR_HVX_STORES, S1_IS_PRED,     4, 1)
 FIELD(PROBE_PKT_SCALAR_HVX_STORES, MMU_IDX,        5, 2)
+
+void gen_framecheck(DisasContext *ctx, TCGv_i32 addr, TCGv_i32 ea);
 
 #endif

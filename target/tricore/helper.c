@@ -17,10 +17,13 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
+#include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/cpu-mmu-index.h"
 #include "exec/page-protection.h"
+#include "exec/target_page.h"
 #include "fpu/softfloat-helpers.h"
 #include "qemu/qemu-print.h"
 
@@ -33,7 +36,7 @@ enum {
 };
 
 static int get_physical_address(CPUTriCoreState *env, hwaddr *physical,
-                                int *prot, target_ulong address,
+                                int *prot, vaddr address,
                                 MMUAccessType access_type, int mmu_idx)
 {
     int ret = TLBRET_MATCH;
@@ -44,7 +47,8 @@ static int get_physical_address(CPUTriCoreState *env, hwaddr *physical,
     return ret;
 }
 
-hwaddr tricore_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
+bool tricore_cpu_translate_for_debug(CPUState *cs, vaddr addr,
+                                     TranslateForDebugResult *result)
 {
     TriCoreCPU *cpu = TRICORE_CPU(cs);
     hwaddr phys_addr;
@@ -53,13 +57,19 @@ hwaddr tricore_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
 
     if (get_physical_address(&cpu->env, &phys_addr, &prot, addr,
                              MMU_DATA_LOAD, mmu_idx)) {
-        return -1;
+        return false;
     }
-    return phys_addr;
+
+    *result = (TranslateForDebugResult) {
+        .physaddr = phys_addr,
+        .lg_page_size = TARGET_PAGE_BITS,
+        .attrs.debug = 1,
+    };
+    return true;
 }
 
 /* TODO: Add exception support */
-static void raise_mmu_exception(CPUTriCoreState *env, target_ulong address,
+static void raise_mmu_exception(CPUTriCoreState *env, vaddr address,
                                 int rw, int tlb_error)
 {
 }

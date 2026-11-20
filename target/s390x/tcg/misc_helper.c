@@ -26,9 +26,11 @@
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
 #include "qemu/timer.h"
-#include "exec/exec-all.h"
 #include "exec/cputlb.h"
-#include "exec/cpu_ldst.h"
+#include "accel/tcg/cpu-ldst-common.h"
+#include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#include "exec/target_page.h"
 #include "qapi/error.h"
 #include "tcg_s390x.h"
 #include "s390-tod.h"
@@ -42,7 +44,7 @@
 #include "hw/s390x/s390_flic.h"
 #include "hw/s390x/ioinst.h"
 #include "hw/s390x/s390-pci-inst.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "hw/s390x/tod.h"
 #include CONFIG_DEVICES
 #endif
@@ -59,7 +61,8 @@ void HELPER(exception)(CPUS390XState *env, uint32_t excp)
 {
     CPUState *cs = env_cpu(env);
 
-    HELPER_LOG("%s: exception %d\n", __func__, excp);
+    HELPER_LOG("%s: exception %d (%s)\n", __func__, excp,
+               s390x_exception_name(excp));
     cs->exception_index = excp;
     cpu_loop_exit(cs);
 }
@@ -134,13 +137,30 @@ void HELPER(diag)(CPUS390XState *env, uint32_t r1, uint32_t r3, uint32_t num)
     case 0x308:
         /* ipl */
         bql_lock();
-        handle_diag_308(env, r1, r3, GETPC());
+        if (handle_diag_308(env, r1, r3, GETPC())) {
+            /* As reset is triggered by the CPU, make sure to exit the loop */
+            cpu_loop_exit(CPU(env_archcpu(env)));
+        }
         bql_unlock();
         r = 0;
         break;
     case 0x288:
         /* time bomb (watchdog) */
         r = handle_diag_288(env, r1, r3);
+        break;
+    case 0x320:
+        /* cert store */
+        bql_lock();
+        handle_diag_320(env, r1, r3, GETPC());
+        bql_unlock();
+        r = 0;
+        break;
+    case 0x508:
+        /* secure ipl operations */
+        bql_lock();
+        handle_diag_508(env, r1, r3, GETPC());
+        bql_unlock();
+        r = 0;
         break;
     default:
         r = -1;
@@ -199,11 +219,15 @@ static void update_ckc_timer(CPUS390XState *env)
         return;
     }
 
-    /* difference between origins */
-    time = env->ckc - td->base.low;
+    if (env->ckc < td->base.low) {
+        time = 0;
+    } else {
+        /* difference between origins */
+        time = env->ckc - td->base.low;
 
-    /* nanoseconds */
-    time = tod2time(time);
+        /* nanoseconds */
+        time = tod2time(time);
+    }
 
     timer_mod(env->tod_timer, time);
 }
@@ -570,7 +594,7 @@ uint32_t HELPER(tpi)(CPUS390XState *env, uint64_t addr)
         lowcore->subchannel_nr = cpu_to_be16(io->nr);
         lowcore->io_int_parm = cpu_to_be32(io->parm);
         lowcore->io_int_word = cpu_to_be32(io->word);
-        cpu_unmap_lowcore(lowcore);
+        cpu_unmap_lowcore(env, lowcore);
     }
 
     g_free(io);
@@ -700,12 +724,14 @@ void HELPER(stfl)(CPUS390XState *env)
     lowcore = cpu_map_lowcore(env);
     prepare_stfl();
     memcpy(&lowcore->stfl_fac_list, stfl_bytes, sizeof(lowcore->stfl_fac_list));
-    cpu_unmap_lowcore(lowcore);
+    cpu_unmap_lowcore(env, lowcore);
 }
 #endif
 
 uint32_t HELPER(stfle)(CPUS390XState *env, uint64_t addr)
 {
+    const int mmu_idx = cpu_mmu_index(env_cpu(env), false);
+    const MemOpIdx oi = make_memop_idx(MO_8, mmu_idx);
     const uintptr_t ra = GETPC();
     const int count_bytes = ((env->regs[0] & 0xff) + 1) * 8;
     int max_bytes;
@@ -724,7 +750,7 @@ uint32_t HELPER(stfle)(CPUS390XState *env, uint64_t addr)
      * not store the words, and existing software depend on that.
      */
     for (i = 0; i < MIN(count_bytes, max_bytes); ++i) {
-        cpu_stb_data_ra(env, addr + i, stfl_bytes[i], ra);
+        cpu_stb_mmu(env, addr + i, stfl_bytes[i], oi, ra);
     }
 
     env->regs[0] = deposit64(env->regs[0], 0, 8, (max_bytes / 8) - 1);

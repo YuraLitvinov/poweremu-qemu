@@ -21,8 +21,8 @@
 #define TRICORE_CPU_H
 
 #include "cpu-qom.h"
-#include "hw/registerfields.h"
-#include "exec/cpu-defs.h"
+#include "hw/core/registerfields.h"
+#include "exec/cpu-common.h"
 #include "qemu/cpu-float.h"
 #include "tricore-defs.h"
 
@@ -79,7 +79,8 @@ struct TriCoreCPUClass {
     ResettablePhases parent_phases;
 };
 
-hwaddr tricore_cpu_get_phys_page_debug(CPUState *cpu, vaddr addr);
+bool tricore_cpu_translate_for_debug(CPUState *cpu, vaddr addr,
+                                     TranslateForDebugResult *result);
 void tricore_cpu_dump_state(CPUState *cpu, FILE *f, int flags);
 
 FIELD(PCXI, PCPN_13, 24, 8)
@@ -250,26 +251,12 @@ void fpu_set_state(CPUTriCoreState *env);
 
 #define MMU_USER_IDX 2
 
-#include "exec/cpu-all.h"
-
 FIELD(TB_FLAGS, PRIV, 0, 2)
 
 void cpu_state_reset(CPUTriCoreState *s);
 void tricore_tcg_init(void);
 void tricore_translate_code(CPUState *cs, TranslationBlock *tb,
                             int *max_insns, vaddr pc, void *host_pc);
-
-static inline void cpu_get_tb_cpu_state(CPUTriCoreState *env, vaddr *pc,
-                                        uint64_t *cs_base, uint32_t *flags)
-{
-    uint32_t new_flags = 0;
-    *pc = env->PC;
-    *cs_base = 0;
-
-    new_flags |= FIELD_DP32(new_flags, TB_FLAGS, PRIV,
-            extract32(env->PSW, 10, 2));
-    *flags = new_flags;
-}
 
 #define CPU_RESOLVING_TYPE TYPE_TRICORE_CPU
 

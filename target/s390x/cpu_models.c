@@ -17,6 +17,7 @@
 #include "system/kvm.h"
 #include "system/tcg.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qemu/error-report.h"
 #include "qapi/visitor.h"
 #include "qemu/module.h"
@@ -248,6 +249,7 @@ bool s390_has_feat(S390Feat feat)
     if (s390_is_pv()) {
         switch (feat) {
         case S390_FEAT_DIAG_318:
+        case S390_FEAT_CERT_STORE:
         case S390_FEAT_HPMA2:
         case S390_FEAT_SIE_F2:
         case S390_FEAT_SIE_SKEY:
@@ -262,7 +264,10 @@ bool s390_has_feat(S390Feat feat)
         case S390_FEAT_SIE_CMMA:
         case S390_FEAT_SIE_PFMFI:
         case S390_FEAT_SIE_IBS:
+        case S390_FEAT_SIPL:
+        case S390_FEAT_SCLAF:
         case S390_FEAT_CONFIGURATION_TOPOLOGY:
+        case S390_FEAT_SIE_ASTFLEIE2:
             return false;
             break;
         default:
@@ -373,7 +378,7 @@ static void s390_print_cpu_model_list_entry(gpointer data, gpointer user_data)
     g_free(name);
 }
 
-static gint s390_cpu_list_compare(gconstpointer a, gconstpointer b)
+static gint s390_cpu_list_compare(gconstpointer a, gconstpointer b, gpointer d)
 {
     const S390CPUClass *cc_a = S390_CPU_CLASS((ObjectClass *)a);
     const S390CPUClass *cc_b = S390_CPU_CLASS((ObjectClass *)b);
@@ -415,7 +420,7 @@ void s390_cpu_list(void)
 
     qemu_printf("Available CPUs:\n");
     list = object_class_get_list(TYPE_S390_CPU, false);
-    list = g_slist_sort(list, s390_cpu_list_compare);
+    list = g_slist_sort_with_data(list, s390_cpu_list_compare, NULL);
     g_slist_foreach(list, s390_print_cpu_model_list_entry, NULL);
     g_slist_free(list);
 
@@ -436,132 +441,14 @@ void s390_cpu_list(void)
 
 static void check_consistency(const S390CPUModel *model)
 {
-    static int dep[][2] = {
-        { S390_FEAT_IPTE_RANGE, S390_FEAT_DAT_ENH },
-        { S390_FEAT_IDTE_SEGMENT, S390_FEAT_DAT_ENH },
-        { S390_FEAT_IDTE_REGION, S390_FEAT_DAT_ENH },
-        { S390_FEAT_IDTE_REGION, S390_FEAT_IDTE_SEGMENT },
-        { S390_FEAT_LOCAL_TLB_CLEARING, S390_FEAT_DAT_ENH},
-        { S390_FEAT_LONG_DISPLACEMENT_FAST, S390_FEAT_LONG_DISPLACEMENT },
-        { S390_FEAT_DFP_FAST, S390_FEAT_DFP },
-        { S390_FEAT_TRANSACTIONAL_EXE, S390_FEAT_STFLE_49 },
-        { S390_FEAT_EDAT_2, S390_FEAT_EDAT},
-        { S390_FEAT_MSA_EXT_5, S390_FEAT_KIMD_SHA_512 },
-        { S390_FEAT_MSA_EXT_5, S390_FEAT_KLMD_SHA_512 },
-        { S390_FEAT_MSA_EXT_4, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_SIE_CMMA, S390_FEAT_CMM },
-        { S390_FEAT_SIE_CMMA, S390_FEAT_SIE_GSLS },
-        { S390_FEAT_SIE_PFMFI, S390_FEAT_EDAT },
-        { S390_FEAT_MSA_EXT_8, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_MSA_EXT_9, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_MSA_EXT_9, S390_FEAT_MSA_EXT_4 },
-        { S390_FEAT_MULTIPLE_EPOCH, S390_FEAT_TOD_CLOCK_STEERING },
-        { S390_FEAT_VECTOR_PACKED_DECIMAL, S390_FEAT_VECTOR },
-        { S390_FEAT_VECTOR_PACKED_DECIMAL_ENH, S390_FEAT_VECTOR_PACKED_DECIMAL },
-        { S390_FEAT_VECTOR_PACKED_DECIMAL_ENH2, S390_FEAT_VECTOR_PACKED_DECIMAL_ENH },
-        { S390_FEAT_VECTOR_PACKED_DECIMAL_ENH3, S390_FEAT_VECTOR_PACKED_DECIMAL_ENH2 },
-        { S390_FEAT_VECTOR_ENH, S390_FEAT_VECTOR },
-        { S390_FEAT_VECTOR_ENH2, S390_FEAT_VECTOR_ENH },
-        { S390_FEAT_VECTOR_ENH3, S390_FEAT_VECTOR_ENH2 },
-        { S390_FEAT_INSTRUCTION_EXEC_PROT, S390_FEAT_SIDE_EFFECT_ACCESS_ESOP2 },
-        { S390_FEAT_SIDE_EFFECT_ACCESS_ESOP2, S390_FEAT_ESOP },
-        { S390_FEAT_CMM_NT, S390_FEAT_CMM },
-        { S390_FEAT_GUARDED_STORAGE, S390_FEAT_SIDE_EFFECT_ACCESS_ESOP2 },
-        { S390_FEAT_MULTIPLE_EPOCH, S390_FEAT_STORE_CLOCK_FAST },
-        { S390_FEAT_MULTIPLE_EPOCH, S390_FEAT_TOD_CLOCK_STEERING },
-        { S390_FEAT_SEMAPHORE_ASSIST, S390_FEAT_STFLE_49 },
-        { S390_FEAT_KIMD_SHA3_224, S390_FEAT_MSA },
-        { S390_FEAT_KIMD_SHA3_256, S390_FEAT_MSA },
-        { S390_FEAT_KIMD_SHA3_384, S390_FEAT_MSA },
-        { S390_FEAT_KIMD_SHA3_512, S390_FEAT_MSA },
-        { S390_FEAT_KIMD_SHAKE_128, S390_FEAT_MSA },
-        { S390_FEAT_KIMD_SHAKE_256, S390_FEAT_MSA },
-        { S390_FEAT_KLMD_SHA3_224, S390_FEAT_MSA },
-        { S390_FEAT_KLMD_SHA3_256, S390_FEAT_MSA },
-        { S390_FEAT_KLMD_SHA3_384, S390_FEAT_MSA },
-        { S390_FEAT_KLMD_SHA3_512, S390_FEAT_MSA },
-        { S390_FEAT_KLMD_SHAKE_128, S390_FEAT_MSA },
-        { S390_FEAT_KLMD_SHAKE_256, S390_FEAT_MSA },
-        { S390_FEAT_KMAC_HMAC_SHA_224, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KMAC_HMAC_SHA_256, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KMAC_HMAC_SHA_384, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KMAC_HMAC_SHA_512, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KMAC_HMAC_ESHA_224, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KMAC_HMAC_ESHA_256, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KMAC_HMAC_ESHA_384, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KMAC_HMAC_ESHA_512, S390_FEAT_MSA_EXT_3 },
-        { S390_FEAT_KM_FULL_XTS_AES_128, S390_FEAT_MSA_EXT_4 },
-        { S390_FEAT_KM_FULL_XTS_AES_256, S390_FEAT_MSA_EXT_4 },
-        { S390_FEAT_KM_FULL_XTS_EAES_128, S390_FEAT_MSA_EXT_4 },
-        { S390_FEAT_KM_FULL_XTS_EAES_256, S390_FEAT_MSA_EXT_4 },
-        { S390_FEAT_PRNO_TRNG_QRTCR, S390_FEAT_MSA_EXT_5 },
-        { S390_FEAT_PRNO_TRNG, S390_FEAT_MSA_EXT_5 },
-        { S390_FEAT_SIE_KSS, S390_FEAT_SIE_F2 },
-        { S390_FEAT_AP_QUERY_CONFIG_INFO, S390_FEAT_AP },
-        { S390_FEAT_AP_FACILITIES_TEST, S390_FEAT_AP },
-        { S390_FEAT_PTFF_QSIE, S390_FEAT_MULTIPLE_EPOCH },
-        { S390_FEAT_PTFF_QTOUE, S390_FEAT_MULTIPLE_EPOCH },
-        { S390_FEAT_PTFF_STOE, S390_FEAT_MULTIPLE_EPOCH },
-        { S390_FEAT_PTFF_STOUE, S390_FEAT_MULTIPLE_EPOCH },
-        { S390_FEAT_AP_QUEUE_INTERRUPT_CONTROL, S390_FEAT_AP },
-        { S390_FEAT_DIAG_318, S390_FEAT_EXTENDED_LENGTH_SCCB },
-        { S390_FEAT_NNPA, S390_FEAT_VECTOR },
-        { S390_FEAT_RDP, S390_FEAT_LOCAL_TLB_CLEARING },
-        { S390_FEAT_UV_FEAT_AP, S390_FEAT_AP },
-        { S390_FEAT_UV_FEAT_AP_INTR, S390_FEAT_UV_FEAT_AP },
-        { S390_FEAT_PFCR_QAF, S390_FEAT_CCF_BASE },
-        { S390_FEAT_PFCR_CSDST, S390_FEAT_CCF_BASE },
-        { S390_FEAT_PFCR_CSDSTG, S390_FEAT_CCF_BASE },
-        { S390_FEAT_PFCR_CSTST, S390_FEAT_CCF_BASE },
-        { S390_FEAT_PFCR_CSTSTG, S390_FEAT_CCF_BASE },
-        { S390_FEAT_INEFF_NC_TX, S390_FEAT_TRANSACTIONAL_EXE },
-        { S390_FEAT_PLO_CLO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_CSO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_DCSO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_CSSTO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_CSDSTO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_CSTSTO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TCS, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TCSG, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TCSX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TCSO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QCS, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QCSG, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QCSX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QCSO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_LO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_DLX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_DLO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TL, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TLG, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TLX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TLO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QL, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QLG, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QLX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QLO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_STO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_DST, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_DSTG, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_DSTX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_DSTO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TST, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TSTG, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TSTX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_TSTO, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QST, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QSTG, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QSTX, S390_FEAT_PLO_EXT },
-        { S390_FEAT_PLO_QSTO, S390_FEAT_PLO_EXT },
-    };
     int i;
 
-    for (i = 0; i < ARRAY_SIZE(dep); i++) {
-        if (test_bit(dep[i][0], model->features) &&
-            !test_bit(dep[i][1], model->features)) {
+    for (i = 0; i < s390_feat_deps_len; i++) {
+        if (test_bit(s390_feat_deps[i][0], model->features) &&
+            !test_bit(s390_feat_deps[i][1], model->features)) {
             warn_report("\'%s\' requires \'%s\'.",
-                        s390_feat_def(dep[i][0])->name,
-                        s390_feat_def(dep[i][1])->name);
+                        s390_feat_def(s390_feat_deps[i][0])->name,
+                        s390_feat_def(s390_feat_deps[i][1])->name);
         }
     }
 }
@@ -578,7 +465,6 @@ static void check_compat_model_failed(Error **errp,
     error_setg(errp, "%s. Maximum supported model in the current configuration: \'%s\'",
                msg, max_model->def->name);
     error_append_hint(errp, "Consider a different accelerator, try \"-accel help\"\n");
-    return;
 }
 
 static bool check_compatibility(const S390CPUModel *max_model,
@@ -713,7 +599,7 @@ static void set_feature(Object *obj, Visitor *v, const char *name,
     S390CPU *cpu = S390_CPU(obj);
     bool value;
 
-    if (dev->realized) {
+    if (qdev_is_realized(dev)) {
         error_setg(errp, "Attempt to set property '%s' on '%s' after "
                    "it was realized", name, object_get_typename(obj));
         return;
@@ -769,7 +655,7 @@ static void set_feature_group(Object *obj, Visitor *v, const char *name,
     S390CPU *cpu = S390_CPU(obj);
     bool value;
 
-    if (dev->realized) {
+    if (qdev_is_realized(dev)) {
         error_setg(errp, "Attempt to set property '%s' on '%s' after "
                    "it was realized", name, object_get_typename(obj));
         return;
@@ -907,20 +793,22 @@ void s390_cpu_model_class_register_props(ObjectClass *oc)
 
     for (feat = 0; feat < S390_FEAT_MAX; feat++) {
         const S390FeatDef *def = s390_feat_def(feat);
-        object_class_property_add(oc, def->name, "bool", get_feature,
+        object_class_property_add(oc, def->name, "bool", &bool_type_info,
+                                  get_feature,
                                   set_feature, NULL, (void *) feat);
         object_class_property_set_description(oc, def->name, def->desc);
     }
     for (group = 0; group < S390_FEAT_GROUP_MAX; group++) {
         const S390FeatGroupDef *def = s390_feat_group_def(group);
-        object_class_property_add(oc, def->name, "bool", get_feature_group,
+        object_class_property_add(oc, def->name, "bool", &bool_type_info,
+                                  get_feature_group,
                                   set_feature_group, NULL, (void *) group);
         object_class_property_set_description(oc, def->name, def->desc);
     }
 }
 
 #ifdef CONFIG_KVM
-static void s390_host_cpu_model_class_init(ObjectClass *oc, void *data)
+static void s390_host_cpu_model_class_init(ObjectClass *oc, const void *data)
 {
     S390CPUClass *xcc = S390_CPU_CLASS(oc);
 
@@ -929,7 +817,7 @@ static void s390_host_cpu_model_class_init(ObjectClass *oc, void *data)
 }
 #endif
 
-static void s390_base_cpu_model_class_init(ObjectClass *oc, void *data)
+static void s390_base_cpu_model_class_init(ObjectClass *oc, const void *data)
 {
     S390CPUClass *xcc = S390_CPU_CLASS(oc);
 
@@ -940,7 +828,7 @@ static void s390_base_cpu_model_class_init(ObjectClass *oc, void *data)
     xcc->desc = xcc->cpu_def->desc;
 }
 
-static void s390_cpu_model_class_init(ObjectClass *oc, void *data)
+static void s390_cpu_model_class_init(ObjectClass *oc, const void *data)
 {
     S390CPUClass *xcc = S390_CPU_CLASS(oc);
 
@@ -950,16 +838,16 @@ static void s390_cpu_model_class_init(ObjectClass *oc, void *data)
     xcc->desc = xcc->cpu_def->desc;
 }
 
-static void s390_qemu_cpu_model_class_init(ObjectClass *oc, void *data)
+static void s390_qemu_cpu_model_class_init(ObjectClass *oc, const void *data)
 {
     S390CPUClass *xcc = S390_CPU_CLASS(oc);
 
     xcc->is_migration_safe = true;
     xcc->desc = g_strdup_printf("QEMU Virtual CPU version %s",
-                                qemu_hw_version());
+                                QEMU_HW_VERSION);
 }
 
-static void s390_max_cpu_model_class_init(ObjectClass *oc, void *data)
+static void s390_max_cpu_model_class_init(ObjectClass *oc, const void *data)
 {
     S390CPUClass *xcc = S390_CPU_CLASS(oc);
 
@@ -1073,7 +961,7 @@ static void register_types(void)
             .instance_init = s390_cpu_model_initfn,
             .instance_finalize = s390_cpu_model_finalize,
             .class_init = s390_base_cpu_model_class_init,
-            .class_data = (void *) &s390_cpu_defs[i],
+            .class_data = &s390_cpu_defs[i],
         };
         char *name = s390_cpu_type_name(s390_cpu_defs[i].name);
         TypeInfo ti = {
@@ -1082,7 +970,7 @@ static void register_types(void)
             .instance_init = s390_cpu_model_initfn,
             .instance_finalize = s390_cpu_model_finalize,
             .class_init = s390_cpu_model_class_init,
-            .class_data = (void *) &s390_cpu_defs[i],
+            .class_data = &s390_cpu_defs[i],
         };
 
         type_register_static(&ti_base);

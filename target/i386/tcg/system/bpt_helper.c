@@ -18,9 +18,10 @@
  */
 
 #include "qemu/osdep.h"
+#include "accel/tcg/cpu-loop.h"
 #include "cpu.h"
-#include "exec/exec-all.h"
 #include "exec/helper-proto.h"
+#include "exec/watchpoint.h"
 #include "tcg/helper-tcg.h"
 
 
@@ -234,7 +235,7 @@ void breakpoint_handler(CPUState *cs)
     }
 }
 
-target_ulong helper_get_dr(CPUX86State *env, int reg)
+target_ulong HELPER(get_dr)(CPUX86State *env, int reg)
 {
     if (reg >= 4 && reg < 6) {
         if (env->cr[4] & CR4_DE_MASK) {
@@ -253,7 +254,7 @@ target_ulong helper_get_dr(CPUX86State *env, int reg)
     return env->dr[reg];
 }
 
-void helper_set_dr(CPUX86State *env, int reg, target_ulong t0)
+void HELPER(set_dr)(CPUX86State *env, int reg, target_ulong t0)
 {
     if (reg >= 4 && reg < 6) {
         if (env->cr[4] & CR4_DE_MASK) {
@@ -291,7 +292,7 @@ void helper_set_dr(CPUX86State *env, int reg, target_ulong t0)
 }
 
 /* Check if Port I/O is trapped by a breakpoint.  */
-void helper_bpt_io(CPUX86State *env, uint32_t port,
+void HELPER(bpt_io)(CPUX86State *env, uint32_t port,
                    uint32_t size, target_ulong next_eip)
 {
     target_ulong dr7 = env->dr[7];

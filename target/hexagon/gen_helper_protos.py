@@ -42,9 +42,10 @@ def gen_helper_prototype(f, tag, tagregs, tagimms):
     arguments = ", ".join(declared)
 
     ## Add the TCG_CALL_NO_RWG_SE flag to helpers that don't take the env
-    ## argument and aren't HVX instructions.  Since HVX instructions take
-    ## pointers to their arguments, they will have side effects.
-    if hex_common.need_env(tag) or hex_common.is_hvx_insn(tag):
+    ## argument and are not vector instructions. Vector pointer arguments
+    ## have side effects.
+    if (hex_common.need_env(tag) or hex_common.is_hvx_insn(tag) or
+            "A_HLX" in hex_common.attribdict[tag]):
         f.write(f"DEF_HELPER_{len(declared) - 1}({tag}, {arguments})\n")
     else:
         f.write(f"DEF_HELPER_FLAGS_{len(declared) - 1}({tag}, "
@@ -59,19 +60,8 @@ def main():
     tagimms = hex_common.get_tagimms()
 
     with open(args.out, "w") as f:
-        for tag in hex_common.tags:
-            ## Skip the priv instructions
-            if "A_PRIV" in hex_common.attribdict[tag]:
-                continue
-            ## Skip the guest instructions
-            if "A_GUEST" in hex_common.attribdict[tag]:
-                continue
-            ## Skip the diag instructions
-            if tag == "Y6_diag":
-                continue
-            if tag == "Y6_diag0":
-                continue
-            if tag == "Y6_diag1":
+        for tag in hex_common.get_user_tags():
+            if hex_common.tag_ignore(tag):
                 continue
 
             if hex_common.skip_qemu_helper(tag):
@@ -80,6 +70,18 @@ def main():
                 continue
 
             gen_helper_prototype(f, tag, tagregs, tagimms)
+
+        f.write("#if !defined(CONFIG_USER_ONLY)\n")
+        for tag in hex_common.get_sys_tags():
+            if hex_common.tag_ignore(tag):
+                continue
+            if hex_common.skip_qemu_helper(tag):
+                continue
+            if hex_common.is_idef_parser_enabled(tag):
+                continue
+
+            gen_helper_prototype(f, tag, tagregs, tagimms)
+        f.write("#endif\n")
 
 
 if __name__ == "__main__":

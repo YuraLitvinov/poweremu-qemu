@@ -19,7 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
-#include "exec/helper-proto.h"
+#include "helper.h"
 #include "internals.h"
 #include "cpu-features.h"
 #include "fpu/softfloat.h"
@@ -121,7 +121,7 @@ uint32_t vfp_get_fpsr_from_host(CPUARMState *env)
     a64_flags |= (get_float_exception_flags(&env->vfp.fp_status[FPST_A64_F16])
           & ~(float_flag_input_denormal_flushed | float_flag_input_denormal_used));
     /*
-     * We do not merge in flags from FPST_AH or FPST_AH_F16, because
+     * We do not merge in flags from FPST_{AH,ZA} or FPST_{AH,ZA}_F16, because
      * they are used for insns that must not set the cumulative exception bits.
      */
 
@@ -194,6 +194,8 @@ void vfp_set_fpcr_to_host(CPUARMState *env, uint32_t val, uint32_t mask)
         set_float_rounding_mode(i, &env->vfp.fp_status[FPST_A64]);
         set_float_rounding_mode(i, &env->vfp.fp_status[FPST_A32_F16]);
         set_float_rounding_mode(i, &env->vfp.fp_status[FPST_A64_F16]);
+        set_float_rounding_mode(i, &env->vfp.fp_status[FPST_ZA]);
+        set_float_rounding_mode(i, &env->vfp.fp_status[FPST_ZA_F16]);
     }
     if (changed & FPCR_FZ16) {
         bool ftz_enabled = val & FPCR_FZ16;
@@ -201,15 +203,18 @@ void vfp_set_fpcr_to_host(CPUARMState *env, uint32_t val, uint32_t mask)
         set_flush_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_A64_F16]);
         set_flush_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_STD_F16]);
         set_flush_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_AH_F16]);
+        set_flush_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_ZA_F16]);
         set_flush_inputs_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_A32_F16]);
         set_flush_inputs_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_A64_F16]);
         set_flush_inputs_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_STD_F16]);
         set_flush_inputs_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_AH_F16]);
+        set_flush_inputs_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_ZA_F16]);
     }
     if (changed & FPCR_FZ) {
         bool ftz_enabled = val & FPCR_FZ;
         set_flush_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_A32]);
         set_flush_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_A64]);
+        set_flush_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_ZA]);
         /* FIZ is A64 only so FZ always makes A32 code flush inputs to zero */
         set_flush_inputs_to_zero(ftz_enabled, &env->vfp.fp_status[FPST_A32]);
     }
@@ -221,6 +226,7 @@ void vfp_set_fpcr_to_host(CPUARMState *env, uint32_t val, uint32_t mask)
         bool fitz_enabled = (val & FPCR_FIZ) ||
             (val & (FPCR_FZ | FPCR_AH)) == FPCR_FZ;
         set_flush_inputs_to_zero(fitz_enabled, &env->vfp.fp_status[FPST_A64]);
+        set_flush_inputs_to_zero(fitz_enabled, &env->vfp.fp_status[FPST_ZA]);
     }
     if (changed & FPCR_DN) {
         bool dnan_enabled = val & FPCR_DN;
@@ -238,9 +244,13 @@ void vfp_set_fpcr_to_host(CPUARMState *env, uint32_t val, uint32_t mask)
             /* Change behaviours for A64 FP operations */
             arm_set_ah_fp_behaviours(&env->vfp.fp_status[FPST_A64]);
             arm_set_ah_fp_behaviours(&env->vfp.fp_status[FPST_A64_F16]);
+            arm_set_ah_fp_behaviours(&env->vfp.fp_status[FPST_ZA]);
+            arm_set_ah_fp_behaviours(&env->vfp.fp_status[FPST_ZA_F16]);
         } else {
             arm_set_default_fp_behaviours(&env->vfp.fp_status[FPST_A64]);
             arm_set_default_fp_behaviours(&env->vfp.fp_status[FPST_A64_F16]);
+            arm_set_default_fp_behaviours(&env->vfp.fp_status[FPST_ZA]);
+            arm_set_default_fp_behaviours(&env->vfp.fp_status[FPST_ZA_F16]);
         }
     }
     /*
@@ -413,10 +423,10 @@ ftype HELPER(vfp_##name##to##p)(uint##isz##_t  x, uint32_t shift,      \
                                                      float_status *fpst) \
     {                                                                  \
         ftype ret;                                                     \
-        FloatRoundMode oldmode = fpst->float_rounding_mode;            \
-        fpst->float_rounding_mode = float_round_nearest_even;          \
+        FloatRoundMode oldmode = get_float_rounding_mode(fpst);        \
+        set_float_rounding_mode(float_round_nearest_even, fpst);       \
         ret = itype##_to_##float##fsz##_scalbn(x, -shift, fpst);       \
-        fpst->float_rounding_mode = oldmode;                           \
+        set_float_rounding_mode(oldmode, fpst);                        \
         return ret;                                                    \
     }
 
@@ -653,7 +663,7 @@ static uint64_t call_recip_estimate(int *exp, int exp_off, uint64_t frac,
 
 static bool round_to_inf(float_status *fpst, bool sign_bit)
 {
-    switch (fpst->float_rounding_mode) {
+    switch (get_float_rounding_mode(fpst)) {
     case float_round_nearest_even: /* Round to Nearest */
         return true;
     case float_round_up: /* Round to +Inf */
@@ -680,11 +690,11 @@ uint32_t HELPER(recpe_f16)(uint32_t input, float_status *fpst)
         float16 nan = f16;
         if (float16_is_signaling_nan(f16, fpst)) {
             float_raise(float_flag_invalid, fpst);
-            if (!fpst->default_nan_mode) {
+            if (!get_default_nan_mode(fpst)) {
                 nan = float16_silence_nan(f16, fpst);
             }
         }
-        if (fpst->default_nan_mode) {
+        if (get_default_nan_mode(fpst)) {
             nan =  float16_default_nan(fpst);
         }
         return nan;
@@ -701,7 +711,7 @@ uint32_t HELPER(recpe_f16)(uint32_t input, float_status *fpst)
         } else {
             return float16_set_sign(float16_maxnorm, f16_sign);
         }
-    } else if (f16_exp >= 29 && fpst->flush_to_zero) {
+    } else if (f16_exp >= 29 && get_flush_to_zero(fpst)) {
         float_raise(float_flag_underflow, fpst);
         return float16_set_sign(float16_zero, float16_is_neg(f16));
     }
@@ -733,11 +743,11 @@ static float32 do_recpe_f32(float32 input, float_status *fpst, bool rpres)
         float32 nan = f32;
         if (float32_is_signaling_nan(f32, fpst)) {
             float_raise(float_flag_invalid, fpst);
-            if (!fpst->default_nan_mode) {
+            if (!get_default_nan_mode(fpst)) {
                 nan = float32_silence_nan(f32, fpst);
             }
         }
-        if (fpst->default_nan_mode) {
+        if (get_default_nan_mode(fpst)) {
             nan =  float32_default_nan(fpst);
         }
         return nan;
@@ -754,7 +764,7 @@ static float32 do_recpe_f32(float32 input, float_status *fpst, bool rpres)
         } else {
             return float32_set_sign(float32_maxnorm, f32_sign);
         }
-    } else if (f32_exp >= 253 && fpst->flush_to_zero) {
+    } else if (f32_exp >= 253 && get_flush_to_zero(fpst)) {
         float_raise(float_flag_underflow, fpst);
         return float32_set_sign(float32_zero, float32_is_neg(f32));
     }
@@ -792,11 +802,11 @@ float64 HELPER(recpe_f64)(float64 input, float_status *fpst)
         float64 nan = f64;
         if (float64_is_signaling_nan(f64, fpst)) {
             float_raise(float_flag_invalid, fpst);
-            if (!fpst->default_nan_mode) {
+            if (!get_default_nan_mode(fpst)) {
                 nan = float64_silence_nan(f64, fpst);
             }
         }
-        if (fpst->default_nan_mode) {
+        if (get_default_nan_mode(fpst)) {
             nan =  float64_default_nan(fpst);
         }
         return nan;
@@ -813,7 +823,7 @@ float64 HELPER(recpe_f64)(float64 input, float_status *fpst)
         } else {
             return float64_set_sign(float64_maxnorm, f64_sign);
         }
-    } else if (f64_exp >= 2045 && fpst->flush_to_zero) {
+    } else if (f64_exp >= 2045 && get_flush_to_zero(fpst)) {
         float_raise(float_flag_underflow, fpst);
         return float64_set_sign(float64_zero, float64_is_neg(f64));
     }
@@ -935,11 +945,11 @@ uint32_t HELPER(rsqrte_f16)(uint32_t input, float_status *s)
         float16 nan = f16;
         if (float16_is_signaling_nan(f16, s)) {
             float_raise(float_flag_invalid, s);
-            if (!s->default_nan_mode) {
+            if (!get_default_nan_mode(s)) {
                 nan = float16_silence_nan(f16, s);
             }
         }
-        if (s->default_nan_mode) {
+        if (get_default_nan_mode(s)) {
             nan =  float16_default_nan(s);
         }
         return nan;
@@ -984,11 +994,11 @@ static float32 do_rsqrte_f32(float32 input, float_status *s, bool rpres)
         float32 nan = f32;
         if (float32_is_signaling_nan(f32, s)) {
             float_raise(float_flag_invalid, s);
-            if (!s->default_nan_mode) {
+            if (!get_default_nan_mode(s)) {
                 nan = float32_silence_nan(f32, s);
             }
         }
-        if (s->default_nan_mode) {
+        if (get_default_nan_mode(s)) {
             nan =  float32_default_nan(s);
         }
         return nan;
@@ -1046,11 +1056,11 @@ float64 HELPER(rsqrte_f64)(float64 input, float_status *s)
         float64 nan = f64;
         if (float64_is_signaling_nan(f64, s)) {
             float_raise(float_flag_invalid, s);
-            if (!s->default_nan_mode) {
+            if (!get_default_nan_mode(s)) {
                 nan = float64_silence_nan(f64, s);
             }
         }
-        if (s->default_nan_mode) {
+        if (get_default_nan_mode(s)) {
             nan =  float64_default_nan(s);
         }
         return nan;
@@ -1349,10 +1359,7 @@ void HELPER(check_hcr_el2_trap)(CPUARMState *env, uint32_t rt, uint32_t reg)
         g_assert_not_reached();
     }
 
-    syndrome = ((EC_FPIDTRAP << ARM_EL_EC_SHIFT)
-                | ARM_EL_IL
-                | (1 << 24) | (0xe << 20) | (7 << 14)
-                | (reg << 10) | (rt << 5) | 1);
+    syndrome = syn_cp10_rt_trap(1, 0xe, 7, reg, rt, 1);
 
     raise_exception(env, EXCP_HYP_TRAP, syndrome, 2);
 }

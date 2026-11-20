@@ -20,15 +20,18 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "qemu/qemu-print.h"
 #include "qemu/timer.h"
 #include "cpu.h"
 #include "qemu/module.h"
-#include "exec/exec-all.h"
 #include "exec/translation-block.h"
+#include "exec/target_page.h"
 #include "fpu/softfloat.h"
 #include "tcg/tcg.h"
 #include "hw/hppa/hppa_hardware.h"
+#include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/cpu-ops.h"
 
 static void hppa_cpu_set_pc(CPUState *cs, vaddr value)
 {
@@ -50,11 +53,12 @@ static vaddr hppa_cpu_get_pc(CPUState *cs)
                          env->iaoq_f & -4);
 }
 
-void cpu_get_tb_cpu_state(CPUHPPAState *env, vaddr *pc,
-                          uint64_t *pcsbase, uint32_t *pflags)
+static TCGTBCPUState hppa_get_tb_cpu_state(CPUState *cs)
 {
+    CPUHPPAState *env = cpu_env(cs);
     uint32_t flags = 0;
     uint64_t cs_base = 0;
+    vaddr pc;
 
     /*
      * TB lookup assumes that PC contains the complete virtual address.
@@ -62,7 +66,7 @@ void cpu_get_tb_cpu_state(CPUHPPAState *env, vaddr *pc,
      * incomplete virtual address.  This also means that we must separate
      * out current cpu privilege from the low bits of IAOQ_F.
      */
-    *pc = hppa_cpu_get_pc(env_cpu(env));
+    pc = hppa_cpu_get_pc(env_cpu(env));
     flags |= (env->iaoq_f & 3) << TB_FLAG_PRIV_SHIFT;
 
     /*
@@ -87,6 +91,7 @@ void cpu_get_tb_cpu_state(CPUHPPAState *env, vaddr *pc,
 #ifdef CONFIG_USER_ONLY
     flags |= TB_FLAG_UNALIGN * !env_cpu(env)->prctl_unalign_sigbus;
 #else
+    flags |= TB_FLAG_FPU_DISABLED * !(env->cr[CR_SCRCCR] & 0xc0);
     if ((env->sr[4] == env->sr[5])
         & (env->sr[4] == env->sr[6])
         & (env->sr[4] == env->sr[7])) {
@@ -98,8 +103,7 @@ void cpu_get_tb_cpu_state(CPUHPPAState *env, vaddr *pc,
     }
 #endif
 
-    *pcsbase = cs_base;
-    *pflags = flags;
+    return (TCGTBCPUState){ .pc = pc, .flags = flags, .cs_base = cs_base };
 }
 
 static void hppa_cpu_synchronize_from_tb(CPUState *cs,
@@ -134,7 +138,7 @@ static void hppa_restore_state_to_opc(CPUState *cs,
 #ifndef CONFIG_USER_ONLY
 static bool hppa_cpu_has_work(CPUState *cs)
 {
-    return cs->interrupt_request & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI);
+    return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI);
 }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -149,7 +153,7 @@ static int hppa_cpu_mmu_index(CPUState *cs, bool ifetch)
     return env->psw & PSW_W ? MMU_ABS_W_IDX : MMU_ABS_IDX;
 }
 
-static void hppa_cpu_disas_set_info(CPUState *cs, disassemble_info *info)
+static void hppa_cpu_disas_set_info(const CPUState *cs, disassemble_info *info)
 {
     info->mach = bfd_mach_hppa20;
     info->endian = BFD_ENDIAN_BIG;
@@ -179,7 +183,7 @@ static void hppa_cpu_realizefn(DeviceState *dev, Error **errp)
     HPPACPUClass *acc = HPPA_CPU_GET_CLASS(dev);
     Error *local_err = NULL;
 
-    cpu_exec_realizefn(cs, &local_err);
+    cpu_common_realize(cs, &local_err);
     if (local_err != NULL) {
         error_propagate(errp, local_err);
         return;
@@ -200,13 +204,6 @@ static void hppa_cpu_realizefn(DeviceState *dev, Error **errp)
 
     /* Use pc-relative instructions always to simplify the translator. */
     tcg_cflags_set(cs, CF_PCREL);
-}
-
-static void hppa_cpu_initfn(Object *obj)
-{
-    CPUHPPAState *env = cpu_env(CPU(obj));
-
-    env->is_pa20 = !!object_dynamic_cast(obj, TYPE_HPPA64_CPU);
 }
 
 static void hppa_cpu_reset_hold(Object *obj, ResetType type)
@@ -235,9 +232,14 @@ static void hppa_cpu_reset_hold(Object *obj, ResetType type)
 
 static ObjectClass *hppa_cpu_class_by_name(const char *cpu_model)
 {
-    g_autofree char *typename = g_strconcat(cpu_model, "-cpu", NULL);
+    ObjectClass *oc;
+    char *typename;
 
-    return object_class_by_name(typename);
+    typename = g_strdup_printf(HPPA_CPU_TYPE_NAME("%s"), cpu_model);
+    oc = object_class_by_name(typename);
+    g_free(typename);
+
+    return oc;
 }
 
 #ifndef CONFIG_USER_ONLY
@@ -245,29 +247,92 @@ static ObjectClass *hppa_cpu_class_by_name(const char *cpu_model)
 
 static const struct SysemuCPUOps hppa_sysemu_ops = {
     .has_work = hppa_cpu_has_work,
-    .get_phys_page_debug = hppa_cpu_get_phys_page_debug,
+    .translate_for_debug = hppa_cpu_translate_for_debug,
 };
 #endif
 
-#include "accel/tcg/cpu-ops.h"
-
 static const TCGCPUOps hppa_tcg_ops = {
+    /* PA-RISC 1.x processors have a strong memory model.  */
+    /*
+     * ??? While we do not yet implement PA-RISC 2.0, those processors have
+     * a weak memory model, but with TLB bits that force ordering on a per-page
+     * basis.  It's probably easier to fall back to a strong memory model.
+     */
+    .guest_default_memory_order = TCG_MO_ALL,
+    .mttcg_supported = true,
+
     .initialize = hppa_translate_init,
     .translate_code = hppa_translate_code,
+    .get_tb_cpu_state = hppa_get_tb_cpu_state,
     .synchronize_from_tb = hppa_cpu_synchronize_from_tb,
     .restore_state_to_opc = hppa_restore_state_to_opc,
+    .mmu_index = hppa_cpu_mmu_index,
 
 #ifndef CONFIG_USER_ONLY
     .tlb_fill_align = hppa_cpu_tlb_fill_align,
+    .pointer_wrap = cpu_pointer_wrap_notreached,
     .cpu_exec_interrupt = hppa_cpu_exec_interrupt,
-    .cpu_exec_halt = hppa_cpu_has_work,
+    .cpu_exec_reset = cpu_reset,
     .do_interrupt = hppa_cpu_do_interrupt,
     .do_unaligned_access = hppa_cpu_do_unaligned_access,
     .do_transaction_failed = hppa_cpu_do_transaction_failed,
 #endif /* !CONFIG_USER_ONLY */
 };
 
-static void hppa_cpu_class_init(ObjectClass *oc, void *data)
+static void hppa_cpu_class_base_init(ObjectClass *oc, const void *data)
+{
+    HPPACPUClass *acc = HPPA_CPU_CLASS(oc);
+    /* Make sure all CPU models define a HPPACPUDef */
+    g_assert(!object_class_is_abstract(oc) && data != NULL);
+    acc->def = data;
+    /*
+     * Verify assumptions made in hppa_abs_to_phys_pa2_w1() on the size
+     * of the physical address space.
+     */
+    g_assert(acc->def->phys_addr_bits <= 54);
+}
+
+const char *hppa_exception_name(int excp)
+{
+    static const char * const excp_names[] = {
+        [EXCP_HPMC]          = "high priority machine check",
+        [EXCP_POWER_FAIL]    = "power fail interrupt",
+        [EXCP_RC]            = "recovery counter trap",
+        [EXCP_EXT_INTERRUPT] = "external interrupt",
+        [EXCP_LPMC]          = "low priority machine check",
+        [EXCP_ITLB_MISS]     = "instruction tlb miss fault",
+        [EXCP_IMP]           = "instruction memory protection trap",
+        [EXCP_ILL]           = "illegal instruction trap",
+        [EXCP_BREAK]         = "break instruction trap",
+        [EXCP_PRIV_OPR]      = "privileged operation trap",
+        [EXCP_PRIV_REG]      = "privileged register trap",
+        [EXCP_OVERFLOW]      = "overflow trap",
+        [EXCP_COND]          = "conditional trap",
+        [EXCP_ASSIST]        = "assist exception trap",
+        [EXCP_DTLB_MISS]     = "data tlb miss fault",
+        [EXCP_NA_ITLB_MISS]  = "non-access instruction tlb miss",
+        [EXCP_NA_DTLB_MISS]  = "non-access data tlb miss",
+        [EXCP_DMP]           = "data memory protection trap",
+        [EXCP_DMB]           = "data memory break trap",
+        [EXCP_TLB_DIRTY]     = "tlb dirty bit trap",
+        [EXCP_PAGE_REF]      = "page reference trap",
+        [EXCP_ASSIST_EMU]    = "assist emulation trap",
+        [EXCP_HPT]           = "high-privilege transfer trap",
+        [EXCP_LPT]           = "low-privilege transfer trap",
+        [EXCP_TB]            = "taken branch trap",
+        [EXCP_DMAR]          = "data memory access rights trap",
+        [EXCP_DMPI]          = "data memory protection id trap",
+        [EXCP_UNALIGN]       = "unaligned data reference trap",
+        [EXCP_PER_INTERRUPT] = "performance monitor interrupt",
+        [EXCP_SYSCALL]       = "syscall",
+        [EXCP_SYSCALL_LWS]   = "syscall-lws",
+        [EXCP_TOC]           = "TOC (transfer of control)",
+    };
+
+    return STR_ARRAY_ELEM_OR_NULL(excp_names, excp) ?: "unknown";
+}
+
+static void hppa_cpu_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     CPUClass *cc = CPU_CLASS(oc);
@@ -281,7 +346,7 @@ static void hppa_cpu_class_init(ObjectClass *oc, void *data)
                                        &acc->parent_phases);
 
     cc->class_by_name = hppa_cpu_class_by_name;
-    cc->mmu_index = hppa_cpu_mmu_index;
+    cc->exception_name = hppa_exception_name;
     cc->dump_state = hppa_cpu_dump_state;
     cc->set_pc = hppa_cpu_set_pc;
     cc->get_pc = hppa_cpu_get_pc;
@@ -302,14 +367,34 @@ static const TypeInfo hppa_cpu_type_infos[] = {
         .parent = TYPE_CPU,
         .instance_size = sizeof(HPPACPU),
         .instance_align = __alignof(HPPACPU),
-        .instance_init = hppa_cpu_initfn,
-        .abstract = false,
+        .abstract = true,
         .class_size = sizeof(HPPACPUClass),
         .class_init = hppa_cpu_class_init,
+        .class_base_init = hppa_cpu_class_base_init,
     },
     {
-        .name = TYPE_HPPA64_CPU,
+        .name = TYPE_HPPA_CPU_PA_7300LC,
         .parent = TYPE_HPPA_CPU,
+        .class_data = &(const HPPACPUDef) {
+            .phys_addr_bits = 32,
+            .is_pa20 = false,
+        },
+    },
+    {
+        .name = TYPE_HPPA_CPU_PA_8500,
+        .parent = TYPE_HPPA_CPU,
+        .class_data = &(const HPPACPUDef) {
+            .phys_addr_bits = 40,
+            .is_pa20 = true,
+        },
+    },
+    {
+        .name = TYPE_HPPA_CPU_PA_8700,
+        .parent = TYPE_HPPA_CPU,
+        .class_data = &(const HPPACPUDef) {
+            .phys_addr_bits = 44,
+            .is_pa20 = true,
+        },
     },
 };
 

@@ -25,8 +25,8 @@
 #include "mmu-hash64.h"
 #include "mmu-hash32.h"
 #include "exec/cputlb.h"
-#include "exec/exec-all.h"
 #include "exec/page-protection.h"
+#include "exec/target_page.h"
 #include "exec/log.h"
 #include "helper_regs.h"
 #include "qemu/error-report.h"
@@ -36,7 +36,7 @@
 #include "mmu-radix64.h"
 #include "mmu-booke.h"
 #include "exec/helper-proto.h"
-#include "exec/cpu_ldst.h"
+#include "accel/tcg/cpu-ldst.h"
 
 /* #define FLUSH_ALL_TLBS */
 
@@ -147,27 +147,11 @@ static void booke206_flush_tlb(CPUPPCState *env, int flags,
 /* BATs management */
 #if !defined(FLUSH_ALL_TLBS)
 static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
-                                     target_ulong mask, bool data)
+                                     target_ulong mask)
 {
     CPUState *cs = env_cpu(env);
     target_ulong base, end, page;
 
-    /*
-     * A BAT with neither Vs nor Vp set maps nothing, so no TLB entry can
-     * have come from it: when it became invalid its old range was flushed.
-     * Mac OS X's physical-copy window sets DBAT0/1 and clears them again
-     * around every copy -- tens of thousands of times a second -- and
-     * flushing the invalid side each time was half of its BAT cost.
-     * PPC_BAT_SKIP_INVALID=0 flushes them anyway.
-     */
-    static int skip_invalid = -1;
-    if (skip_invalid < 0) {
-        const char *e = getenv("PPC_BAT_SKIP_INVALID");
-        skip_invalid = !(e && e[0] == '0');
-    }
-    if (skip_invalid && !(BATu & (BATU32_VS | BATU32_VP))) {
-        return;
-    }
     base = BATu & ~0x0001FFFF;
     end = base + mask + 0x00020000;
     if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
@@ -180,27 +164,6 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     qemu_log_mask(CPU_LOG_MMU, "Flush BAT from " TARGET_FMT_lx
                   " to " TARGET_FMT_lx " (" TARGET_FMT_lx ")\n",
                   base, end, mask);
-    /*
-     * A data BAT translates only data accesses made with translation on:
-     * no instruction fetch, and no real-mode index (bit 1 of the PPC MMU
-     * index set; 0x3333 are the others, with the SR slots' bits 2-3).  So
-     * leave the jump cache and the other indexes alone -- Tiger rewrites
-     * DBAT0/1 tens of thousands of times a second during file I/O, and
-     * flushing every page of every index plus the jump cache was three
-     * quarters of the vCPU's time in a file copy.  PPC_DBAT_FAST=0 flushes
-     * as for any page.
-     */
-    static int fast = -1;
-    if (fast < 0) {
-        const char *e = getenv("PPC_DBAT_FAST");
-        fast = !(e && e[0] == '0');
-    }
-    if (data && fast && env->mmu_model == POWERPC_MMU_32B) {
-        tlb_flush_data_pages_by_mmuidx(cs, base, (end - base) >> TARGET_PAGE_BITS,
-                                       0x3333);
-        qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
-        return;
-    }
     for (page = base; page != end; page += TARGET_PAGE_SIZE) {
         tlb_flush_page(cs, page);
     }
@@ -216,16 +179,15 @@ static inline void dump_store_bat(CPUPPCState *env, char ID, int ul, int nr,
                   value, env->nip);
 }
 
-void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
+void HELPER(store_ibatu)(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
     target_ulong mask;
 
     dump_store_bat(env, 'I', 0, nr, value);
     if (env->IBAT[0][nr] != value) {
-        /* the old range, sized by the old BL (the new one may be smaller) */
-        mask = (env->IBAT[0][nr] << 15) & 0x0FFE0000UL;
+        mask = (value << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask, false);
+        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
 #endif
         /*
          * When storing valid upper BAT, mask BEPI and BRPN and
@@ -237,20 +199,20 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->IBAT[1][nr] = (env->IBAT[1][nr] & 0x0000007B) |
             (env->IBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask, false);
+        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
 #else
         tlb_flush(env_cpu(env));
 #endif
     }
 }
 
-void helper_store_ibatl(CPUPPCState *env, uint32_t nr, target_ulong value)
+void HELPER(store_ibatl)(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
     dump_store_bat(env, 'I', 1, nr, value);
     env->IBAT[1][nr] = value;
 }
 
-void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
+void HELPER(store_dbatu)(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
     target_ulong mask;
 
@@ -260,10 +222,9 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
          * When storing valid upper BAT, mask BEPI and BRPN and
          * invalidate all TLBs covered by this BAT
          */
-        /* the old range, sized by the old BL (the new one may be smaller) */
-        mask = (env->DBAT[0][nr] << 15) & 0x0FFE0000UL;
+        mask = (value << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask, true);
+        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
 #endif
         mask = (value << 15) & 0x0FFE0000UL;
         env->DBAT[0][nr] = (value & 0x00001FFFUL) |
@@ -271,14 +232,14 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->DBAT[1][nr] = (env->DBAT[1][nr] & 0x0000007B) |
             (env->DBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask, true);
+        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
 #else
         tlb_flush(env_cpu(env));
 #endif
     }
 }
 
-void helper_store_dbatl(CPUPPCState *env, uint32_t nr, target_ulong value)
+void HELPER(store_dbatl)(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
     dump_store_bat(env, 'D', 1, nr, value);
     env->DBAT[1][nr] = value;
@@ -317,76 +278,12 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
     case POWERPC_MMU_32B:
         env->tlb_need_flush = 0;
         tlb_flush(env_cpu(env));
-        ppc_mmu_slots_reset(env);
         break;
     default:
         /* XXX: TODO */
         cpu_abort(env_cpu(env), "Unknown MMU model %x\n", env->mmu_model);
         break;
     }
-}
-
-/*
- * A 32-bit hash MMU's TLB is tagged with the VSID, so reloading the segment
- * registers keeps it, and Mac OS X reloads them on every exception entry and
- * exit to switch between the kernel's and the user's address space.  QEMU's
- * TLB is indexed by effective address instead, and flushing it on each of
- * those switches made the guest walk its page table millions of times a
- * second.  So each recently used set of segment register values gets its
- * own pair of MMU indexes (translated, user and supervisor; see
- * ppc_env_mmu_index) and switching sets only evicts the least recently used
- * one.  tlbie and tlbia still flush every set.
- *
- * Called at the context-synchronizing event after the segment registers
- * changed.
- */
-void ppc_mmu_slot_sync(CPUPPCState *env)
-{
-    int i, victim = 0;
-
-    for (i = 0; i < PPC_MMU_SLOTS; i++) {
-        if (env->mmu_slot_used[i] &&
-            !memcmp(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]))) {
-            break;
-        }
-        if (env->mmu_slot_used[i] < env->mmu_slot_used[victim]) {
-            victim = i;
-        }
-    }
-    if (i == PPC_MMU_SLOTS) {
-        i = victim;
-        memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));
-        tlb_flush_by_mmuidx(env_cpu(env), 3 << (4 * i));
-    }
-    env->mmu_slot_used[i] = ++env->mmu_slot_clock;
-    env->mmu_slot = i;
-}
-
-/* After the whole QEMU TLB was flushed: only the current set is cached. */
-void ppc_mmu_slots_reset(CPUPPCState *env)
-{
-    env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
-    memset(env->mmu_slot_used, 0, sizeof(env->mmu_slot_used));
-    memcpy(env->mmu_slot_sr[env->mmu_slot], env->sr,
-           sizeof(env->mmu_slot_sr[0]));
-    env->mmu_slot_used[env->mmu_slot] = ++env->mmu_slot_clock;
-}
-
-/*
- * Whether tlbie flushes the whole TLB, as the architecture allows and QEMU
- * has always done, or only the page it names (PPC_TLBIE=page).  Flushing
- * just the named pages sounds better and measures the same once emptying
- * the TB jump cache is O(1), so the faithful behaviour stays the default.
- */
-static bool ppc_tlbie_flushes_all(void)
-{
-    static int mode = -1;
-
-    if (mode < 0) {
-        const char *s = getenv("PPC_TLBIE");
-        mode = !(s && !strcmp(s, "page"));
-    }
-    return mode;
 }
 
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
@@ -413,19 +310,10 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
         /*
          * Actual CPUs invalidate entire congruence classes based on
          * the geometry of their TLBs and some OSes take that into
-         * account.  Remember the page this tlbie named instead, and flush
-         * just those at the next context-synchronizing event; an OS that
-         * leans on congruence-class behaviour (rather than naming every
-         * page it changes, as Darwin and Linux do) needs the default.
+         * account, we just mark the TLB to be flushed later (context
+         * synchronizing event or sync instruction on 32-bit).
          */
-        if (ppc_tlbie_flushes_all()) {
-            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
-        } else if (env->tlb_flush_npages < PPC_TLB_PENDING_PAGES) {
-            env->tlb_flush_pages[env->tlb_flush_npages++] = addr;
-            env->tlb_need_flush |= TLB_NEED_PAGE_FLUSH;
-        } else {
-            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
-        }
+        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
         break;
     default:
         /* Should never reach here with other MMU models */
@@ -440,19 +328,7 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 /* Special registers manipulation */
 
 /* Segment registers load and store */
-
-/* PPC_SR_SLOTS=0 flushes the whole TLB on every segment register change. */
-static bool ppc_mmu_slots_on(void)
-{
-    static int on = -1;
-
-    if (on < 0) {
-        const char *s = getenv("PPC_SR_SLOTS");
-        on = !(s && !strcmp(s, "0"));
-    }
-    return on;
-}
-target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
+target_ulong HELPER(load_sr)(CPUPPCState *env, target_ulong sr_num)
 {
 #if defined(TARGET_PPC64)
     if (mmu_is_64bit(env->mmu_model)) {
@@ -463,7 +339,7 @@ target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
     return env->sr[sr_num];
 }
 
-void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
+void HELPER(store_sr)(CPUPPCState *env, target_ulong srnum, target_ulong value)
 {
     qemu_log_mask(CPU_LOG_MMU,
             "%s: reg=%d " TARGET_FMT_lx " " TARGET_FMT_lx "\n", __func__,
@@ -501,20 +377,18 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
             }
         }
 #else
-        env->tlb_need_flush |= env->mmu_model == POWERPC_MMU_32B &&
-                               ppc_mmu_slots_on() ?
-                               TLB_NEED_SR_SWITCH : TLB_NEED_LOCAL_FLUSH;
+        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
 #endif
     }
 }
 
 /* TLB management */
-void helper_tlbia(CPUPPCState *env)
+void HELPER(tlbia)(CPUPPCState *env)
 {
     ppc_tlb_invalidate_all(env);
 }
 
-void helper_tlbie(CPUPPCState *env, target_ulong addr)
+void HELPER(tlbie)(CPUPPCState *env, target_ulong addr)
 {
     ppc_tlb_invalidate_one(env, addr);
 }
@@ -544,7 +418,7 @@ void helper_tlbie(CPUPPCState *env, target_ulong addr)
 #define TLBIE_RB_IS_MASK    PPC_BITMASK(52, 53)
 #define TLBIE_RB_AP_MASK    PPC_BITMASK(56, 58)
 
-void helper_tlbie_isa300(CPUPPCState *env, target_ulong rb, target_ulong rs,
+void HELPER(tlbie_isa300)(CPUPPCState *env, target_ulong rb, target_ulong rs,
                          uint32_t flags)
 {
     unsigned ric = (flags & TLBIE_F_RIC_MASK) >> TLBIE_F_RIC_SHIFT;
@@ -673,7 +547,7 @@ invalid:
 
 #endif
 
-void helper_tlbiva(CPUPPCState *env, target_ulong addr)
+void HELPER(tlbiva)(CPUPPCState *env, target_ulong addr)
 {
     /* tlbiva instruction only exists on BookE */
     assert(env->mmu_model == POWERPC_MMU_BOOKE);
@@ -706,12 +580,12 @@ static void do_6xx_tlb(CPUPPCState *env, target_ulong new_EPN, int is_code)
                      way, is_code, CMP, RPN);
 }
 
-void helper_6xx_tlbd(CPUPPCState *env, target_ulong EPN)
+void HELPER(6xx_tlbd)(CPUPPCState *env, target_ulong EPN)
 {
     do_6xx_tlb(env, EPN, 0);
 }
 
-void helper_6xx_tlbi(CPUPPCState *env, target_ulong EPN)
+void HELPER(6xx_tlbi)(CPUPPCState *env, target_ulong EPN)
 {
     do_6xx_tlb(env, EPN, 1);
 }
@@ -800,7 +674,7 @@ static inline int booke_page_size_to_tlb(target_ulong page_size)
 #define PPC4XX_TLBLO_ATTR_MASK      0x000000FF
 #define PPC4XX_TLBLO_RPN_MASK       0xFFFFFC00
 
-void helper_store_40x_pid(CPUPPCState *env, target_ulong val)
+void HELPER(store_40x_pid)(CPUPPCState *env, target_ulong val)
 {
     if (env->spr[SPR_40x_PID] != val) {
         env->spr[SPR_40x_PID] = val;
@@ -808,7 +682,7 @@ void helper_store_40x_pid(CPUPPCState *env, target_ulong val)
     }
 }
 
-target_ulong helper_4xx_tlbre_hi(CPUPPCState *env, target_ulong entry)
+target_ulong HELPER(4xx_tlbre_hi)(CPUPPCState *env, target_ulong entry)
 {
     ppcemb_tlb_t *tlb;
     target_ulong ret;
@@ -825,11 +699,11 @@ target_ulong helper_4xx_tlbre_hi(CPUPPCState *env, target_ulong entry)
         size = PPC4XX_TLBHI_SIZE_DEFAULT;
     }
     ret |= size << PPC4XX_TLBHI_SIZE_SHIFT;
-    helper_store_40x_pid(env, tlb->PID);
+    HELPER(store_40x_pid)(env, tlb->PID);
     return ret;
 }
 
-target_ulong helper_4xx_tlbre_lo(CPUPPCState *env, target_ulong entry)
+target_ulong HELPER(4xx_tlbre_lo)(CPUPPCState *env, target_ulong entry)
 {
     ppcemb_tlb_t *tlb;
     target_ulong ret;
@@ -864,7 +738,7 @@ static void ppcemb_tlb_flush(CPUState *cs, ppcemb_tlb_t *tlb)
                               TARGET_LONG_BITS);
 }
 
-void helper_4xx_tlbwe_hi(CPUPPCState *env, target_ulong entry,
+void HELPER(4xx_tlbwe_hi)(CPUPPCState *env, target_ulong entry,
                          target_ulong val)
 {
     CPUState *cs = env_cpu(env);
@@ -916,7 +790,7 @@ void helper_4xx_tlbwe_hi(CPUPPCState *env, target_ulong entry,
                   tlb->prot & PAGE_VALID ? 'v' : '-', (int)tlb->PID);
 }
 
-void helper_4xx_tlbwe_lo(CPUPPCState *env, target_ulong entry,
+void HELPER(4xx_tlbwe_lo)(CPUPPCState *env, target_ulong entry,
                          target_ulong val)
 {
     CPUState *cs = env_cpu(env);
@@ -952,7 +826,7 @@ void helper_4xx_tlbwe_lo(CPUPPCState *env, target_ulong entry,
                   tlb->prot & PAGE_VALID ? 'v' : '-', (int)tlb->PID);
 }
 
-target_ulong helper_4xx_tlbsx(CPUPPCState *env, target_ulong address)
+target_ulong HELPER(4xx_tlbsx)(CPUPPCState *env, target_ulong address)
 {
     return ppcemb_tlb_search(env, address, env->spr[SPR_40x_PID]);
 }
@@ -977,7 +851,7 @@ static bool mmubooke_pid_match(CPUPPCState *env, ppcemb_tlb_t *tlb)
 }
 
 /* PowerPC 440 TLB management */
-void helper_440_tlbwe(CPUPPCState *env, uint32_t word, target_ulong entry,
+void HELPER(440_tlbwe)(CPUPPCState *env, uint32_t word, target_ulong entry,
                       target_ulong value)
 {
     ppcemb_tlb_t *tlb;
@@ -1038,7 +912,7 @@ void helper_440_tlbwe(CPUPPCState *env, uint32_t word, target_ulong entry,
     }
 }
 
-target_ulong helper_440_tlbre(CPUPPCState *env, uint32_t word,
+target_ulong HELPER(440_tlbre)(CPUPPCState *env, uint32_t word,
                               target_ulong entry)
 {
     ppcemb_tlb_t *tlb;
@@ -1094,7 +968,7 @@ target_ulong helper_440_tlbre(CPUPPCState *env, uint32_t word,
     return ret;
 }
 
-target_ulong helper_440_tlbsx(CPUPPCState *env, target_ulong address)
+target_ulong HELPER(440_tlbsx)(CPUPPCState *env, target_ulong address)
 {
     return ppcemb_tlb_search(env, address, env->spr[SPR_440_MMUCR] & 0xFF);
 }
@@ -1118,19 +992,19 @@ static ppcmas_tlb_t *booke206_cur_tlb(CPUPPCState *env)
     return booke206_get_tlbm(env, tlb, ea, esel);
 }
 
-void helper_booke_setpid(CPUPPCState *env, uint32_t pidn, target_ulong pid)
+void HELPER(booke_setpid)(CPUPPCState *env, uint32_t pidn, target_ulong pid)
 {
     env->spr[pidn] = pid;
     /* changing PIDs mean we're in a different address space now */
     tlb_flush(env_cpu(env));
 }
 
-void helper_booke_set_eplc(CPUPPCState *env, target_ulong val)
+void HELPER(booke_set_eplc)(CPUPPCState *env, target_ulong val)
 {
     env->spr[SPR_BOOKE_EPLC] = val & EPID_MASK;
     tlb_flush_by_mmuidx(env_cpu(env), 1 << PPC_TLB_EPID_LOAD);
 }
-void helper_booke_set_epsc(CPUPPCState *env, target_ulong val)
+void HELPER(booke_set_epsc)(CPUPPCState *env, target_ulong val)
 {
     env->spr[SPR_BOOKE_EPSC] = val & EPID_MASK;
     tlb_flush_by_mmuidx(env_cpu(env), 1 << PPC_TLB_EPID_STORE);
@@ -1145,7 +1019,7 @@ static inline void flush_page(CPUPPCState *env, ppcmas_tlb_t *tlb)
     }
 }
 
-void helper_booke206_tlbwe(CPUPPCState *env)
+void HELPER(booke206_tlbwe)(CPUPPCState *env)
 {
     uint32_t tlbncfg, tlbn;
     ppcmas_tlb_t *tlb;
@@ -1273,7 +1147,7 @@ static inline void booke206_tlb_to_mas(CPUPPCState *env, ppcmas_tlb_t *tlb)
     env->spr[SPR_BOOKE_MAS7] = tlb->mas7_3 >> 32;
 }
 
-void helper_booke206_tlbre(CPUPPCState *env)
+void HELPER(booke206_tlbre)(CPUPPCState *env)
 {
     ppcmas_tlb_t *tlb = NULL;
 
@@ -1285,7 +1159,7 @@ void helper_booke206_tlbre(CPUPPCState *env)
     }
 }
 
-void helper_booke206_tlbsx(CPUPPCState *env, target_ulong address)
+void HELPER(booke206_tlbsx)(CPUPPCState *env, target_ulong address)
 {
     ppcmas_tlb_t *tlb = NULL;
     int i, j;
@@ -1359,7 +1233,7 @@ static inline void booke206_invalidate_ea_tlb(CPUPPCState *env, int tlbn,
     }
 }
 
-void helper_booke206_tlbivax(CPUPPCState *env, target_ulong address)
+void HELPER(booke206_tlbivax)(CPUPPCState *env, target_ulong address)
 {
     CPUState *cs;
 
@@ -1390,13 +1264,13 @@ void helper_booke206_tlbivax(CPUPPCState *env, target_ulong address)
     }
 }
 
-void helper_booke206_tlbilx0(CPUPPCState *env, target_ulong address)
+void HELPER(booke206_tlbilx0)(CPUPPCState *env, target_ulong address)
 {
     /* XXX missing LPID handling */
     booke206_flush_tlb(env, -1, 1);
 }
 
-void helper_booke206_tlbilx1(CPUPPCState *env, target_ulong address)
+void HELPER(booke206_tlbilx1)(CPUPPCState *env, target_ulong address)
 {
     int i, j;
     int tid = (env->spr[SPR_BOOKE_MAS6] & MAS6_SPID);
@@ -1417,7 +1291,7 @@ void helper_booke206_tlbilx1(CPUPPCState *env, target_ulong address)
     tlb_flush(env_cpu(env));
 }
 
-void helper_booke206_tlbilx3(CPUPPCState *env, target_ulong address)
+void HELPER(booke206_tlbilx3)(CPUPPCState *env, target_ulong address)
 {
     int i, j;
     ppcmas_tlb_t *tlb;
@@ -1457,7 +1331,7 @@ void helper_booke206_tlbilx3(CPUPPCState *env, target_ulong address)
     tlb_flush(env_cpu(env));
 }
 
-void helper_booke206_tlbflush(CPUPPCState *env, target_ulong type)
+void HELPER(booke206_tlbflush)(CPUPPCState *env, target_ulong type)
 {
     int flags = 0;
 
@@ -1473,12 +1347,12 @@ void helper_booke206_tlbflush(CPUPPCState *env, target_ulong type)
 }
 
 
-void helper_check_tlb_flush_local(CPUPPCState *env)
+void HELPER(check_tlb_flush_local)(CPUPPCState *env)
 {
     check_tlb_flush(env, false);
 }
 
-void helper_check_tlb_flush_global(CPUPPCState *env)
+void HELPER(check_tlb_flush_global)(CPUPPCState *env)
 {
     check_tlb_flush(env, true);
 }
@@ -1492,16 +1366,6 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
     hwaddr raddr;
     int page_size, prot;
 
-    if (cpu->env.mmu_model == POWERPC_MMU_32B && !(mmu_idx & 2) &&
-        ((cpu->env.tlb_need_flush & TLB_NEED_SR_SWITCH) ||
-         mmu_idx >> 2 != cpu->env.mmu_slot)) {
-        /*
-         * Between a segment register write and the next context
-         * synchronization, entries made from the new values would land in
-         * the old set's TLB; never reuse that one for the old set.
-         */
-        cpu->env.mmu_slot_used[mmu_idx >> 2] = 0;
-    }
     if (ppc_xlate(cpu, eaddr, access_type, &raddr,
                   &page_size, &prot, mmu_idx, !probe)) {
         tlb_set_page(cs, eaddr & TARGET_PAGE_MASK, raddr & TARGET_PAGE_MASK,

@@ -49,6 +49,7 @@ struct Instruction {
                               */
     bool extension_valid;   /* Has a constant extender attached */
     bool is_endloop;   /* This is an end of loop */
+    bool hlx_new_zero; /* HLX .new store without a producer. */
     int32_t immed[IMMEDS_MAX];    /* immediate field */
 };
 
@@ -66,11 +67,13 @@ struct Packet {
 
     bool pkt_has_dczeroa;
 
-    bool pkt_has_store_s0;
-    bool pkt_has_store_s1;
+    bool pkt_has_scalar_store_s0;
+    bool pkt_has_scalar_store_s1;
 
     bool pkt_has_hvx;
+    bool pkt_has_hmx;
     Insn *vhist_insn;
+    bool pkt_has_hlx;
 
     Insn insn[INSTRUCTIONS_MAX];
 };

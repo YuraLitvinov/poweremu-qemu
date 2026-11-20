@@ -20,7 +20,6 @@
 #ifndef I386_HELPER_TCG_H
 #define I386_HELPER_TCG_H
 
-#include "exec/exec-all.h"
 #include "qemu/host-utils.h"
 
 /* Maximum instruction code size */
@@ -32,15 +31,14 @@
 # define TCG_PHYS_ADDR_BITS 36
 #endif
 
-QEMU_BUILD_BUG_ON(TCG_PHYS_ADDR_BITS > TARGET_PHYS_ADDR_SPACE_BITS);
-
 /**
  * x86_cpu_do_interrupt:
  * @cpu: vCPU the interrupt is to be handled by.
  */
 void x86_cpu_do_interrupt(CPUState *cpu);
 #ifndef CONFIG_USER_ONLY
-bool x86_cpu_exec_halt(CPUState *cpu);
+void x86_cpu_poll_during_halt(CPUState *cpu);
+void x86_cpu_leaving_halt(CPUState *cpu);
 bool x86_need_replay_interrupt(int interrupt_request);
 bool x86_cpu_exec_interrupt(CPUState *cpu, int int_req);
 #endif
@@ -98,9 +96,9 @@ static inline unsigned int compute_pf(uint8_t x)
 /* misc_helper.c */
 void cpu_load_eflags(CPUX86State *env, int eflags, int update_mask);
 
-/* sysemu/svm_helper.c */
+/* system/svm_helper.c */
 #ifndef CONFIG_USER_ONLY
-G_NORETURN void cpu_vmexit(CPUX86State *nenv, uint32_t exit_code,
+G_NORETURN void cpu_vmexit(CPUX86State *nenv, uint64_t exit_code,
                            uint64_t exit_info_1, uintptr_t retaddr);
 void do_vmexit(CPUX86State *env);
 #endif
@@ -116,7 +114,7 @@ int exception_has_error_code(int intno);
 /* smm_helper.c */
 void do_smm_enter(X86CPU *cpu);
 
-/* sysemu/bpt_helper.c */
+/* system/bpt_helper.c */
 bool check_hw_breakpoints(CPUX86State *env, bool force_dr6_update);
 
 /*

@@ -24,7 +24,6 @@ enum {
   M16_OPC_SLTI = 0x0a,
   M16_OPC_SLTIU = 0x0b,
   M16_OPC_I8 = 0x0c,
-  M16_OPC_LI = 0x0d,
   M16_OPC_CMPI = 0x0e,
   M16_OPC_SD = 0x0f,
   M16_OPC_LB = 0x10,
@@ -119,13 +118,6 @@ enum {
   RR_RY_CNVT_SEH = 0x5,
   RR_RY_CNVT_SEW = 0x6,
 };
-
-static int xlat(int r)
-{
-  static const int map[] = { 16, 17, 2, 3, 4, 5, 6, 7 };
-
-  return map[r];
-}
 
 static void decr_and_store(DisasContext *ctx, unsigned regidx, TCGv t0)
 {
@@ -293,7 +285,7 @@ static void decr_and_load(DisasContext *ctx, unsigned regidx, TCGv t0)
 
     tcg_gen_movi_tl(t2, -4);
     gen_op_addr_add(ctx, t0, t0, t2);
-    tcg_gen_qemu_ld_tl(t1, t0, ctx->mem_idx, MO_TE | MO_SL |
+    tcg_gen_qemu_ld_tl(t1, t0, ctx->mem_idx, mo_endian(ctx) | MO_SL |
                        ctx->default_tcg_memop_mask);
     gen_store_gpr(t1, regidx);
 }
@@ -453,16 +445,14 @@ static void decode_i64_mips16(DisasContext *ctx,
 
 static int decode_extended_mips16_opc(CPUMIPSState *env, DisasContext *ctx)
 {
-    int extend = translator_lduw(env, &ctx->base, ctx->base.pc_next + 2);
     int op, rx, ry, funct, sa;
     int16_t imm, offset;
 
-    ctx->opcode = (ctx->opcode << 16) | extend;
     op = (ctx->opcode >> 11) & 0x1f;
     sa = (ctx->opcode >> 22) & 0x1f;
     funct = (ctx->opcode >> 8) & 0x7;
-    rx = xlat((ctx->opcode >> 8) & 0x7);
-    ry = xlat((ctx->opcode >> 5) & 0x7);
+    rx = gpr3_m16(ctx, (ctx->opcode >> 8) & 0x7);
+    ry = gpr3_m16(ctx, (ctx->opcode >> 5) & 0x7);
     offset = imm = (int16_t) (((ctx->opcode >> 16) & 0x1f) << 11
                               | ((ctx->opcode >> 21) & 0x3f) << 5
                               | (ctx->opcode & 0x1f));
@@ -584,9 +574,6 @@ static int decode_extended_mips16_opc(CPUMIPSState *env, DisasContext *ctx)
             break;
         }
         break;
-    case M16_OPC_LI:
-        tcg_gen_movi_tl(cpu_gpr[rx], (uint16_t) imm);
-        break;
     case M16_OPC_CMPI:
         tcg_gen_xori_tl(cpu_gpr[24], cpu_gpr[rx], (uint16_t) imm);
         break;
@@ -658,12 +645,29 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
     int funct;
     int n_bytes;
 
-    op = (ctx->opcode >> 11) & 0x1f;
+    ctx->opcode = translator_lduw_end(env, &ctx->base, ctx->base.pc_next,
+                                      mo_endian(ctx));
+
+    op = extract32(ctx->opcode, 11, 5);
+    /* EXTEND-prefixed and JAL/JALX instructions are 32-bit */
+    if (op == M16_OPC_EXTEND || op == M16_OPC_JAL) {
+        uint32_t opcode;
+
+        opcode = ctx->opcode << 16;
+        opcode |= translator_lduw_end(env, &ctx->base, ctx->base.pc_next + 2,
+                                      mo_endian(ctx));
+        if (decode_ase_mips16e_32(ctx, opcode)) {
+            return 4;
+        }
+    } else if (decode_ase_mips16e_16(ctx, ctx->opcode)) {
+        return 2;
+    }
+
     sa = (ctx->opcode >> 2) & 0x7;
     sa = sa == 0 ? 8 : sa;
-    rx = xlat((ctx->opcode >> 8) & 0x7);
+    rx = gpr3_m16(ctx, (ctx->opcode >> 8) & 0x7);
     cnvt_op = (ctx->opcode >> 5) & 0x7;
-    ry = xlat((ctx->opcode >> 5) & 0x7);
+    ry = gpr3_m16(ctx, (ctx->opcode >> 5) & 0x7);
     op1 = offset = ctx->opcode & 0x1f;
 
     n_bytes = 2;
@@ -686,7 +690,8 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
         /* No delay slot, so just process as a normal instruction */
         break;
     case M16_OPC_JAL:
-        offset = translator_lduw(env, &ctx->base, ctx->base.pc_next + 2);
+        offset = translator_lduw_end(env, &ctx->base, ctx->base.pc_next + 2,
+                                     mo_endian(ctx));
         offset = (((ctx->opcode & 0x1f) << 21)
                   | ((ctx->opcode >> 5) & 0x1f) << 16
                   | offset) << 2;
@@ -815,7 +820,7 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
                 break;
             case I8_MOV32R:
                 {
-                    int rz = xlat(ctx->opcode & 0x7);
+                    int rz = gpr3_m16(ctx, ctx->opcode & 0x7);
 
                     reg32 = (((ctx->opcode >> 3) & 0x3) << 3) |
                         ((ctx->opcode >> 5) & 0x7);
@@ -830,13 +835,6 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
                 gen_reserved_instruction(ctx);
                 break;
             }
-        }
-        break;
-    case M16_OPC_LI:
-        {
-            int16_t imm = (uint8_t) ctx->opcode;
-
-            gen_arith_imm(ctx, OPC_ADDIU, rx, 0, imm);
         }
         break;
     case M16_OPC_CMPI:
@@ -894,7 +892,7 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
         break;
     case M16_OPC_RRR:
         {
-            int rz = xlat((ctx->opcode >> 2) & 0x7);
+            int rz = gpr3_m16(ctx, (ctx->opcode >> 2) & 0x7);
             int mips32_op;
 
             switch (ctx->opcode & 0x3) {
@@ -1103,6 +1101,10 @@ static int decode_ase_mips16e(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case M16_OPC_EXTEND:
+        ctx->opcode <<= 16;
+        ctx->opcode |= translator_lduw_end(env, &ctx->base,
+                                           ctx->base.pc_next + 2,
+                                           mo_endian(ctx));
         decode_extended_mips16_opc(env, ctx);
         n_bytes = 4;
         break;

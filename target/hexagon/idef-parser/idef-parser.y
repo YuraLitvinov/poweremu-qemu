@@ -51,7 +51,7 @@
 
 %token IN INAME VAR
 %token ABS CROUND ROUND CIRCADD COUNTONES INC DEC ANDA ORA XORA PLUSPLUS ASL
-%token ASR LSR EQ NEQ LTE GTE MIN MAX ANDL FOR ICIRC IF MUN FSCR FCHK SXT
+%token ASR LSR EQ NEQ LTE GTE MIN MAX ANDL FOR ICIRC IF MUN FSCR FCHK VFCHK SXT
 %token ZXT CONSTEXT LOCNT BREV SIGN LOAD STORE PC LPCFG
 %token LOAD_CANCEL STORE_CANCEL CANCEL IDENTITY ROTL INSBITS SETBITS EXTRANGE
 %token CAST4_8U FAIL CARRY_FROM_ADD ADDSAT64 LSBNEW
@@ -398,13 +398,23 @@ assign_statement : lvalue '=' rvalue
                  ;
 
 control_statement : frame_check
+                  | vframe_check
                   | cancel_statement
                   | if_statement
                   | for_statement
                   ;
 
 frame_check : FCHK '(' rvalue ',' rvalue ')' ';'
+              {
+                  gen_framecheck(c, &@1, &$3, &$5);
+              }
             ;
+
+vframe_check : VFCHK '(' rvalue ',' rvalue ')' ';'
+               {
+                   gen_vframecheck(c, &@1, &$3);
+               }
+             ;
 
 cancel_statement : LOAD_CANCEL
                    {
@@ -869,7 +879,7 @@ int main(int argc, char **argv)
     context.header_str = g_string_new(NULL);
     context.ternary = g_array_new(FALSE, TRUE, sizeof(Ternary));
     /* Read input file */
-    FILE *input_file = fopen(argv[ARG_INDEX_IDEFS], "r");
+    FILE *input_file = fopen(argv[ARG_INDEX_IDEFS], "rb");
     fseek(input_file, 0L, SEEK_END);
     long input_size = ftell(input_file);
     context.input_buffer = (char *) calloc(input_size + 1, sizeof(char));

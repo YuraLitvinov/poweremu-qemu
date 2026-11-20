@@ -21,12 +21,12 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
-#include "exec/exec-all.h"
-#include "exec/cpu_ldst.h"
+#include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/cpu-loop.h"
 #include "tcg/helper-tcg.h"
 #include "tcg/seg_helper.h"
 
-void helper_syscall(CPUX86State *env, int next_eip_addend)
+void HELPER(syscall)(CPUX86State *env, int next_eip_addend)
 {
     CPUState *cs = env_cpu(env);
 
@@ -64,7 +64,7 @@ static void do_interrupt_user(CPUX86State *env, int intno, int is_int,
         cpl = env->hflags & HF_CPL_MASK;
         /* check privilege if software int */
         if (dpl < cpl) {
-            raise_exception_err(env, EXCP0D_GPF, (intno << shift) + 2);
+            raise_exception_err(env, EXCP0D_GPF, intno * 8 + 2);
         }
     }
 
@@ -102,6 +102,6 @@ void cpu_x86_load_seg(CPUX86State *env, X86Seg seg_reg, int selector)
                                DESC_P_MASK | DESC_S_MASK | DESC_W_MASK |
                                DESC_A_MASK | (dpl << DESC_DPL_SHIFT));
     } else {
-        helper_load_seg(env, seg_reg, selector);
+        HELPER(load_seg)(env, seg_reg, selector);
     }
 }

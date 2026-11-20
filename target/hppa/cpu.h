@@ -21,31 +21,32 @@
 #define HPPA_CPU_H
 
 #include "cpu-qom.h"
-#include "exec/cpu-defs.h"
+#include "exec/cpu-common.h"
+#include "exec/cpu-interrupt.h"
+#include "exec/target_long.h"
+#include "system/memory.h"
 #include "qemu/cpu-float.h"
 #include "qemu/interval-tree.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 
-#define MMU_ABS_W_IDX     6
-#define MMU_ABS_IDX       7
-#define MMU_KERNEL_IDX    8
-#define MMU_KERNEL_P_IDX  9
-#define MMU_PL1_IDX       10
-#define MMU_PL1_P_IDX     11
-#define MMU_PL2_IDX       12
-#define MMU_PL2_P_IDX     13
-#define MMU_USER_IDX      14
-#define MMU_USER_P_IDX    15
+#define MMU_KERNEL_IDX    0
+#define MMU_KERNEL_P_IDX  1
+#define MMU_PL1_IDX       2
+#define MMU_PL1_P_IDX     3
+#define MMU_PL2_IDX       4
+#define MMU_PL2_P_IDX     5
+#define MMU_USER_IDX      6
+#define MMU_USER_P_IDX    7
+#define MMU_ABS_IDX       8
+#define MMU_ABS_W_IDX     9
 
-#define MMU_IDX_MMU_DISABLED(MIDX)  ((MIDX) < MMU_KERNEL_IDX)
-#define MMU_IDX_TO_PRIV(MIDX)       (((MIDX) - MMU_KERNEL_IDX) / 2)
-#define MMU_IDX_TO_P(MIDX)          (((MIDX) - MMU_KERNEL_IDX) & 1)
-#define PRIV_P_TO_MMU_IDX(PRIV, P)  ((PRIV) * 2 + !!(P) + MMU_KERNEL_IDX)
+#define MMU_IDX_MMU_DISABLED(MIDX)  ((MIDX) >= MMU_ABS_IDX)
+#define MMU_IDX_TO_PRIV(MIDX)       ((MIDX) / 2)
+#define MMU_IDX_TO_P(MIDX)          ((MIDX) & 1)
+#define PRIV_P_TO_MMU_IDX(PRIV, P)  ((PRIV) * 2 + !!(P))
 
 #define PRIV_KERNEL       0
 #define PRIV_USER         3
-
-#define TARGET_INSN_START_EXTRA_WORDS 2
 
 /* No need to flush MMU_ABS*_IDX  */
 #define HPPA_MMU_FLUSH_MASK                             \
@@ -96,6 +97,8 @@
 
 /* Emulated hardware TOC button */
 #define EXCP_TOC                 32 /* TOC = Transfer of control (NMI) */
+
+const char *hppa_exception_name(int excp);
 
 #define CPU_INTERRUPT_NMI       CPU_INTERRUPT_TGT_EXT_3         /* TOC */
 
@@ -186,7 +189,7 @@ typedef struct HPPATLBEntry {
         struct HPPATLBEntry *unused_next;
     };
 
-    target_ulong pa;
+    hwaddr pa;
 
     unsigned entry_valid : 1;
 
@@ -245,7 +248,7 @@ typedef struct CPUArchState {
      * ??? The number of entries isn't specified by the architecture.
      * BTLBs are not supported in 64-bit machines.
      */
-#define PA10_BTLB_FIXED         16
+#define PA10_BTLB_FIXED         8
 #define PA10_BTLB_VARIABLE      0
 #define HPPA_TLB_ENTRIES        256
 
@@ -266,11 +269,12 @@ typedef struct CPUArchState {
 
     HPPATLBEntry tlb[HPPA_TLB_ENTRIES];
 
+    target_ulong power_btn;    /* virtual power button (0 = reboot) */
+
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
-    bool is_pa20;
-
+    target_ulong cpu_hpa;      /* HPA of this CPU */
     target_ulong kernel_entry; /* Linux kernel was loaded here */
     target_ulong cmdline_or_bootorder;
     target_ulong initrd_base, initrd_end;
@@ -290,6 +294,18 @@ struct ArchCPU {
 };
 
 /**
+ * HPPACPUDef:
+ * @phys_addr_bits: Number of bits in the physical address space.
+ * @is_pa20: Whether the CPU model follows the PA-RISC 2.0 or 1.1 spec.
+ *
+ * Configuration options for a HPPA CPU model.
+ */
+typedef struct HPPACPUDef {
+    uint8_t phys_addr_bits;
+    bool is_pa20;
+} HPPACPUDef;
+
+/**
  * HPPACPUClass:
  * @parent_realize: The parent class' realize handler.
  * @parent_phases: The parent class' reset phase handlers.
@@ -301,13 +317,22 @@ struct HPPACPUClass {
 
     DeviceRealize parent_realize;
     ResettablePhases parent_phases;
+    const HPPACPUDef *def;
 };
 
-#include "exec/cpu-all.h"
-
-static inline bool hppa_is_pa20(const CPUHPPAState *env)
+static inline const HPPACPUDef *hppa_def(CPUHPPAState *env)
 {
-    return env->is_pa20;
+    return HPPA_CPU_GET_CLASS(env_cpu(env))->def;
+}
+
+static inline uint8_t hppa_phys_addr_bits(CPUHPPAState *env)
+{
+    return hppa_def(env)->phys_addr_bits;
+}
+
+static inline bool hppa_is_pa20(CPUHPPAState *env)
+{
+    return hppa_def(env)->is_pa20;
 }
 
 static inline int HPPA_BTLB_ENTRIES(CPUHPPAState *env)
@@ -321,8 +346,8 @@ void hppa_translate_code(CPUState *cs, TranslationBlock *tb,
 
 #define CPU_RESOLVING_TYPE TYPE_HPPA_CPU
 
-static inline target_ulong hppa_form_gva_mask(uint64_t gva_offset_mask,
-                                        uint64_t spc, target_ulong off)
+static inline vaddr hppa_form_gva_mask(uint64_t gva_offset_mask,
+                                       uint64_t spc, target_ulong off)
 {
 #ifdef CONFIG_USER_ONLY
     return off & gva_offset_mask;
@@ -331,14 +356,15 @@ static inline target_ulong hppa_form_gva_mask(uint64_t gva_offset_mask,
 #endif
 }
 
-static inline target_ulong hppa_form_gva(CPUHPPAState *env, uint64_t spc,
-                                         target_ulong off)
+static inline vaddr hppa_form_gva(CPUHPPAState *env, uint64_t spc,
+                                  target_ulong off)
 {
     return hppa_form_gva_mask(env->gva_offset_mask, spc, off);
 }
 
-hwaddr hppa_abs_to_phys_pa2_w0(vaddr addr);
-hwaddr hppa_abs_to_phys_pa2_w1(vaddr addr);
+hwaddr hppa_abs_to_phys_pa1x(uint8_t phys_addr_bits, vaddr addr);
+hwaddr hppa_abs_to_phys_pa2_w0(uint8_t phys_addr_bits, vaddr addr);
+hwaddr hppa_abs_to_phys_pa2_w1(uint8_t phys_addr_bits, vaddr addr);
 
 /*
  * Since PSW_{I,CB} will never need to be in tb->flags, reuse them.
@@ -349,11 +375,9 @@ hwaddr hppa_abs_to_phys_pa2_w1(vaddr addr);
 #define TB_FLAG_PRIV_SHIFT  8
 #define TB_FLAG_UNALIGN     0x400
 #define TB_FLAG_SPHASH      0x800
+#define TB_FLAG_FPU_DISABLED 0x1000
 #define CS_BASE_DIFFPAGE    (1 << 12)
 #define CS_BASE_DIFFSPACE   (1 << 13)
-
-void cpu_get_tb_cpu_state(CPUHPPAState *env, vaddr *pc,
-                          uint64_t *cs_base, uint32_t *pflags);
 
 target_ulong cpu_hppa_get_psw(CPUHPPAState *env);
 void cpu_hppa_put_psw(CPUHPPAState *env, target_ulong);
@@ -371,7 +395,8 @@ int hppa_cpu_gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
 void hppa_cpu_dump_state(CPUState *cs, FILE *f, int);
 #ifndef CONFIG_USER_ONLY
 void hppa_ptlbe(CPUHPPAState *env);
-hwaddr hppa_cpu_get_phys_page_debug(CPUState *cs, vaddr addr);
+bool hppa_cpu_translate_for_debug(CPUState *cs, vaddr addr,
+                                  TranslateForDebugResult *result);
 void hppa_set_ior_and_isr(CPUHPPAState *env, vaddr addr, bool mmu_disabled);
 bool hppa_cpu_tlb_fill_align(CPUState *cs, CPUTLBEntryFull *out, vaddr addr,
                              MMUAccessType access_type, int mmu_idx,

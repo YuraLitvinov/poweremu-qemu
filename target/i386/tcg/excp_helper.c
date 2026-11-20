@@ -18,22 +18,28 @@
  */
 
 #include "qemu/osdep.h"
+#include "accel/tcg/cpu-loop.h"
 #include "cpu.h"
-#include "exec/exec-all.h"
 #include "qemu/log.h"
 #include "system/runstate.h"
 #include "exec/helper-proto.h"
 #include "helper-tcg.h"
+#include "qemu/plugin.h"
 
-G_NORETURN void helper_raise_interrupt(CPUX86State *env, int intno,
+G_NORETURN void HELPER(raise_interrupt)(CPUX86State *env, int intno,
                                           int next_eip_addend)
 {
     raise_interrupt(env, intno, next_eip_addend);
 }
 
-G_NORETURN void helper_raise_exception(CPUX86State *env, int exception_index)
+G_NORETURN void HELPER(raise_exception)(CPUX86State *env, int exception_index)
 {
     raise_exception(env, exception_index);
+}
+
+G_NORETURN void HELPER(raise_gpf)(CPUX86State *env)
+{
+    raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
 }
 
 /*
@@ -50,8 +56,11 @@ static int check_exception(CPUX86State *env, int intno, int *error_code,
     int second_contributory = intno == 0 ||
                                (intno >= 10 && intno <= 13);
 
-    qemu_log_mask(CPU_LOG_INT, "check_exception old: 0x%x new 0x%x\n",
-                env->old_exception, intno);
+    qemu_log_mask(CPU_LOG_INT, "check_exception old: 0x%x (%s) new 0x%x (%s)\n",
+                env->old_exception,
+                env->old_exception == -1 ? "none"
+                    : x86_exception_name(env->old_exception),
+                intno, x86_exception_name(intno));
 
 #if !defined(CONFIG_USER_ONLY)
     if (env->old_exception == EXCP08_DBLE) {
@@ -94,6 +103,7 @@ void raise_interrupt2(CPUX86State *env, int intno,
                       uintptr_t retaddr)
 {
     CPUState *cs = env_cpu(env);
+    uint64_t last_pc = env->eip + env->segs[R_CS].base;
 
     if (!is_int) {
         cpu_svm_check_intercept_param(env, SVM_EXIT_EXCP_BASE + intno,
@@ -107,6 +117,7 @@ void raise_interrupt2(CPUX86State *env, int intno,
     env->error_code = error_code;
     env->exception_is_int = is_int;
     env->exception_next_eip = env->eip + next_eip_addend;
+    qemu_plugin_vcpu_exception_cb(cs, last_pc);
     cpu_loop_exit_restore(cs, retaddr);
 }
 
@@ -140,7 +151,7 @@ G_NORETURN void raise_exception_ra(CPUX86State *env, int exception_index,
     raise_interrupt2(env, exception_index, 0, 0, 0, retaddr);
 }
 
-G_NORETURN void helper_icebp(CPUX86State *env)
+G_NORETURN void HELPER(icebp)(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);
 

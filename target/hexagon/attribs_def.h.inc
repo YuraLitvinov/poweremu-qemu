@@ -19,10 +19,16 @@
 DEF_ATTRIB(AA_DUMMY, "Dummy Zeroth Attribute", "", "")
 
 /* Misc */
+DEF_ATTRIB(FAKEINSN, "Not a real instruction", "", "")
+DEF_ATTRIB(MAPPING, "Not real -- asm mapped", "", "")
+DEF_ATTRIB(CONDMAPPING, "Not real -- mapped based on values", "", "")
 DEF_ATTRIB(EXTENSION, "Extension instruction", "", "")
+
+DEF_ATTRIB(NA_NT, "Non-Allocating Non-Temporal instruction", "", "")
 
 DEF_ATTRIB(PRIV, "Not available in user or guest mode", "", "")
 DEF_ATTRIB(GUEST, "Not available in user mode", "", "")
+DEF_ATTRIB(TLBPP_INSN, "Extended (64-bit VA) TLB probe instruction", "", "")
 
 DEF_ATTRIB(FPOP, "Floating Point Operation", "", "")
 
@@ -52,8 +58,12 @@ DEF_ATTRIB(REGWRSIZE_4B, "Memory width is 4 bytes", "", "")
 DEF_ATTRIB(REGWRSIZE_8B, "Memory width is 8 bytes", "", "")
 DEF_ATTRIB(MEMLIKE, "Memory-like instruction", "", "")
 DEF_ATTRIB(MEMLIKE_PACKET_RULES, "follows Memory-like packet rules", "", "")
+DEF_ATTRIB(CACHEOP, "Cache operation", "", "")
+DEF_ATTRIB(COPBYADDRESS, "Cache operation by address", "", "")
+DEF_ATTRIB(COPBYIDX, "Cache operation by index", "", "")
 DEF_ATTRIB(RELEASE, "Releases a lock", "", "")
 DEF_ATTRIB(ACQUIRE, "Acquires a lock", "", "")
+DEF_ATTRIB(ATOMIC, "Atomic memory instruction", "", "")
 
 DEF_ATTRIB(RLS_INNER, "Store release inner visibility", "", "")
 DEF_ATTRIB(RLS_ALL_THREAD, "Store release among all threads", "", "")
@@ -61,6 +71,24 @@ DEF_ATTRIB(RLS_SAME_THREAD, "Store release with the same thread", "", "")
 
 /* V6 Vector attributes */
 DEF_ATTRIB(CVI, "Executes on the HVX extension", "", "")
+
+/* HLX attributes */
+DEF_ATTRIB(HLX, "Executes on the HLX extension", "", "")
+DEF_ATTRIB(HLX_MEM, "HLX memory instruction", "", "")
+DEF_ATTRIB(HLX_MPY, "HLX multiply instruction", "", "")
+DEF_ATTRIB(HLX_SHIFT, "HLX shift instruction", "", "")
+DEF_ATTRIB(HLX_COMMON_ALU, "HLX common ALU instruction", "", "")
+DEF_ATTRIB(HLX_PAIRED_ALU, "HLX paired ALU instruction", "", "")
+DEF_ATTRIB(HLX_ANY_RESOURCE, "HLX can use any resource", "", "")
+DEF_ATTRIB(HLX_SLOT23, "HLX can execute in slot 2 or 3", "", "")
+DEF_ATTRIB(HLX_NEW, "HLX new-value instruction", "", "")
+DEF_ATTRIB(HLX_TMP, "HLX temporary register instruction", "", "")
+DEF_ATTRIB(HLX_CU_SCALAR, "HLX scalar CU instruction", "", "")
+DEF_ATTRIB(HLX_SCALAR32, "HLX 32-bit scalar operand", "", "")
+DEF_ATTRIB(HLX_SCALAR64, "HLX 64-bit scalar operand", "", "")
+DEF_ATTRIB(HLX_LXX_MPY, "HLX Lxx multiply operation", "", "")
+DEF_ATTRIB(HLX_LXX_ADD, "HLX Lxx add operation", "", "")
+DEF_ATTRIB(NOTE_HLX_MEM, "HLX memory access notes", "", "")
 
 DEF_ATTRIB(CVI_NEW, "New value memory instruction executes on HVX", "", "")
 DEF_ATTRIB(CVI_VM, "Memory instruction executes on HVX", "", "")
@@ -81,6 +109,7 @@ DEF_ATTRIB(CVI_SCATTER, "CVI Scatter operation", "", "")
 DEF_ATTRIB(CVI_SCATTER_RELEASE, "CVI Store Release for scatter", "", "")
 DEF_ATTRIB(CVI_TMP_DST, "CVI instruction that doesn't write a register", "", "")
 DEF_ATTRIB(CVI_SLOT23, "Can execute in slot 2 or slot 3 (HVX)", "", "")
+DEF_ATTRIB(CVI_VA_2SRC, "Execs on multimedia vector engine; requires two srcs", "", "")
 
 DEF_ATTRIB(VTCM_ALLBANK_ACCESS, "Allocates in all VTCM schedulers.", "", "")
 
@@ -101,7 +130,9 @@ DEF_ATTRIB(ROPS_3, "Compound instruction worth 3 RISC-ops", "", "")
 
 /* access to implicit registers */
 DEF_ATTRIB(IMPLICIT_WRITES_LR, "Writes the link register", "", "UREG.LR")
+DEF_ATTRIB(IMPLICIT_READS_PC, "Reads the program counter", "UREG.PC", "")
 DEF_ATTRIB(IMPLICIT_WRITES_SP, "Writes the stack pointer", "", "UREG.SP")
+DEF_ATTRIB(IMPLICIT_READS_SP, "Reads the stack pointer", "UREG.SP", "")
 DEF_ATTRIB(IMPLICIT_WRITES_FP, "Writes the frame pointer", "", "UREG.FP")
 DEF_ATTRIB(IMPLICIT_WRITES_LC0, "Writes loop count for loop 0", "", "UREG.LC0")
 DEF_ATTRIB(IMPLICIT_WRITES_LC1, "Writes loop count for loop 1", "", "UREG.LC1")
@@ -111,13 +142,19 @@ DEF_ATTRIB(IMPLICIT_WRITES_P0, "Writes Predicate 0", "", "UREG.P0")
 DEF_ATTRIB(IMPLICIT_WRITES_P1, "Writes Predicate 1", "", "UREG.P1")
 DEF_ATTRIB(IMPLICIT_WRITES_P2, "Writes Predicate 1", "", "UREG.P2")
 DEF_ATTRIB(IMPLICIT_WRITES_P3, "May write Predicate 3", "", "UREG.P3")
-DEF_ATTRIB(IMPLICIT_READS_PC, "Reads the PC register", "", "")
-DEF_ATTRIB(IMPLICIT_READS_P0, "Reads the P0 register", "", "")
-DEF_ATTRIB(IMPLICIT_READS_P1, "Reads the P1 register", "", "")
-DEF_ATTRIB(IMPLICIT_READS_P2, "Reads the P2 register", "", "")
-DEF_ATTRIB(IMPLICIT_READS_P3, "Reads the P3 register", "", "")
+DEF_ATTRIB(IMPLICIT_READS_P0, "Reads Predicate 0", "UREG.P0", "")
+DEF_ATTRIB(IMPLICIT_READS_P1, "Reads Predicate 1", "UREG.P1", "")
+DEF_ATTRIB(IMPLICIT_READS_P3, "Reads Predicate 3", "UREG.P3", "")
 DEF_ATTRIB(IMPLICIT_WRITES_USR, "May write USR", "", "")
-DEF_ATTRIB(IMPLICIT_READS_SP, "Reads the SP register", "", "")
+DEF_ATTRIB(IMPLICIT_WRITES_CCR, "Writes CCR register", "", "UREG.CCR")
+DEF_ATTRIB(IMPLICIT_WRITES_GOSP, "Writes GOSP register", "", "UREG.GOSP")
+DEF_ATTRIB(IMPLICIT_WRITES_SSR, "Writes SSR register", "", "UREG.SSR")
+DEF_ATTRIB(IMPLICIT_WRITES_SGP0, "Writes SGP0 register", "", "UREG.SGP0")
+DEF_ATTRIB(IMPLICIT_WRITES_SGP1, "Writes SGP1 register", "", "UREG.SGP1")
+DEF_ATTRIB(IMPLICIT_WRITES_IMASK_ANYTHREAD,
+    "Writes IMASK for any thread", "", "")
+DEF_ATTRIB(IMPLICIT_WRITES_STID_PRIO_ANYTHREAD,
+    "Writes STID priority for any thread", "", "")
 DEF_ATTRIB(COMMUTES, "The operation is communitive", "", "")
 DEF_ATTRIB(DEALLOCRET, "dealloc_return", "", "")
 DEF_ATTRIB(DEALLOCFRAME, "deallocframe", "", "")
@@ -137,8 +174,13 @@ DEF_ATTRIB(RESTRICT_SLOT3ONLY, "Must execute on slot3", "", "")
 DEF_ATTRIB(RESTRICT_NOSLOT1, "No slot 1 instruction in parallel", "", "")
 DEF_ATTRIB(RESTRICT_PREFERSLOT0, "Try to encode into slot 0", "", "")
 DEF_ATTRIB(RESTRICT_PACKET_AXOK, "May exist with A-type or X-type", "", "")
+DEF_ATTRIB(RESTRICT_SLOT1_AOK, "Slot 1 is allowed", "", "")
 
 DEF_ATTRIB(ICOP, "Instruction cache op", "", "")
+
+DEF_ATTRIB(EXCEPTION_SWI, "Software interrupt exception", "", "")
+DEF_ATTRIB(DMA, "DMA instruction", "", "")
+DEF_ATTRIB(NO_TIMING_LOG, "Does not get logged to the timing model", "", "")
 
 DEF_ATTRIB(HWLOOP0_END, "Ends HW loop0", "", "")
 DEF_ATTRIB(HWLOOP1_END, "Ends HW loop1", "", "")
@@ -150,6 +192,10 @@ DEF_ATTRIB(L2FLUSHOP, "l2flush op type", "", "")
 DEF_ATTRIB(DCFETCH, "dcfetch type", "", "")
 
 DEF_ATTRIB(L2FETCH, "Instruction is l2fetch type", "", "")
+
+DEF_ATTRIB(DCTAGOP, "Data cache tag operation", "", "")
+DEF_ATTRIB(ICTAGOP, "Instruction cache tag operation", "", "")
+DEF_ATTRIB(L2TAGOP, "L2 cache tag operation", "", "")
 
 DEF_ATTRIB(ICINVA, "icinva", "", "")
 DEF_ATTRIB(DCCLEANINVA, "dccleaninva", "", "")
@@ -166,12 +212,39 @@ DEF_ATTRIB(NOTE_LATEPRED, "The predicate can not be used as a .new", "", "")
 DEF_ATTRIB(NOTE_NVSLOT0, "Can execute only in slot 0 (ST)", "", "")
 DEF_ATTRIB(NOTE_NOVP, "Cannot be paired with a HVX permute instruction", "", "")
 DEF_ATTRIB(NOTE_VA_UNARY, "Combined with HVX ALU op (must be unary)", "", "")
+DEF_ATTRIB(NOTE_SLOT1_AOK, "Slot 1 is allowed", "", "")
+DEF_ATTRIB(NOTE_GUEST, "Guest mode instruction", "", "")
+DEF_ATTRIB(NOTE_BADTAG_UNDEF, "Bad tag results in undefined behavior", "", "")
 
 /* V6 MMVector Notes for Documentation */
 DEF_ATTRIB(NOTE_SHIFT_RESOURCE, "Uses the HVX shift resource.", "", "")
 /* Restrictions to make note of */
 DEF_ATTRIB(RESTRICT_NOSLOT1_STORE, "Packet must not have slot 1 store", "", "")
 DEF_ATTRIB(RESTRICT_LATEPRED, "Predicate can not be used as a .new.", "", "")
+DEF_ATTRIB(RESTRICT_TARGET, "Restricted branch target instruction", "", "")
+
+/* HVX IEEE FP extension attributes */
+DEF_ATTRIB(HVX_IEEE_FP, "HVX IEEE FP extension instruction", "", "")
+DEF_ATTRIB(HVX_IEEE_FP_ACC, "HVX IEEE FP accumulate instruction", "", "")
+DEF_ATTRIB(HVX_IEEE_FP_OUT_8, "HVX IEEE FP 8-bit output", "", "")
+DEF_ATTRIB(HVX_IEEE_FP_OUT_16, "HVX IEEE FP 16-bit output", "", "")
+DEF_ATTRIB(HVX_IEEE_FP_OUT_32, "HVX IEEE FP 32-bit output", "", "")
+DEF_ATTRIB(CVI_VX_NO_TMP_LD, "HVX multiply without tmp load", "", "")
+DEF_ATTRIB(HVX_FLT, "This a floating point HVX instruction.", "", "")
+
+DEF_ATTRIB(NO_IDEF_PARSER, "Skip idef-parser for this instruction", "", "")
+DEF_ATTRIB(SHARED_EXTENSION, "Shared extension instruction", "", "")
+DEF_ATTRIB(EA_REG_ONLY, "EA = input register only", "", "")
+DEF_ATTRIB(EA_PAGECROSS, "EA calculation can have a Page Cross Stall", "", "")
+DEF_ATTRIB(MPY, "Has a multiply", "", "")
+DEF_ATTRIB(PAIR_1OF2, "For assembler", "", "")
+DEF_ATTRIB(PAIR_2OF2, "For assembler", "", "")
+DEF_ATTRIB(HMX, "HMX coprocessor instruction", "", "")
+DEF_ATTRIB(HMX_CVT, "HMX convert instruction", "", "")
+DEF_ATTRIB(HMX_FLT, "HMX floating-point instruction", "", "")
+DEF_ATTRIB(HMX_CU_SCALAR, "HMX scalar operand", "", "")
+DEF_ATTRIB(HMX_BLOCK_ALIGN, "HMX block-aligned access", "", "")
+DEF_ATTRIB(HMX_128B_ALIGN, "HMX 128-byte aligned access", "", "")
 
 /* Keep this as the last attribute: */
 DEF_ATTRIB(ZZ_LASTATTRIB, "Last attribute in the file", "", "")
