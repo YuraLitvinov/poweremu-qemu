@@ -11,5 +11,5 @@ path = "lib.rs"
 
 [dependencies]
 r300 = { path = "../r300" }
-c2rust-bitfields = "0.22.1"
+system = { path = "../../../system" }
 ash = "0.37"

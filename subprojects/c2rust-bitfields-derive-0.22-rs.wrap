@@ -1,6 +1,0 @@
-[wrap-file]
-directory = c2rust-bitfields-derive-0.22.1
-source_url = https://crates.io/api/v1/crates/c2rust-bitfields-derive/0.22.1/download
-source_filename = c2rust-bitfields-derive-0.22.1.tar.gz
-source_hash = 153187c06ed005d5cb75ed9f0a2f274836f54f6b2efdc1f45136e728764875f9
-method = cargo

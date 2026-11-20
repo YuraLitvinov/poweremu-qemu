@@ -13,7 +13,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 r300 = { path = "../r300_rs" }
-c2rust-bitfields = "0.22.1"
+system = { path = "../../../rust/system" }
 ash = "0.37"
 
 # The C types (renderer vtable, R300 draw packet, uniforms, ...) are

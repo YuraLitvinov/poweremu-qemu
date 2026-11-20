@@ -1,9 +1,10 @@
-use ::c2rust_bitfields;
 
 /// Declares an incomplete C type that is only ever used behind a pointer.
 macro_rules! opaque {
     ($($name:ident);* $(;)?) => { $(#[repr(C)] pub struct $name { _p: [u8; 0] })* };
 }
+// QEMU's own Rust crate `system` supplies MemTxAttrs (same layout as the C header).
+pub use system::MemTxAttrs;
 pub mod ffi;
 pub use self::ffi::*;
 pub mod types_qemu_1;

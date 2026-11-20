@@ -93,45 +93,12 @@ pub union pthread_cond_t {
     pub __size: [::core::ffi::c_char; 48],
     pub __align: ::core::ffi::c_longlong,
 }
-#[derive(Copy, Clone, BitfieldStruct)]
+/// Opaque C `FILE`: only ever used as `*mut FILE` (fopen/fprintf/fclose).
 #[repr(C)]
-pub struct _IO_FILE {
-    pub _flags: ::core::ffi::c_int,
-    pub _IO_read_ptr: *mut ::core::ffi::c_char,
-    pub _IO_read_end: *mut ::core::ffi::c_char,
-    pub _IO_read_base: *mut ::core::ffi::c_char,
-    pub _IO_write_base: *mut ::core::ffi::c_char,
-    pub _IO_write_ptr: *mut ::core::ffi::c_char,
-    pub _IO_write_end: *mut ::core::ffi::c_char,
-    pub _IO_buf_base: *mut ::core::ffi::c_char,
-    pub _IO_buf_end: *mut ::core::ffi::c_char,
-    pub _IO_save_base: *mut ::core::ffi::c_char,
-    pub _IO_backup_base: *mut ::core::ffi::c_char,
-    pub _IO_save_end: *mut ::core::ffi::c_char,
-    pub _markers: *mut _IO_marker,
-    pub _chain: *mut _IO_FILE,
-    pub _fileno: ::core::ffi::c_int,
-    #[bitfield(name = "_flags2", ty = "::core::ffi::c_int", bits = "0..=23")]
-    pub _flags2: [u8; 3],
-    pub _short_backupbuf: [::core::ffi::c_char; 1],
-    pub _old_offset: __off_t,
-    pub _cur_column: ::core::ffi::c_ushort,
-    pub _vtable_offset: ::core::ffi::c_schar,
-    pub _shortbuf: [::core::ffi::c_char; 1],
-    pub _lock: *mut ::core::ffi::c_void,
-    pub _offset: __off64_t,
-    pub _codecvt: *mut _IO_codecvt,
-    pub _wide_data: *mut _IO_wide_data,
-    pub _freeres_list: *mut _IO_FILE,
-    pub _freeres_buf: *mut ::core::ffi::c_void,
-    pub _prevchain: *mut *mut _IO_FILE,
-    pub _mode: ::core::ffi::c_int,
-    pub _unused3: ::core::ffi::c_int,
-    pub _total_written: __uint64_t,
-    pub _unused2: [::core::ffi::c_char; 8],
+pub struct FILE {
+    _p: [u8; 0],
 }
 pub type _IO_lock_t = ();
-pub type FILE = _IO_FILE;
 pub type __u8 = ::core::ffi::c_uchar;
 pub type __u16 = ::core::ffi::c_ushort;
 pub type __u32 = ::core::ffi::c_uint;
@@ -544,22 +511,6 @@ pub struct C2RustUnnamed_14 {
             MemTxAttrs,
         ) -> bool,
     >,
-}
-#[derive(Copy, Clone, BitfieldStruct)]
-#[repr(C)]
-pub struct MemTxAttrs {
-    #[bitfield(name = "secure", ty = "::core::ffi::c_uint", bits = "0..=0")]
-    #[bitfield(name = "space", ty = "::core::ffi::c_uint", bits = "1..=2")]
-    #[bitfield(name = "user", ty = "::core::ffi::c_uint", bits = "3..=3")]
-    #[bitfield(name = "memory", ty = "::core::ffi::c_uint", bits = "4..=4")]
-    #[bitfield(name = "debug", ty = "::core::ffi::c_uint", bits = "5..=5")]
-    #[bitfield(name = "requester_id", ty = "::core::ffi::c_uint", bits = "6..=21")]
-    #[bitfield(name = "pid", ty = "::core::ffi::c_uint", bits = "22..=29")]
-    #[bitfield(name = "address_type", ty = "::core::ffi::c_uint", bits = "30..=30")]
-    pub secure_space_user_memory_debug_requester_id_pid_address_type: [u8; 4],
-    pub unspecified: bool,
-    pub _reserved1: uint8_t,
-    pub _reserved2: uint16_t,
 }
 pub type device_endian = ::core::ffi::c_uint;
 pub const DEVICE_LITTLE_ENDIAN: device_endian = 2;

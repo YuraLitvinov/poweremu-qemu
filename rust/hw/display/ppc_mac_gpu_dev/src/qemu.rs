@@ -190,23 +190,19 @@ pub fn clock_realtime_ns() -> i64 {
     unsafe { super::dev_ns::qemu_clock_get_ns(super::dev_ns::QEMU_CLOCK_REALTIME) }
 }
 
+// Layout of QEMU's MemTxAttrs (include/exec/memattrs.h): a 32-bit bitfield word, then `unspecified` (bool),
+// `_reserved1` (u8) and `_reserved2` (u16).  The device passes it by value to address_space_*, so the
+// bindgen type from QEMU's `system` crate must match this exactly.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    type A = super::dev_ns::MemTxAttrs;
+    assert!(size_of::<A>() == 8);
+    assert!(align_of::<A>() == 4);
+    assert!(offset_of!(A, unspecified) == 4);
+};
+
 fn unspecified_attrs() -> super::dev_ns::MemTxAttrs {
-    // MEMTXATTRS_UNSPECIFIED
-    let mut init = super::dev_ns::MemTxAttrs {
-        secure_space_user_memory_debug_requester_id_pid_address_type: [0; 4],
-        unspecified: true,
-        _reserved1: 0,
-        _reserved2: 0,
-    };
-    init.set_secure(0);
-    init.set_space(0);
-    init.set_user(0);
-    init.set_memory(0);
-    init.set_debug(0);
-    init.set_requester_id(0);
-    init.set_pid(0);
-    init.set_address_type(0);
-    init
+    system::MEMTXATTRS_UNSPECIFIED
 }
 
 /// Reads guest physical memory into `buf`; returns QEMU's MemTxResult (0 = OK).
