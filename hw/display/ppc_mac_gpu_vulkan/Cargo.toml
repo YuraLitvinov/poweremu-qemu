@@ -9,6 +9,12 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 ash = "0.37"
+# The Rust R300 code (draw assembly, shader translators, state).  Enabled by
+# meson for every build that has no C implementation of it (all but ppc).
+r300 = { path = "../r300_rs", optional = true }
+
+[features]
+r300_rs = ["dep:r300"]
 
 # The C types (renderer vtable, R300 draw packet, uniforms, ...) are
 # generated from QEMU's own headers at build time, so a change to them

@@ -2293,11 +2293,16 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     V.stat_draws++;
     if (V.stat_draws % 20000 == 0) {
+        static int64_t last_report;
+        int64_t now = g_get_monotonic_time();
+
         qemu_log("ppc-mac-gpu vulkan: %llu draws, %llu passes, %llu uploads, "
-                 "%llu write-backs, %llu flushes\n",
+                 "%llu write-backs, %llu flushes, %.2f s since the previous report\n",
                  (unsigned long long)V.stat_draws, (unsigned long long)V.stat_passes,
                  (unsigned long long)V.stat_uploads, (unsigned long long)V.stat_writebacks,
-                 (unsigned long long)V.stat_flushes);
+                 (unsigned long long)V.stat_flushes,
+                 last_report ? (now - last_report) / 1e6 : 0.0);
+        last_report = now;
     }
     return 0;
 }

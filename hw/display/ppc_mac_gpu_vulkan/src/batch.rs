@@ -21,6 +21,17 @@ fn set_done(sh: &Shared, seq: u32) {
 
 /// The completion thread: waits for each submitted batch in order,
 /// publishes it as done, and calls its callback.
+/// A wait of 50 ms or more is the guest frozen for that long (see [SLOW_MMIO] in the device); say so on stderr.
+fn slow_log(what: &str, t0: std::time::Instant) {
+    use std::sync::OnceLock;
+    static LIM: OnceLock<f64> = OnceLock::new();
+    let lim = *LIM.get_or_init(|| std::env::var("PPCGPU_SLOW_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(50.0));
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    if ms >= lim {
+        eprintln!("[SLOW_VK] {what}: {ms:.1} ms");
+    }
+}
+
 pub fn waiter(dev: ash::Device, sh: Arc<Shared>) {
     loop {
         let (fence, seq, done, arg) = {
@@ -150,6 +161,7 @@ impl Vk {
                 break i;
             }
             // all in flight: wait for the waiter to finish the oldest
+            let wait_t0 = std::time::Instant::now();
             {
                 let mut q = self.shared.q.lock().unwrap();
                 let ws = self.shared.worker_seq.load(Ordering::Acquire);
@@ -157,6 +169,7 @@ impl Vk {
                     q = self.shared.idle.wait(q).unwrap();
                 }
             }
+            slow_log("all batches in flight, waited for the oldest", wait_t0);
             self.reap();
         };
         self.seq = self.seq.wrapping_add(1);
@@ -302,9 +315,11 @@ impl Vk {
             return false;
         };
         // A barrier opens every batch, so the newest finishing means all did.
+        let wait_t0 = std::time::Instant::now();
         unsafe {
             let _ = self.dev.wait_for_fences(&[fence], true, u64::MAX);
         }
+        slow_log("flush waited for the GPU fence", wait_t0);
         self.mark_done(seq);
         self.stat_flushes += 1;
         true

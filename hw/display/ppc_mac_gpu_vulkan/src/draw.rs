@@ -519,9 +519,19 @@ impl Vk {
         }
         self.stat_draws += 1;
         if self.stat_draws % 20000 == 0 {
+            // wall time since the previous report (since the first draw for the first one)
+            static LAST_REPORT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let now = std::time::Instant::now();
+            let since = {
+                let mut last = LAST_REPORT.lock().unwrap();
+                let d = last.map(|t| now.duration_since(t).as_secs_f64());
+                *last = Some(now);
+                d
+            };
             eprintln!(
-                "ppc-mac-gpu vulkan: {} draws, {} passes, {} uploads, {} write-backs, {} flushes",
-                self.stat_draws, self.stat_passes, self.stat_uploads, self.stat_writebacks, self.stat_flushes
+                "ppc-mac-gpu vulkan: {} draws, {} passes, {} uploads, {} write-backs, {} flushes{}",
+                self.stat_draws, self.stat_passes, self.stat_uploads, self.stat_writebacks, self.stat_flushes,
+                since.map_or(String::new(), |d| format!(", {:.2} s since the previous report", d))
             );
         }
         0

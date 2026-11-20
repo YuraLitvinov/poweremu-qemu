@@ -92,22 +92,31 @@ else
   ppc_mac_gpu_byteorder = declare_dependency(compile_args: ['-DPPC_MAC_GPU_BE=0'])
 endif
 
-system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [ppc_mac_gpu_byteorder, files(
+ppc_mac_gpu_files = files(
   'ppc_mac_gpu.c',
   'ppc_mac_gpu_x86_stubs.c',
   'ppc_mac_gpu_scanout_le.c',
   'ppc_mac_gpu_scanout_be.c',
-  'r300/r300_state.c',
-  'r300/r300_pvs.c',
-  'r300/r300_pvs_glsl.c',
-  'r300/r300_us.c',
   'r300/r300_spirv.c',
-  'r300/r300_draw.c',
-  'r300/r300_texel.c',
-  'r300/r300_texel_le.c',
-  'r300/r300_texel_be.c',
   'ppc_mac_gpu_vp.c',
-), pixman] + r300_shader_deps)
+)
+if target_dirs.contains('ppc-softmmu')
+  # The big-endian guest runs the C implementation of the R300 code: the Rust
+  # crate (r300_rs/) is little-endian only.
+  ppc_mac_gpu_files += files(
+    'r300/r300_state.c',
+    'r300/r300_pvs.c',
+    'r300/r300_pvs_glsl.c',
+    'r300/r300_us.c',
+    'r300/r300_draw.c',
+    'r300/r300_texel.c',
+    'r300/r300_texel_le.c',
+    'r300/r300_texel_be.c',
+  )
+endif
+# Everything else runs the Rust crate (no C fallback), linked in through the
+# Vulkan crate's static library (below).
+system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [ppc_mac_gpu_byteorder, ppc_mac_gpu_files, pixman] + r300_shader_deps)
 
 # Vulkan backend for the R300 (renderer=vulkan): the Rust/ash crate in
 # ppc_mac_gpu_vulkan/, which implements the interface declared in
@@ -118,8 +127,11 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [ppc_mac_gpu_byteorder, files
 # in as a static library; without Cargo or the Vulkan loader the device
 # refuses renderer=vulkan.
 if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
-  ppc_vulkan_probe = dependency('vulkan', required: false, method: 'pkg-config')
-  ppc_vulkan_cargo = find_program('cargo', required: false)
+  # Without the C R300 code (everything but the big-endian build) the Rust
+  # crates are the device, so Cargo and Vulkan are required.
+  ppc_rust_r300 = not target_dirs.contains('ppc-softmmu')
+  ppc_vulkan_probe = dependency('vulkan', required: ppc_rust_r300, method: 'pkg-config')
+  ppc_vulkan_cargo = find_program('cargo', required: ppc_rust_r300)
   if ppc_vulkan_probe.found() and ppc_vulkan_cargo.found()
     ppc_vulkan_dir = meson.current_source_dir() / 'ppc_mac_gpu_vulkan'
     ppc_vulkan_target_dir = meson.current_build_dir() / 'ppc_mac_gpu_vulkan_target'
@@ -127,7 +139,8 @@ if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
       output: 'libppc_mac_gpu_vulkan.a',
       command: [find_program('sh'),
         files('ppc_mac_gpu_vulkan/build.sh'),
-        ppc_vulkan_dir, ppc_vulkan_target_dir, '@OUTPUT@'],
+        ppc_vulkan_dir, ppc_vulkan_target_dir, '@OUTPUT@',
+        ppc_rust_r300 ? 'r300_rs' : ''],
       build_by_default: true,
       build_always_stale: true,
       console: true,

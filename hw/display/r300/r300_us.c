@@ -327,11 +327,23 @@ static unsigned unit_border(const R300State *st, unsigned unit)
     return bm;
 }
 
+/*
+ * The texture unit a fetch instruction samples.  The ID in the instruction is relative to the texture offset in
+ * US_CODE_OFFSET (bits 17:13), modulo 16.  Mesa leaves that offset at 0, so its IDs read as absolute; the Windows
+ * driver instead loads one fetch instruction (ID 0) into slot N and runs it with offset N, to select texture unit N
+ * without rewriting the program.  (Seen with the Catalyst 10.2 driver: slot 7 and 23 with unit 7 enabled, slot 3 and
+ * 19 with unit 3, ID always 0.  Read literally, it samples the unbound unit 0 and the result is black.)
+ */
+static unsigned us_tex_unit(const R300State *st, uint32_t inst)
+{
+    return (((inst >> 11) & 0xF) + ((r300_reg(st, US_CODE_OFFSET) >> 13) & 0x1F)) & 0xF;
+}
+
 static bool us_emit_tex(R300Sb *sb, const R300State *st, uint32_t inst,
                         uint32_t *units_used, const char **err)
 {
     unsigned src = inst & 0x1F, dst = (inst >> 6) & 0x1F;
-    unsigned unit = (inst >> 11) & 0xF, op = (inst >> 15) & 7;
+    unsigned unit = us_tex_unit(st, inst), op = (inst >> 15) & 7;
     const char *proj, *bias;
 
     switch (op) {
@@ -1678,9 +1690,9 @@ char *r300_us_disasm(const R300State *st)
         r300_sb_printf(&sb, " node %u\n", i);
         for (unsigned k = 0; k < nd->tex_count; k++) {
             uint32_t t = r300_reg(st, US_TEX_INST_0 + 4 * (nd->tex_start + k));
-            r300_sb_printf(&sb, "  tex%-2u op%u t%u <- unit%u t%u\n",
+            r300_sb_printf(&sb, "  tex%-2u op%u t%u <- unit%u t%u (raw %08x)\n",
                            nd->tex_start + k, (t >> 15) & 7, (t >> 6) & 0x1F,
-                           (t >> 11) & 0xF, t & 0x1F);
+                           us_tex_unit(st, t), t & 0x1F, t);
         }
         for (unsigned k = 0; k < nd->alu_count; k++) {
             unsigned a = nd->alu_start + k;

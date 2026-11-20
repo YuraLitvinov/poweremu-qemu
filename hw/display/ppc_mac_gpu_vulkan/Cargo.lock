@@ -153,6 +153,7 @@ version = "0.2.0"
 dependencies = [
  "ash",
  "bindgen",
+ "r300",
 ]
 
 [[package]]
@@ -182,6 +183,10 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "r300"
+version = "0.1.0"
 
 [[package]]
 name = "regex"

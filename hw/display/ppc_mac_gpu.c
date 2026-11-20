@@ -301,6 +301,14 @@ static void gpu_sync_at(PPCMacGPUState *s, uint32_t why)
 /* The device wrote VRAM: mark it dirty for the display, and tell the renderer to collect the log before its next draw. */
 static inline void gpu_vram_dirty(PPCMacGPUState *s, uint64_t addr, uint64_t size)
 {
+    static int tex_log = -1;
+
+    if (unlikely(tex_log < 0)) {
+        tex_log = getenv("PPCGPU_TEX_LOG") != NULL;
+    }
+    if (unlikely(tex_log) && size >= 4096) {
+        fprintf(stderr, "VRAMDIRTY %llx +%llx\n", (unsigned long long)addr, (unsigned long long)size);
+    }
     s->vram_dev_dirty = true;
     memory_region_set_dirty(&s->vram, addr, size);
 }
@@ -791,6 +799,28 @@ static int post_probe_find_or_add_reg(uint32_t reg)
 static int ppc_mac_gpu_post_reg(uint32_t addr);
 static const char *ppc_mac_gpu_post_reg_name(uint32_t addr);
 
+#include "ppc_mac_gpu_r3xx_names.h"
+
+static const char *ppc_mac_gpu_r3xx_reg_name(hwaddr addr)
+{
+    size_t lo = 0, hi = ARRAY_SIZE(ppc_mac_gpu_r3xx_names);
+
+    addr &= ~3u;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+
+        if (ppc_mac_gpu_r3xx_names[mid].addr == addr) {
+            return ppc_mac_gpu_r3xx_names[mid].name;
+        }
+        if (ppc_mac_gpu_r3xx_names[mid].addr < addr) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return NULL;
+}
+
 static const char *ppc_mac_gpu_reg_name(hwaddr addr)
 {
     switch (addr & ~3ULL) {
@@ -900,6 +930,9 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
         }
         if (addr >= R200_PCI_MIRROR_BASE && addr < R200_PCI_MIRROR_END) {
             return "PCI_MIRROR";
+        }
+        if (ppc_mac_gpu_r3xx_reg_name(addr)) {
+            return ppc_mac_gpu_r3xx_reg_name(addr);
         }
         return "UNKNOWN";
     }
@@ -2568,10 +2601,21 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
             r300_reg(r, 0x4E88), r300_reg(r, 0x46A4));
     for (int t = 0; t < 16; t++) {
         if (r300_reg(r, 0x4104) & (1u << t)) {
-            fprintf(f, " t%d=%08x/%08x/%08x/%08x/%08x", t,
+            /* texels that are non-zero / all texels, assuming 32-bit texels (is the texture uploaded yet?) */
+            uint32_t xo = r300_reg(r, 0x4540 + 4 * t) - ((s->regs.mc_fb_location & 0xFFFF) << 16);
+            uint32_t xw = (r300_reg(r, 0x4480 + 4 * t) & 0x7FF) + 1;
+            uint32_t xh = ((r300_reg(r, 0x4480 + 4 * t) >> 11) & 0x7FF) + 1, xnz = 0;
+            uint8_t *xv = memory_region_get_ram_ptr(&s->vram);
+
+            if ((uint64_t)(xo & ~0xFu) + xw * xh * 4 <= s->vram_size && xw * xh <= 1 << 20) {
+                for (uint32_t k = 0; k < xw * xh; k++) {
+                    xnz += ((uint32_t *)(xv + (xo & ~0xFu)))[k] != 0;
+                }
+            }
+            fprintf(f, " t%d=%08x/%08x/%08x/%08x/%08x nz=%u/%u", t,
                     r300_reg(r, 0x4540 + 4 * t), r300_reg(r, 0x4480 + 4 * t),
                     r300_reg(r, 0x44C0 + 4 * t), r300_reg(r, 0x4500 + 4 * t),
-                    r300_reg(r, 0x4400 + 4 * t));
+                    r300_reg(r, 0x4400 + 4 * t), xnz, xw * xh);
         }
     }
     fprintf(f, " rs=%08x/%08x ip=%08x,%08x,%08x,%08x vo=%08x/%08x ps=%08x",
@@ -3074,6 +3118,10 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             break;
         }
     }
+    if (getenv("PPCGPU_TEX_LOG")) {
+        fprintf(stderr, "DRAWRT vram+%x pitch %u h %u fmt %u cbs %u\n", pkt.rt_gpu_addr, pkt.rt_pitch, pkt.rt_height,
+                pkt.rt_format, pkt.num_cb);
+    }
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         R300TexDesc *td = &pkt.tex[t];
         uint64_t tlen = td->size_bytes;     /* the whole mip chain */
@@ -3084,6 +3132,54 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (r300_to_vram(s, &td->gpu_addr, tlen)) {
             /* the card's own copies (texture uploads) write this memory: let them land before it is read */
             gpu_vram_access(s, td->gpu_addr, (uint64_t)td->gpu_addr + tlen, false);
+            if (getenv("PPCGPU_TEX_LOG")) {
+                /* debug: is the texture memory the draw reads actually non-zero (PPCGPU_TEX_LOG=1) */
+                uint64_t n = MIN(tlen, 1u << 20), nz = 0;
+                for (uint64_t i = 0; i < n; i++) {
+                    nz += vram[td->gpu_addr + i] != 0;
+                }
+                const char *dd = getenv("PPCGPU_TEX_DUMP");
+                static unsigned ndump;
+                static uint64_t dump_from = (uint64_t)-1;
+                if (dump_from == (uint64_t)-1) {
+                    const char *e = getenv("PPCGPU_TEX_DUMP_FROM");   /* only dump from this draw on */
+                    dump_from = e ? strtoull(e, NULL, 0) : 0;
+                }
+                bool dump_new = true;
+
+                if (dd && dump_from && tlen <= (4u << 20)) {
+                    /* with a start draw: skip a texture whose bytes were dumped already (FNV-1a over them) */
+                    static struct { uint32_t addr; uint64_t h; } seen[512];
+                    static unsigned nseen;
+                    uint64_t h = 1469598103934665603ull;
+
+                    for (uint64_t i = 0; i < tlen; i++) {
+                        h = (h ^ vram[td->gpu_addr + i]) * 1099511628211ull;
+                    }
+                    for (unsigned i = 0; i < nseen; i++) {
+                        dump_new &= !(seen[i].addr == td->gpu_addr && seen[i].h == h);
+                    }
+                    if (dump_new && nseen < 512) {
+                        seen[nseen].addr = td->gpu_addr;
+                        seen[nseen++].h = h;
+                    }
+                }
+                if (dd && nz && dump_new && s->r3->draws >= dump_from && (dump_from || td->width * 4 == td->pitch_bytes) &&
+                    ndump < 6000 && tlen <= (dump_from ? (4u << 20) : 32768)) {
+                    char *fn = g_strdup_printf("%s/tex_%02x_%x_%ux%u_%03u_d%llu.raw", dd, td->format, td->gpu_addr, td->width,
+                                               td->height, ndump++, (unsigned long long)s->r3->draws);
+                    FILE *f = fopen(fn, "wb");
+                    if (f) {
+                        fwrite(vram + td->gpu_addr, 1, tlen, f);
+                        fclose(f);
+                    }
+                    g_free(fn);
+                }
+                fprintf(stderr, "VRAMTEX %08x(vram+%x) fmt %02x %ux%u pitch %u size %llu nonzero %llu/%llu first %02x%02x%02x%02x\n",
+                        ga, td->gpu_addr, td->format, td->width, td->height, td->pitch_bytes, (unsigned long long)tlen,
+                        (unsigned long long)nz, (unsigned long long)n, vram[td->gpu_addr], vram[td->gpu_addr + 1],
+                        vram[td->gpu_addr + 2], vram[td->gpu_addr + 3]);
+            }
             continue;
         }
         /* AGP/GART texture: copy the texels out of guest memory (freed
@@ -3274,6 +3370,13 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             uint32_t v = r300_swap_mode(r300_reg(s->r3, 0x4F28), (zpitch_reg >> 19) & 3);
 
             x1 = MIN(x1, pitch_b / 4);      /* the scissor is rounded up to 32 pixels; a row ends at the pitch */
+            /* ...and the buffer ends at its height: Windows (3DMark) leaves the scissor wide open (rows 0..7104 of a
+             * 768-row buffer), which made every clear write ~10x the Z buffer (up to 29 MB, 4300 times in 30 s: the
+             * emulator thread ran flat out in this loop, the display driver call never returned and Windows
+             * bugchecked 0xEA) and overwrote the VRAM that follows the Z buffer. */
+            if (pkt.rt_height) {
+                y1 = MIN(y1, pkt.rt_height);
+            }
 
             if (getenv("PPCGPU_CBZB_LOG")) {
                 fprintf(stderr, "CBZB fill zo %08x pitch %u rows %u..%u cols %u..%u value %08x rt %08x rt_pitch %u rt_h %u\n",
@@ -4323,6 +4426,11 @@ static bool blit_rect_untiled(PPCMacGPUState *s, uint8_t *vram,
  * If the address falls within a tiled surface, the tiling swizzle is
  * applied transparently.
  */
+/* Debug tag for the VRAM_WATCH line: the call site (set by the macro below, which is defined after this function
+ * so the one earlier caller, host_data_write, keeps its own log line). */
+static const char *mc_watch_fn = "?";
+static int mc_watch_line;
+
 static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
                                     uint64_t linear_addr, uint32_t value)
 {
@@ -4341,17 +4449,41 @@ static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
     }
 
     if (phys_addr + 4 <= s->vram_size) {
-        /* Phase A — VRAM write watch: window texture tile range */
-        if (phys_addr >= 0x353000 && phys_addr < 0x413000) {
-            static int vram_watch_log = 0;
-            static int zero_write_log = 0;
-            /* Log first 50 writes, plus up to 20 zero-value writes */
-            if (vram_watch_log < 50 || (value == 0 && zero_write_log < 20)) {
+        /*
+         * VRAM write watch (debug).  PPCGPU_VRAM_WATCH="max,lo,hi" (any part optional; numbers like 0x353000):
+         * log up to max writes (default 50, 0 = unlimited) whose physical address is in [lo, hi) (default the
+         * window-texture tile range 0x353000-0x413000).  Up to 20 zero-value writes are logged beyond the cap.
+         */
+        static bool watch_init;
+        static uint64_t watch_max = 50, watch_lo = 0x353000, watch_hi = 0x413000;
+
+        if (!watch_init) {
+            const char *e = getenv("PPCGPU_VRAM_WATCH");
+            char *end;
+
+            watch_init = true;
+            if (e && *e) {
+                watch_max = strtoull(e, &end, 0);
+                if (*end == ',') {
+                    watch_lo = strtoull(end + 1, &end, 0);
+                    if (*end == ',') {
+                        watch_hi = strtoull(end + 1, &end, 0);
+                    }
+                }
+            }
+        }
+        if (phys_addr >= watch_lo && phys_addr < watch_hi) {
+            static uint64_t vram_watch_log, zero_write_log;
+
+            if (watch_max == 0 || vram_watch_log < watch_max || (value == 0 && zero_write_log < 20)) {
                 fprintf(stderr, "[VRAM_WATCH] mc_vram_write32 phys=0x%06llx "
-                        "linear=0x%06llx val=0x%08x tiled=%d\n",
+                        "linear=0x%06llx val=0x%08x tiled=%d src=%s:%d "
+                        "gmc=0x%08x dst_po=0x%08x default_po=0x%08x\n",
                         (unsigned long long)phys_addr,
                         (unsigned long long)linear_addr,
-                        value, (slot >= 0));
+                        value, (slot >= 0), mc_watch_fn, mc_watch_line,
+                        s->regs.dp_gui_master_cntl, s->regs.dst_pitch_offset,
+                        s->regs.default_pitch_offset);
                 vram_watch_log++;
                 if (value == 0) zero_write_log++;
             }
@@ -4359,6 +4491,9 @@ static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
         *(uint32_t *)(vram + phys_addr) = value;
     }
 }
+
+#define mc_vram_write32(s, vram, addr, val) \
+    (mc_watch_fn = __func__, mc_watch_line = __LINE__, mc_vram_write32(s, vram, addr, val))
 
 /*
  * Store one solid-fill pixel.  VRAM holds pixels as the CPU sees them
@@ -4370,7 +4505,7 @@ static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
                                 uint64_t addr, uint32_t color, uint32_t bpp)
 {
     if (bpp == 4) {
-        mc_vram_write32(s, vram, addr, GUEST_TO_CPU32(color));
+        (mc_vram_write32)(s, vram, addr, GUEST_TO_CPU32(color));   /* parentheses: keep the caller's tag */
     } else if (addr + bpp <= s->vram_size) {
         if (bpp == 2) {
                 GUEST_STW_P(vram + addr, color);
@@ -4379,6 +4514,8 @@ static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
         }
     }
 }
+#define fill_vram_px(s, vram, addr, color, bpp) \
+    (mc_watch_fn = __func__, mc_watch_line = __LINE__, fill_vram_px(s, vram, addr, color, bpp))
 
 /*
  * MC VRAM read: read a 32-bit pixel from VRAM at a linear address.
@@ -4481,6 +4618,16 @@ static inline uint8_t *gpu_px_ptr(PPCMacGPUState *s, uint8_t *vram, uint64_t a,
         return NULL;
     }
     uint8_t *pg = gpu_agp_page(s, (uint32_t)a);
+    if (!pg) {
+        /* gpu_po_offset removed MC_FB_LOCATION's start from every PITCH_OFFSET address, past the end of VRAM
+         * too, but the AGP/GART ranges are absolute GPU addresses (a PowerMac leaves the start at 0, so
+         * nothing differs there): try the address with the start put back. */
+        uint64_t fb = (uint64_t)(s->regs.mc_fb_location & 0xFFFF) << 16;
+
+        if (fb && a + fb <= 0xFFFFFFFFull) {
+            pg = gpu_agp_page(s, (uint32_t)(a + fb));
+        }
+    }
     return pg ? pg + (a & 0xFFF) : NULL;
 }
 
@@ -4528,6 +4675,12 @@ static void gpu_mc_copy(PPCMacGPUState *s, uint8_t *vram, uint64_t da, uint64_t 
         d = gpu_px_ptr(s, vram, da, 1);
         r = gpu_px_ptr(s, vram, sa, 1);
         if (!d || !r) {
+            static int nwarn;
+
+            if (nwarn++ < 20) {     /* debug: a page of the copy is not mapped, the rest is dropped */
+                fprintf(stderr, "MC_COPY dropped: da=%llx(%s) sa=%llx(%s) n=%u\n", (unsigned long long)da,
+                        d ? "ok" : "UNMAPPED", (unsigned long long)sa, r ? "ok" : "UNMAPPED", n);
+            }
             return;
         }
         if (da < s->vram_size) {
@@ -4698,6 +4851,8 @@ typedef struct Gpu2DOp {
  * DP_GUI_MASTER_CNTL, honours the copy direction and the scissor.  Pixels are
  * in the guest's byte order (gpu_px_get/put).
  */
+static FILE *r300_ringdump(void);
+
 static void ppc_mac_gpu_2d_op(PPCMacGPUState *s, const Gpu2DOp *op)
 {
     uint32_t gmc = op->gmc;
@@ -4715,6 +4870,14 @@ static void ppc_mac_gpu_2d_op(PPCMacGPUState *s, const Gpu2DOp *op)
     uint32_t mask = bpp == 4 ? 0xFFFFFFFFu : bpp == 2 ? 0xFFFF : 0xFF;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
+    {   /* debug: with R300_RINGDUMP, every 2D op lands in the packet dump too (one timeline) */
+        FILE *rd = r300_ringdump();
+
+        if (rd) {
+            fprintf(rd, "2D rop=%02x brush=%u srcsrc=%u dst=%08x/%u (%d,%d) src=%08x/%u (%d,%d) %ux%u bpp=%u\n",
+                    rop, brush, src_src, doff, dpitch, dx, dy, soff, spitch, sx, sy, w, h, bpp);
+        }
+    }
     if (getenv("PPCGPU_LE2D_LOG")) {
         static int n;
         if (n++ < 4000) {
@@ -4807,6 +4970,19 @@ static void ppc_mac_gpu_2d_op(PPCMacGPUState *s, const Gpu2DOp *op)
     if (need_src && !sgtt) {
         /* a download reads what the renderer wrote: make it visible first */
         gpu_vram_access(s, GPU_ROWS(soff, spitch, sy < 0 ? 0 : MIN(sy, sy + (int)h - 1), h), false);
+    }
+    if (dgtt && need_src && !sgtt && getenv("PPCGPU_TEX_LOG") && (uint64_t)w * h >= 4096) {
+        /* debug: is what is about to be downloaded to system memory non-zero in the VRAM copy? */
+        uint8_t *vr = memory_region_get_ram_ptr(&s->vram);
+        uint32_t nz = 0, tot = 0;
+
+        for (uint32_t j = 0; j < h && (uint64_t)soff + (uint64_t)(sy + j + 1) * spitch <= s->vram_size; j++) {
+            for (uint32_t i = 0; i < w; i++) {
+                nz += *(uint32_t *)(vr + soff + (uint64_t)(sy + j) * spitch + (uint64_t)(sx + i) * 4) != 0;
+                tot++;
+            }
+        }
+        fprintf(stderr, "DL2SYS src=%x/%u %ux%u nonzero=%u/%u\n", soff, spitch, w, h, nz, tot);
     }
     for (uint32_t j = 0; j < h; j++) {
         int y = yt2b ? dy + (int)j : dy - (int)j;
@@ -7276,6 +7452,40 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
     g_free(rb_data);
 }
 
+/*
+ * Run the ring up to the write pointer the guest last stored (everything the old CP_RB_WPTR handler did).  With
+ * ring_async (x86 build) the WPTR write only schedules this: the guest does not wait while the host renders the
+ * batch.  Anything that can observe the result (register reads past the display block, any other register write)
+ * calls it first, so ordering and the status/fence registers stay as if the ring had run synchronously.
+ */
+static void ppc_mac_gpu_ring_run(PPCMacGPUState *s)
+{
+    uint32_t old_rptr, val;
+
+    if (!s->ring_pending) {
+        return;
+    }
+    s->ring_pending = false;
+    old_rptr = s->regs.cp_rb_rptr;
+    val = s->regs.cp_rb_wptr;
+    /* CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted. */
+    if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
+        s->regs.stall_ring_dwords += (val >= old_rptr) ? (val - old_rptr) : val;
+        ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
+    }
+    /* Everything is carried out here, so the ring is empty again -- in the card's own register and in the copy the
+     * driver may be reading from memory instead. */
+    s->regs.cp_rb_rptr = val;
+    ppc_mac_gpu_rptr_writeback(s);
+    /* Bump CSQ stat counter so the driver's "wait for CSQ change" poll sees a different value. */
+    s->regs.cp_csq_stat_counter++;
+}
+
+static void ppc_mac_gpu_ring_bh_cb(void *opaque)
+{
+    ppc_mac_gpu_ring_run(opaque);
+}
+
 /* The last command packets pushed in by hand, for the stall report. */
 static struct { uint32_t hdr, type, opcode, count; } pm4_recent[32];
 static unsigned pm4_recent_n;
@@ -7931,7 +8141,14 @@ static bool ppc_mac_gpu_mmio_read_display(PPCMacGPUState *s, hwaddr addr, unsign
         /* bit 30, GUI_TRIG_OFFSET: a new offset is waiting for the next vblank (r100_page_flip waits for it to rise) */
         {
             int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), frame = NANOSECONDS_PER_SECOND / 60;
-            bool pending = s->regs.crtc_offset_write_ns > 0 && now / frame == s->regs.crtc_offset_write_ns / frame;
+            /* A write with OFFSET_LOCK (bit 31) leaves the update pending until the lock is released by a later write
+             * (r100_page_flip: lock+offset, poll bit 30 until it rises, unlock): without that, a write made a few
+             * microseconds before a 60 Hz boundary was pending for less than one poll round trip, the guest never saw
+             * bit 30 rise and spun for its whole 100000 us timeout (a ~1.1 s freeze of the whole guest, every few
+             * seconds under glxgears).  Bounded to two frames so a driver that never unlocks cannot see it for ever. */
+            bool pending = s->regs.crtc_offset_write_ns > 0 &&
+                           (now / frame == s->regs.crtc_offset_write_ns / frame ||
+                            (s->regs.crtc_offset_locked && now - s->regs.crtc_offset_write_ns < 2 * frame));
 
             val = s->regs.crtc_offset | (pending ? 1u << 30 : 0);
         }
@@ -8417,6 +8634,16 @@ static bool ppc_mac_gpu_mmio_read_stub_3d(PPCMacGPUState *s, hwaddr addr, unsign
         break;
 
     default:
+        /* WORKAROUND (x86, Windows 3DMark2001 "Benchmark", the DirectX fullscreen mode change): ati2cqag.dll (SP3), wait
+         * loop at rva 0x7a40 whose condition (rva 0x7300) reads [0x1fb4] until (value & 0x80000000) == 0x80000000 (the
+         * wait object holds pointer 0x1fb4, mask 0x80000000).  Without the bit the call runs for ~20 s and the display
+         * watchdog bugchecks (THREAD_STUCK_IN_DEVICE_DRIVER_M).  Meaning of the register unknown.  Placed before the
+         * 3D shadow range below, which otherwise answers 0x1fb4 with 0 (the earlier copy of this answer sat after it
+         * and never ran). */
+        if (GUEST_LE && addr == 0x1fb4 && !getenv("PPCGPU_NO_7B0")) {
+            val = 0x80000000;
+            break;
+        }
         /*
          * 3D engine register range (0x1C00-0x3FFF) — return shadow values.
          * This allows the kext to read back any 3D register it has written.
@@ -8643,14 +8870,6 @@ static bool ppc_mac_gpu_mmio_read_stub_3d(PPCMacGPUState *s, hwaddr addr, unsign
             }
             if (addr == 0x0a10) {
                 val = 0x3333;
-                break;
-            }
-            /* Windows 3DMark2001 "Benchmark" (DirectX fullscreen mode change): ati2cqag.dll, a wait-with-timeout loop
-             * at rva 0x7a40 whose condition (rva 0x7300) reads [0x1fb4] until (value & 0x80000000) == 0x80000000 (the
-             * object holds pointer 0x1fb4, mask 0x80000000).  Without the bit the call runs for ~20 s and the
-             * display watchdog bugchecks (THREAD_STUCK_IN_DEVICE_DRIVER_M).  Meaning of the register unknown. */
-            if (addr == 0x1fb4) {
-                val = 0x80000000;
                 break;
             }
         }
@@ -9120,6 +9339,11 @@ static void gpu_poll_watch(hwaddr addr, uint64_t val)
 /* Every register read, with the value the emulator answered (PPCGPU_DEBUG_LOG=1). */
 static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    PPCMacGPUState *rs = opaque;
+
+    if (unlikely(rs->ring_pending) && addr >= 0x200) {
+        ppc_mac_gpu_ring_run(rs);   /* status, rptr, scratch/fence: show the finished ring */
+    }
     uint64_t val = ppc_mac_gpu_mmio_read_impl(opaque, addr, size);
 
     gpu_poll_watch(addr, val);
@@ -9357,6 +9581,7 @@ static bool ppc_mac_gpu_mmio_write_display(PPCMacGPUState *s, hwaddr addr,
         /* bit 30 is GUI_TRIG_OFFSET (an action, reads back while pending) and bit 31 OFFSET_LOCK (the Catalyst
          * driver and its video BIOS write 0x80020000); neither is part of the address. */
         s->regs.crtc_offset = val & ~(3u << 30);
+        s->regs.crtc_offset_locked = !!(val & (1u << 31));
         s->regs.crtc_offset_write_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         s->display_invalid = true;
         break;
@@ -9681,32 +9906,18 @@ static bool ppc_mac_gpu_mmio_write_cp(PPCMacGPUState *s, hwaddr addr,
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", (uint32_t)val);
         break;
-    case R200_CP_RB_WPTR: {
-        uint32_t old_rptr = s->regs.cp_rb_rptr;
+    case R200_CP_RB_WPTR:
         gpu_debug_log("CP_RING WPTR <- %u (prev=%u, delta=%d)",
                       (uint32_t)val, s->regs.cp_rb_wptr,
                       (int)(uint32_t)val - (int)s->regs.cp_rb_wptr);
         s->regs.cp_rb_wptr = val;
-
-        /*
-         * Process ring buffer commands if the microengine is started.
-         * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
-         */
-        if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
-            s->regs.stall_ring_dwords += (val >= old_rptr) ? (val - old_rptr) : val;
-            ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
+        s->ring_pending = true;
+        if (s->ring_async && s->ring_bh) {
+            qemu_bh_schedule(s->ring_bh);
+        } else {
+            ppc_mac_gpu_ring_run(s);
         }
-
-        /* Everything is carried out here, so the ring is empty again --
-         * in the card's own register and in the copy the driver may be
-         * reading from memory instead. */
-        s->regs.cp_rb_rptr = val;
-        ppc_mac_gpu_rptr_writeback(s);
-        /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
-         * sees a different value after we process commands. */
-        s->regs.cp_csq_stat_counter++;
         break;
-    }
     case R200_CP_ME_CNTL:
         s->regs.cp_me_cntl = val;
         gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", (uint32_t)val, !((uint32_t)val & 0x10000000));
@@ -10170,8 +10381,23 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         }
         return;
     }
+    if (unlikely(s->ring_pending) && addr != R200_CP_RB_WPTR) {
+        ppc_mac_gpu_ring_run(s);    /* keep register writes ordered after the queued ring */
+    }
     if (addr >= 0x780 && addr < 0x7C0) {
         seq_log("DMA  wr reg=%03x val=%08x", (unsigned)addr, (uint32_t)val);
+    }
+    if (addr >= 0x400 && addr < 0x560) {
+        /* PPCGPU_OV0_LOG=1: video overlay (OV0_*) and colour-key register writes, to see what the driver programs */
+        static int ov0_log = -1;
+
+        if (ov0_log < 0) {
+            ov0_log = getenv("PPCGPU_OV0_LOG") != NULL;
+        }
+        if (ov0_log) {
+            fprintf(stderr, "[OV0] wr reg=0x%04x (%s) val=0x%08x\n", (unsigned)addr,
+                    ppc_mac_gpu_reg_name(addr), (uint32_t)val);
+        }
     }
     /* No flush here: CPU-side 2D operations check their own VRAM ranges
      * (gpu_vram_access), fences complete asynchronously, and the other
@@ -10258,9 +10484,51 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
 }
 
+/* Slow-access detector (stderr, always on): a register access that keeps the vCPU in the device for 5 ms or more
+ * freezes the guest for that long (the CP ring is processed inside the doorbell write).  PPCGPU_SLOW_MS changes the
+ * limit.  Says which register and how long, so a freeze seen in the guest (an FPS dip, a stuck window) can be tied to
+ * an operation. */
+static int64_t gpu_slow_limit_ns(void)
+{
+    static int64_t lim = -1;
+
+    if (lim < 0) {
+        const char *e = getenv("PPCGPU_SLOW_MS");
+
+        lim = (e ? strtoll(e, NULL, 0) : 5) * 1000000;
+    }
+    return lim;
+}
+
+static uint64_t ppc_mac_gpu_mmio_read_timed(void *opaque, hwaddr addr, unsigned int size)
+{
+    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t v = ppc_mac_gpu_mmio_read(opaque, addr, size);
+    int64_t dt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0;
+
+    if (dt >= gpu_slow_limit_ns()) {
+        fprintf(stderr, "[SLOW_MMIO] read  reg=0x%04" PRIx64 " (%s) took %.1f ms\n", (uint64_t)addr,
+                ppc_mac_gpu_reg_name(addr), dt / 1e6);
+    }
+    return v;
+}
+
+static void ppc_mac_gpu_mmio_write_timed(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t dt;
+
+    ppc_mac_gpu_mmio_write(opaque, addr, val, size);
+    dt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0;
+    if (dt >= gpu_slow_limit_ns()) {
+        fprintf(stderr, "[SLOW_MMIO] write reg=0x%04" PRIx64 " (%s) val=0x%08" PRIx64 " took %.1f ms\n",
+                (uint64_t)addr, ppc_mac_gpu_reg_name(addr), val, dt / 1e6);
+    }
+}
+
 static const MemoryRegionOps ppc_mac_gpu_mmio_ops = {
-    .read = ppc_mac_gpu_mmio_read,
-    .write = ppc_mac_gpu_mmio_write,
+    .read = ppc_mac_gpu_mmio_read_timed,
+    .write = ppc_mac_gpu_mmio_write_timed,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -10551,6 +10819,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
+    s->ring_pending = false;
     memset(&s->regs, 0, sizeof(s->regs));
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
@@ -10692,6 +10961,11 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     Object *obj = OBJECT(dev);
 
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
+    /* Deferred ring processing: only the little-endian (x86) build; PPCGPU_SYNC_RING=1 turns it off. */
+    s->ring_async = GUEST_LE && !getenv("PPCGPU_SYNC_RING");
+    if (s->ring_async) {
+        s->ring_bh = qemu_bh_new(ppc_mac_gpu_ring_bh_cb, s);
+    }
     s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
         const char *dump = getenv("R300_DUMP");
 
@@ -11135,6 +11409,20 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                  PPC_MAC_GPU_PCI_VENDOR_ID);
     pci_set_word(dev->config + PCI_SUBSYSTEM_ID,
                  PPC_MAC_GPU_R300_DEVICE_ID);
+
+    /*
+     * EXPERIMENT (marked hack): PPCGPU_DEVICE_ID=<hex> makes the card present another PCI device ID (the
+     * subsystem ID stays: XP ranks a SUBSYS-specific inbox INF above the Catalyst one), so a guest driver that caches per-device state (the XP Catalyst keeps its bus-caps test
+     * result in the registry) sees new hardware and runs its probing again.  The video ROM's PCI data
+     * structure must name the same ID for SeaBIOS to run it (tools/make-vgabios-rom.py patches it).
+     */
+    {
+        const char *e = getenv("PPCGPU_DEVICE_ID");
+        if (e && *e) {
+            uint16_t id = (uint16_t)strtoul(e, NULL, 16);
+            pci_set_word(dev->config + PCI_DEVICE_ID, id);
+        }
+    }
 
     /*
      * AGP capability at offset 0x58 (where real RV280 has it).

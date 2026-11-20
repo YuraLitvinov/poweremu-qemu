@@ -229,22 +229,11 @@ impl Vk {
             let (cw, ch) = if dxt { (mw, mh) } else { (lw, lh) };
             let face = td.lvl_pitch[l as usize] as usize * td.lvl_rows[l as usize] as usize;
             for f in 0..n {
-                let mut bpr = 0u32;
-                let bytes = unsafe {
-                    r300_tex_level_bytes(td, src.add(td.lvl_off[l as usize] as usize + f as usize * face), l, cw, ch, &mut bpr)
-                };
-                if bytes.is_null() {
-                    continue;
-                }
-                let len = if dxt { bpr as usize * ((ch as usize + 3) / 4) } else { bpr as usize * ch as usize };
-                let Some((sb, so, dst)) = self.arena(len as u64) else {
-                    unsafe { free(bytes as *mut c_void) };
+                // SAFETY: `src` covers the texture (the caller's contract).
+                let at = unsafe { src.add(td.lvl_off[l as usize] as usize + f as usize * face) };
+                let Some((sb, so)) = self.level_to_arena(td, at, l, cw, ch, dxt) else {
                     continue;
                 };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes, dst, len);
-                    free(bytes as *mut c_void);
-                }
                 let r = vk::BufferImageCopy {
                     buffer_offset: so,
                     buffer_row_length: 0,
@@ -267,5 +256,46 @@ impl Vk {
         self.clock += 1;
         self.texfull[slot] = TexFull { live: true, key, img, mem, view, used: self.clock };
         Some(view)
+    }
+}
+
+impl Vk {
+    /// Converts mip level `l` (`w` x `h`, from `src`) of `td` into the upload arena: the buffer and offset it
+    /// went to, or `None` if the level cannot be converted or the arena is full.  The Rust R300 crate
+    /// converts in place; the C one returns a malloc'd copy.
+    #[cfg(feature = "r300_rs")]
+    fn level_to_arena(&mut self, td: &R300TexDesc, src: *const u8, l: u32, w: u32, h: u32, _dxt: bool) -> Option<(vk::Buffer, u64)> {
+        let td = td as *const R300TexDesc as *const r300::types::R300TexDesc;
+        let mut bpr = 0u32;
+        // SAFETY: the two descriptors have the same C layout (checked by the r300 crate against r300_draw.h).
+        let len = unsafe { r300::capi::r300_tex_level_size(td, l, w, h, &mut bpr) };
+        if len == 0 {
+            return None;
+        }
+        let (sb, so, dst) = self.arena(len as u64)?;
+        // SAFETY: `dst` has `len` writable bytes; `src` covers the level's source rows.
+        unsafe { r300::capi::r300_tex_level_convert(td, src, l, w, h, dst, len) }.then_some((sb, so))
+    }
+
+    #[cfg(not(feature = "r300_rs"))]
+    fn level_to_arena(&mut self, td: &R300TexDesc, src: *const u8, l: u32, w: u32, h: u32, dxt: bool) -> Option<(vk::Buffer, u64)> {
+        let mut bpr = 0u32;
+        // SAFETY: as the call it replaces.
+        let bytes = unsafe { r300_tex_level_bytes(td, src, l, w, h, &mut bpr) };
+        if bytes.is_null() {
+            return None;
+        }
+        let len = if dxt { bpr as usize * ((h as usize + 3) / 4) } else { bpr as usize * h as usize };
+        let Some((sb, so, dst)) = self.arena(len as u64) else {
+            // SAFETY: malloc'd by r300_tex_level_bytes.
+            unsafe { free(bytes as *mut c_void) };
+            return None;
+        };
+        // SAFETY: `bytes` and `dst` hold `len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes, dst, len);
+            free(bytes as *mut c_void);
+        }
+        Some((sb, so))
     }
 }

@@ -1,0 +1,9 @@
+S stage.glsl 0 222 55b2ac406bd0c92b
+S stage.glsl 1 127 b1aac1766025e2cd
+S stage.glsl 2 220 cf39a68249445545
+E broken.glsl 0 GLSL: r300_vs:2: error: 'this' : Reserved word.|r300_vs:2: error: '' :  syntax error, unexpected end of file|
+E broken.glsl 1 GLSL: r300_fs:2: error: 'this' : Reserved word.|r300_fs:2: error: '' :  syntax error, unexpected end of file|
+E broken.glsl 2 GLSL: r300_fs_z:2: error: 'this' : Reserved word.|r300_fs_z:2: error: '' :  syntax error, unexpected end of file|
+N 0 r300_vs
+N 1 r300_fs
+N 2 r300_fs_z

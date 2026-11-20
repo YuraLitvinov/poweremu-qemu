@@ -30,12 +30,14 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci-host/i440fx.h"
+#include "hw/pci-host/uninorth.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "qapi/visitor.h"
 #include "qemu/error-report.h"
+#include "exec/address-spaces.h"
 #include "qom/object.h"
 
 /*
@@ -354,7 +356,7 @@ static const TypeInfo i440fx_info = {
  * Datasheet: Intel 290633 (82443BX).  Only what the guests' AGP drivers
  * (Linux agpgart intel-agp, Windows agp440.sys) read is modelled: the AGP
  * capability, AGPCTRL/APSIZE/ATTBASE and the aperture BAR.  The aperture
- * itself does not translate yet (GART comes later).
+ * itself is translated through the GATT (CPU side here, GPU side in the Radeon model).
  */
 #define TYPE_I440BX_PCI_DEVICE "i440BX"
 OBJECT_DECLARE_SIMPLE_TYPE(PCII440BXState, I440BX_PCI_DEVICE)
@@ -370,26 +372,92 @@ struct PCII440BXState {
 #define I440BX_ATTBASE  0xb8
 #define I440BX_AGP_STATUS_VAL 0x1f000202 /* RQ 32, SBA, rates 1x/2x (AGP 2.0 BX) */
 
+/*
+ * CPU side of the AGP aperture: an access to the aperture BAR is translated through the GATT (ATTBASE, one 32-bit
+ * entry per 4 KB page, bits 31:12 = physical page, bit 0 = valid) to the system memory page behind it.  The
+ * Windows AGP stack (agp440.sys) and the Radeon miniport write command buffers, textures and the ring through this
+ * window; an unmapped (invalid) page reads as zero and drops writes, like the chipset.
+ */
+static bool i440bx_gart_lookup(PCII440BXState *b, hwaddr off, hwaddr *phys)
+{
+    hwaddr gatt = pci_get_long(PCI_DEVICE(b)->config + I440BX_ATTBASE) & 0xfffff000;
+    uint32_t pte;
+
+    if (!gatt) {
+        return false;
+    }
+    pte = ldl_le_phys(&address_space_memory, gatt + (off >> 12) * 4);
+    if (!(pte & 1)) {
+        return false;
+    }
+    *phys = (pte & 0xfffff000) | (off & 0xfff);
+    return true;
+}
+
 static uint64_t i440bx_aper_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return 0;
+    uint8_t buf[8] = { 0 };
+    unsigned done = 0;
+
+    while (done < size) {
+        unsigned n = MIN(size - done, 0x1000 - ((addr + done) & 0xfff));
+        hwaddr phys;
+
+        if (i440bx_gart_lookup(opaque, addr + done, &phys)) {
+            address_space_read(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED, buf + done, n);
+        }
+        done += n;
+    }
+    return ldq_le_p(buf);
 }
 
 static void i440bx_aper_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned size)
 {
+    uint8_t buf[8];
+    unsigned done = 0;
+
+    stq_le_p(buf, val);
+    while (done < size) {
+        unsigned n = MIN(size - done, 0x1000 - ((addr + done) & 0xfff));
+        hwaddr phys;
+
+        if (i440bx_gart_lookup(opaque, addr + done, &phys)) {
+            address_space_write(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED, buf + done, n);
+        }
+        done += n;
+    }
 }
 
 static const MemoryRegionOps i440bx_aper_ops = {
     .read = i440bx_aper_read,
     .write = i440bx_aper_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
 };
 
 /* APSIZE[5:0]: 0 = 256MB, each set bit (from the top) halves it, 0x3f = 4MB */
 static uint64_t i440bx_aperture_size(PCIDevice *dev)
 {
     return (4ULL << 20) << (6 - ctpop8(dev->config[I440BX_APSIZE] & 0x3f));
+}
+
+/*
+ * The AGP GART the host bridge translates the aperture with: ATTBASE is the physical address of a table of 32-bit
+ * entries, one per 4 KB page of the aperture, bits 31:12 the physical page, bit 0 valid (Intel GATT).  The
+ * emulated Radeon reads it for GPU addresses in its MC_AGP_LOCATION range (the guest's AGP aperture), which is
+ * where the Linux and Windows AGP drivers put the ring, indirect buffers and GART textures.  Overrides the weak
+ * stub in ppc_mac_gpu_x86_stubs.c.
+ */
+static PCII440BXState *i440bx_instance;
+
+hwaddr uninorth_get_agp_gart_base(void)
+{
+    if (!i440bx_instance) {
+        return 0;
+    }
+    return pci_get_long(PCI_DEVICE(i440bx_instance)->config + I440BX_ATTBASE) & 0xfffff000;
 }
 
 static void i440bx_update_aperture(PCII440BXState *b)
@@ -422,6 +490,8 @@ static void i440bx_realize(PCIDevice *dev, Error **errp)
 {
     PCII440BXState *b = I440BX_PCI_DEVICE(dev);
     Error *err = NULL;
+
+    i440bx_instance = b;
 
     i440fx_realize(dev, &err);
     if (err) {

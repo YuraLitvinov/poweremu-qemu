@@ -7,7 +7,7 @@
 //! `ppc_mac_gpu_vulkan.c` (kept beside it, unbuilt, as the reference) and
 //! uses `ash`.  Every C type comes from bindgen over QEMU's own headers.
 
-#![allow(unknown_lints, non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, unnecessary_transmutes, clippy::all)]
+// #![allow(unknown_lints, non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, unnecessary_transmutes, clippy::all)]
 
 mod batch;
 mod cache;
@@ -17,6 +17,11 @@ mod pipe;
 mod record;
 mod state;
 mod tex;
+
+/// The Rust R300 code: its `r300_*` C entry points are linked into this static library, in place of the C
+/// implementation (see hw/display/meson.build).
+#[cfg(feature = "r300_rs")]
+pub use r300::capi as r300_capi;
 
 #[allow(clippy::all)]
 pub mod sys {

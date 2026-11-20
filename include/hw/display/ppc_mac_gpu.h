@@ -257,6 +257,7 @@
 #define R200_CP_CSQ_IND_ADDR          0x07F0
 #define R200_CP_CSQ_IND_DATA          0x07F4
 #define R200_CP_CSQ_STAT              0x07F8
+#define R200_CP_CSQ2_STAT             0x07FC
 
 /* HOST_DATA */
 #define R200_HOST_DATA0               0x17C0
@@ -418,6 +419,7 @@ typedef struct PPCMacGPURegs {
     uint32_t crtc_v_sync_strt_wid;
     uint32_t crtc_offset;
     uint32_t crtc_offset_cntl;
+    bool crtc_offset_locked;        /* the last CRTC_OFFSET write had OFFSET_LOCK (bit 31) set */
     int64_t crtc_offset_write_ns;   /* CRTC_OFFSET write time: GUI_TRIG_OFFSET (bit 30) reads set until the next 60 Hz frame boundary */
     int64_t crtc_vblank_clear_ns;   /* virtual time of the last VBLANK_SAVE clear (derived CRTC_STATUS) */
     uint32_t crtc_pitch;
@@ -620,6 +622,9 @@ struct PPCMacGPUState {
      * writes (2D engine, uploads), flagged by gpu_vram_dirty(). */
     bool vram_dev_dirty;
     uint32_t kick_epoch, last_draw_epoch;
+    /* x86 build: CP_RB_WPTR only records the new pointer; a bottom half runs the ring (see ppc_mac_gpu_ring_run) */
+    struct QEMUBH *ring_bh;
+    bool ring_pending, ring_async;
 
     /* Scratch for vertex assembly, reused across draws.
      *
