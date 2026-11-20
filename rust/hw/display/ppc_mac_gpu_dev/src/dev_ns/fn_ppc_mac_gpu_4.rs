@@ -813,7 +813,7 @@ pub unsafe extern "C" fn ppc_mac_gpu_realize(dev: *mut PCIDevice, errp: *mut *mu
 fn realize_inner(s: &mut PPCMacGPUState, errp: &mut *mut Error) -> Result<(), RealizeError> {
     use crate::src::qemu as q;
     use std::os::unix::ffi::OsStrExt;
-    let tn = q::object_typename(&s.pci);
+    let tn = q::object_typename(crate::src::qemu::pci_raw_ref(&s.pci));
     s.regs_size = ::core::mem::size_of::<PPCMacGPURegs>() as uint32_t;
     s.ring_async = std::env::var_os("PPCGPU_SYNC_RING").is_none();
     let opaque = s as *mut PPCMacGPUState as *mut ::core::ffi::c_void;
@@ -834,17 +834,17 @@ fn realize_inner(s: &mut PPCMacGPUState, errp: &mut *mut Error) -> Result<(), Re
     if s.vram_size > 256 << 20 {
         return Err(RealizeError::Report(11022, "ppc-mac-gpu: VRAM must be at most 256 MB".into()));
     }
-    s.con = q::graphic_console_create(&mut s.pci, &ppc_mac_gpu_gfx_ops, opaque);
+    s.con = q::graphic_console_create(crate::src::qemu::pci_raw(&mut s.pci), &ppc_mac_gpu_gfx_ops, opaque);
     if s.legacy_vga {
         let vga = q::glib_zeroed_ref::<VGACommonState>();
         s.vga = vga as *mut VGACommonState;
         vga.vram_size_mb = 8;
-        if !q::vga_setup(vga, &mut s.pci, errp) {
+        if !q::vga_setup(vga, crate::src::qemu::pci_raw(&mut s.pci), errp) {
             return Err(RealizeError::Reported);
         }
         vga.con = s.con;
-        q::mr_init_io(&mut s.vga_bank, &mut s.pci, &ppc_mac_gpu_vga_bank_ops, opaque, c"ppc-mac-gpu-vga-bank", 0x10000);
-        q::pci_mem_add_subregion_overlap(&mut s.pci, 0xa0000, &mut s.vga_bank, 3);
+        q::mr_init_io(&mut s.vga_bank, crate::src::qemu::pci_raw(&mut s.pci), &ppc_mac_gpu_vga_bank_ops, opaque, c"ppc-mac-gpu-vga-bank", 0x10000);
+        q::pci_mem_add_subregion_overlap(crate::src::qemu::pci_raw(&mut s.pci), 0xa0000, &mut s.vga_bank, 3);
         q::mr_set_enabled(&mut s.vga_bank, false);
     }
     let rname: Option<&[u8]> = q::c_arg(s.renderer_name)
@@ -872,18 +872,18 @@ fn realize_inner(s: &mut PPCMacGPUState, errp: &mut *mut Error) -> Result<(), Re
         }
     }
     if !s.metal_vram_ptr.is_null() {
-        q::mr_init_ram_ptr(&mut s.vram, &mut s.pci, c"ppc-mac-gpu-vram", s.vram_size, s.metal_vram_ptr);
-        q::vmstate_register_ram(&mut s.vram, &mut s.pci);
+        q::mr_init_ram_ptr(&mut s.vram, crate::src::qemu::pci_raw(&mut s.pci), c"ppc-mac-gpu-vram", s.vram_size, s.metal_vram_ptr);
+        q::vmstate_register_ram(&mut s.vram, crate::src::qemu::pci_raw(&mut s.pci));
     } else {
-        q::mr_init_ram_fatal(&mut s.vram, &mut s.pci, c"ppc-mac-gpu-vram", s.vram_size);
+        q::mr_init_ram_fatal(&mut s.vram, crate::src::qemu::pci_raw(&mut s.pci), c"ppc-mac-gpu-vram", s.vram_size);
     }
-    q::mr_init(&mut s.vram_bar, &mut s.pci, c"ppc-mac-gpu-vram-bar", s.vram_size);
+    q::mr_init(&mut s.vram_bar, crate::src::qemu::pci_raw(&mut s.pci), c"ppc-mac-gpu-vram-bar", s.vram_size);
     q::mr_add_subregion(&mut s.vram_bar, 0, &mut s.vram);
-    q::pci_register_bar(&mut s.pci, 0, 0x8, &mut s.vram_bar);
-    q::mr_init_io(&mut s.mmio, &mut s.pci, &ppc_mac_gpu_mmio_ops, opaque, c"ppc-mac-gpu-mmio", 0x10000);
-    q::pci_register_bar(&mut s.pci, 2, 0, &mut s.mmio);
-    q::mr_init_alias(&mut s.io, &mut s.pci, c"ppc-mac-gpu-io", &mut s.mmio, 0, 0x100);
-    q::pci_register_bar(&mut s.pci, 1, 0x1, &mut s.io);
+    q::pci_register_bar(crate::src::qemu::pci_raw(&mut s.pci), 0, 0x8, &mut s.vram_bar);
+    q::mr_init_io(&mut s.mmio, crate::src::qemu::pci_raw(&mut s.pci), &ppc_mac_gpu_mmio_ops, opaque, c"ppc-mac-gpu-mmio", 0x10000);
+    q::pci_register_bar(crate::src::qemu::pci_raw(&mut s.pci), 2, 0, &mut s.mmio);
+    q::mr_init_alias(&mut s.io, crate::src::qemu::pci_raw(&mut s.pci), c"ppc-mac-gpu-io", &mut s.mmio, 0, 0x100);
+    q::pci_register_bar(crate::src::qemu::pci_raw(&mut s.pci), 1, 0x1, &mut s.io);
     q::mr_set_log(&mut s.vram, true, 0);
     q::timer_init_virtual(&mut s.vblank_timer, ppc_mac_gpu_vblank, opaque);
     if let Some(bios) = q::c_arg(s.biosrom).filter(|c| !c.to_bytes().is_empty()) {
@@ -897,7 +897,7 @@ fn realize_inner(s: &mut PPCMacGPUState, errp: &mut *mut Error) -> Result<(), Re
             None => crate::src::logs::debug(format_args!("BIOS ROM load failed: {}", path)),
         }
     }
-    q::i2c_ddc_init(&mut s.pci, &mut s.bbi2c);
+    q::i2c_ddc_init(crate::src::qemu::pci_raw(&mut s.pci), &mut s.bbi2c);
     let e: &mut [uint8_t; 128] = &mut s.edid_blob;
     let mut i: ::core::ffi::c_int = 0;
     let mut sum: uint8_t = 0;
@@ -1055,24 +1055,24 @@ fn realize_inner(s: &mut PPCMacGPUState, errp: &mut *mut Error) -> Result<(), Re
         ));
     }
     q::renderer_set_dirty_source(s.renderer_ref(), s.renderer_opaque, opaque);
-    q::pci_set_u8(&mut s.pci, 0x8, 0);
-    q::pci_set_u8(&mut s.pci, 0x3d, 1);
-    q::pci_set_u16(&mut s.pci, 0x2c, 0x1002);
-    q::pci_set_u16(&mut s.pci, 0x2e, 0x4e44);
+    q::pci_set_u8(crate::src::qemu::pci_raw(&mut s.pci), 0x8, 0);
+    q::pci_set_u8(crate::src::qemu::pci_raw(&mut s.pci), 0x3d, 1);
+    q::pci_set_u16(crate::src::qemu::pci_raw(&mut s.pci), 0x2c, 0x1002);
+    q::pci_set_u16(crate::src::qemu::pci_raw(&mut s.pci), 0x2e, 0x4e44);
     if let Some(id) = std::env::var_os("PPCGPU_DEVICE_ID").filter(|v| !v.is_empty()) {
-        q::pci_set_u16(&mut s.pci, 0x2, strtoul_hex16(id.as_bytes()));
+        q::pci_set_u16(crate::src::qemu::pci_raw(&mut s.pci), 0x2, strtoul_hex16(id.as_bytes()));
     }
     // AGP capability (id 0x2), through QEMU's safe `pci` crate.
     pci::PCIDeviceMethods::add_capability(&&*s, 0x2, 0x58, 12)
         .map_err(|e| RealizeError::Report(line!() as ::core::ffi::c_int, format!("{}: AGP capability: {}", tn, e)))?;
-    q::pci_set_u8(&mut s.pci, 0x58 + 2, 0x20);
-    q::pci_set_u32(&mut s.pci, 0x58 + 4, 0x200 | 0x4 | 0x2 | 0x1 | (0x1f << 24));
-    q::pci_set_u32(&mut s.pci, 0x58 + 8, 0x100 | 0x200 | 0x4 | (0x1f << 24));
-    q::pci_set_wmask_u32(&mut s.pci, 0x58 + 8, 0xffff_ffff);
+    q::pci_set_u8(crate::src::qemu::pci_raw(&mut s.pci), 0x58 + 2, 0x20);
+    q::pci_set_u32(crate::src::qemu::pci_raw(&mut s.pci), 0x58 + 4, 0x200 | 0x4 | 0x2 | 0x1 | (0x1f << 24));
+    q::pci_set_u32(crate::src::qemu::pci_raw(&mut s.pci), 0x58 + 8, 0x100 | 0x200 | 0x4 | (0x1f << 24));
+    q::pci_set_wmask_u32(crate::src::qemu::pci_raw(&mut s.pci), 0x58 + 8, 0xffff_ffff);
     // Power management capability (id 0x1).
     pci::PCIDeviceMethods::add_capability(&&*s, 0x1, 0x50, 8)
         .map_err(|e| RealizeError::Report(line!() as ::core::ffi::c_int, format!("{}: PM capability: {}", tn, e)))?;
-    q::pci_set_u16(&mut s.pci, 0x50 + 2, 0x1 | (1 << 9) | (1 << 10));
+    q::pci_set_u16(crate::src::qemu::pci_raw(&mut s.pci), 0x50 + 2, 0x1 | (1 << 9) | (1 << 10));
     q::trace_realize(s.vram_size_mb, s.vram_size);
     Ok(())
 }
@@ -1206,9 +1206,12 @@ pub extern "C" fn ppc_mac_gpu_class_init(
     let Some(k) = crate::src::qemu::pci_device_class(klass) else {
         return;
     };
-    k.vendor_id = 0x1002;
-    k.device_id = 0x4e44;
-    k.class_id = 0x300;
+    {
+        use pci::PCIDeviceClassIds;
+        k.set_vendor_id(0x1002);
+        k.set_device_id(0x4e44);
+        k.set_class_id(0x300);
+    }
     k.realize = Some(ppc_mac_gpu_realize);
     k.exit = Some(ppc_mac_gpu_exit);
     k.config_read = Some(ppc_mac_gpu_config_read);

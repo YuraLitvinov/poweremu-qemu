@@ -239,15 +239,6 @@ pub fn is_r300_register(addr: uint32_t) -> bool {
     }
     return 0 as ::core::ffi::c_int != 0;
 }
-pub unsafe extern "C" fn ati_radeon_9700_class_init(
-    klass: *mut ObjectClass,
-    _data: *const ::core::ffi::c_void,
-) {
-    if let Some(k) = crate::src::qemu::pci_device_class(klass) {
-        k.device_id = 0x4e44 as uint16_t;
-        k.revision = 0 as uint8_t;
-    }
-}
 pub extern "C" fn do_qemu_init_ppc_mac_gpu_register_types() {
     crate::src::qemu::register_qom_module_init(ppc_mac_gpu_register_types);
 }

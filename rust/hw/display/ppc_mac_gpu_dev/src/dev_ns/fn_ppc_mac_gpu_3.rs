@@ -395,7 +395,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
         }
         256 => {
             val = (crate::src::qemu::pci_config_read(
-                &mut s.pci,
+                crate::src::qemu::pci_raw(&mut s.pci),
                 0x10 as uint32_t,
                 4 as ::core::ffi::c_int,
             ) as ::core::ffi::c_uint
@@ -403,7 +403,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
         }
         260 => {
             val = (crate::src::qemu::pci_config_read(
-                &mut s.pci,
+                crate::src::qemu::pci_raw(&mut s.pci),
                 0x10 as uint32_t,
                 4 as ::core::ffi::c_int,
             ) & !(0xf as uint32_t))
@@ -414,7 +414,7 @@ pub fn ppc_mac_gpu_mmio_read_cfg(
         }
         268 => {
             val = (crate::src::qemu::pci_config_read(
-                &mut s.pci,
+                crate::src::qemu::pci_raw(&mut s.pci),
                 0x18 as uint32_t,
                 4 as ::core::ffi::c_int,
             ) as ::core::ffi::c_uint
@@ -937,7 +937,7 @@ pub fn ppc_mac_gpu_mmio_read_stub_3d(
             } else if addr >= 0xf00 as hwaddr && addr < 0xf40 as hwaddr {
                 let pci_off: uint32_t = addr.wrapping_sub(0xf00 as hwaddr) as uint32_t;
                 val = crate::src::qemu::pci_config_read(
-                    &mut s.pci,
+                    crate::src::qemu::pci_raw(&mut s.pci),
                     pci_off,
                     size as ::core::ffi::c_int,
                 ) as uint64_t;

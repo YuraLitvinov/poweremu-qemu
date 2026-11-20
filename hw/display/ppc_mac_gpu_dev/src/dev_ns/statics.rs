@@ -697,29 +697,6 @@ pub static mut vmstate_ppc_mac_gpu: VMStateDescription = VMStateDescription {
     fields: ::core::ptr::null::<VMStateField>(),
     subsections: ::core::ptr::null::<*const VMStateDescription>(),
 };
-#[no_mangle]
-pub static mut ati_radeon_9700_type_info: TypeInfo = unsafe {
-    TypeInfo {
-        name: c"ati-radeon-9700".as_ptr(),
-        parent: c"ppc-mac-gpu".as_ptr(),
-        instance_size: 0,
-        instance_align: 0,
-        instance_init: None,
-        instance_post_init: None,
-        instance_finalize: None,
-        abstract_: false,
-        secure: false,
-        class_size: 0,
-        class_init: Some(
-            ati_radeon_9700_class_init
-                as unsafe extern "C" fn(*mut ObjectClass, *const ::core::ffi::c_void) -> (),
-        ),
-        class_base_init: None,
-        class_data: ::core::ptr::null::<::core::ffi::c_void>(),
-        is_available: None,
-        interfaces: ::core::ptr::null::<InterfaceInfo>(),
-    }
-};
 #[used]
 #[cfg_attr(target_os = "linux", link_section = ".init_array")]
 #[cfg_attr(target_os = "windows", link_section = ".CRT$XIB")]

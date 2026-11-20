@@ -212,7 +212,7 @@ pub fn ppc_mac_gpu_reg_write_offs(
 }
 pub fn ppc_mac_gpu_update_irq(s: &mut PPCMacGPUState) {
     let level: bool = s.regs.gen_int_status & s.regs.gen_int_cntl != 0;
-    crate::src::qemu::pci_irq_set(&mut s.pci, level);
+    crate::src::qemu::pci_irq_set(crate::src::qemu::pci_raw(&mut s.pci), level);
     crate::src::qemu::trace_irq_event(s.regs.gen_int_status, s.regs.gen_int_cntl, level);
 }
 pub unsafe extern "C" fn ppc_mac_gpu_vblank(opaque: *mut ::core::ffi::c_void) {

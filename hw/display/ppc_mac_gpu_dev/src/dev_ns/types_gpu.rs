@@ -830,7 +830,7 @@ pub struct PPCMacGPUDisplayMode {
 }
 #[repr(C)]
 pub struct PPCMacGPUState {
-    pub pci: PCIDevice,
+    pub pci: qom::ParentField<pci::PCIDevice>,
     pub vram_dev_dirty: bool,
     pub kick_epoch: uint32_t,
     pub last_draw_epoch: uint32_t,

@@ -196,10 +196,26 @@ const _: () = {
     use core::mem::{align_of, offset_of, size_of};
     type S = super::dev_ns::PPCMacGPUState;
     assert!(offset_of!(S, pci) == 0);
+    assert!(size_of::<qom::ParentField<pci::PCIDevice>>() == 2768);
     assert!(size_of::<super::dev_ns::PCIDevice>() == 2768);
     assert!(size_of::<S>() >= size_of::<super::dev_ns::PCIDevice>());
     assert!(align_of::<S>() >= align_of::<super::dev_ns::PCIDevice>());
 };
+
+/// The raw C `PCIDevice` inside the QOM parent field, for the C-style helpers in this file.
+///
+/// Takes the field (not the whole device) so callers can keep borrowing other fields at the same time.
+pub fn pci_raw(parent: &mut qom::ParentField<pci::PCIDevice>) -> &mut super::dev_ns::PCIDevice {
+    // SAFETY: `pci::PCIDevice` is a transparent wrapper around the C PCIDevice, and `parent` is a live,
+    // exclusively borrowed instance field.
+    unsafe { &mut *parent.as_mut_ptr() }
+}
+
+/// Shared-borrow counterpart of [`pci_raw`].
+pub fn pci_raw_ref(parent: &qom::ParentField<pci::PCIDevice>) -> &super::dev_ns::PCIDevice {
+    // SAFETY: as in `pci_raw`; only read through the returned reference.
+    unsafe { &*parent.as_ptr() }
+}
 
 // PPCMacGPUState is a QOM object whose parent is `pci-device` and whose first field is the PCIDevice
 // (asserted above), so QEMU's `qom` and `pci` crates can treat it as one: this is what lets the safe
@@ -2085,6 +2101,28 @@ pub fn class_add_trace_property(
     unsafe { super::dev_ns::object_class_property_add_str(klass, c"trace".as_ptr(), get, set) };
 }
 
+/// The `ati-radeon-9700` companion type: the same device with the 9700's PCI revision.  It adds no
+/// fields, so it is a transparent wrapper and shares the parent's instance and class size.
+#[repr(transparent)]
+pub struct AtiRadeon9700(super::dev_ns::PPCMacGPUState);
+
+// SAFETY: transparent over PPCMacGPUState, whose first field is the PCIDevice; "ati-radeon-9700" is
+// registered with "ppc-mac-gpu" as its parent.
+unsafe impl qom::ObjectType for AtiRadeon9700 {
+    type Class = super::dev_ns::PCIDeviceClass;
+    const TYPE_NAME: &'static CStr = c"ati-radeon-9700";
+}
+qom::qom_isa!(AtiRadeon9700: super::dev_ns::PPCMacGPUState, pci::PCIDevice, hwcore::DeviceState, qom::Object);
+
+impl qom::ObjectImpl for AtiRadeon9700 {
+    type ParentType = super::dev_ns::PPCMacGPUState;
+    const CLASS_INIT: fn(&mut super::dev_ns::PCIDeviceClass) = |k| {
+        use pci::PCIDeviceClassIds;
+        k.set_device_id(0x4e44);
+        k.set_revision(0);
+    };
+}
+
 /// Registers the device type and its companion type with QOM (`type_register_static`).
 pub fn register_device_types() {
     // The interface list is only read during registration (QOM copies the names), so a local array is fine.
@@ -2098,7 +2136,8 @@ pub fn register_device_types() {
     // during registration.
     unsafe {
         super::dev_ns::type_register_static(&raw const info);
-        super::dev_ns::type_register_static(&raw const super::dev_ns::ati_radeon_9700_type_info);
+        let companion = <AtiRadeon9700 as qom::ObjectImpl>::TYPE_INFO;
+        super::dev_ns::type_register_static(&raw const companion);
     }
 }
 
