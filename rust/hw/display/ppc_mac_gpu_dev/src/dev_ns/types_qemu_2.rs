@@ -1,5 +1,4 @@
 use super::*;
-#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct VGACommonState {
     pub legacy_address_space: *mut MemoryRegion,

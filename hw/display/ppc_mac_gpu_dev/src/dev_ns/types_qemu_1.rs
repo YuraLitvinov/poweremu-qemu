@@ -4,7 +4,11 @@ pub use hwcore_sys::{DeviceClass, DeviceState};
 pub use pci_sys::{PCIDevice, PCIDeviceClass};
 pub use qom_sys::{InterfaceInfo, Object, ObjectClass, TypeInfo};
 pub use migration_sys::{VMStateDescription, VMStateField, VMStateFlags, VMStateInfo, VMStateStructMember};
-pub use util_sys::Error;
+pub use util_sys::{Error, QEMUTimer};
+pub use system_sys::{
+    AddressSpace, AddressSpaceMapClient, FlatView, MemoryListener, MemoryRegion, MemoryRegionOps, MemoryRegionSection,
+    NotifyRamDiscard, NotifyRamPopulate, RamDiscardListener, RamDiscardManager, RamDiscardSourceEntry,
+};
 pub type __int128_t = i128;
 pub type __builtin_va_list = [__va_list_tag; 1];
 #[derive(Copy, Clone)]
@@ -173,31 +177,8 @@ pub struct _GString {
 pub type GString = _GString;
 #[derive(Copy, Clone)]
 #[repr(C)]
-pub struct AddressSpace {
-    pub rcu: rcu_head,
-    pub name: *mut ::core::ffi::c_char,
-    pub root: *mut MemoryRegion,
-    pub current_map: *mut FlatView,
-    pub ioeventfd_nb: ::core::ffi::c_int,
-    pub ioeventfd_notifiers: ::core::ffi::c_int,
-    pub ioeventfds: *mut MemoryRegionIoeventfd,
-    pub listeners: C2RustUnnamed_3,
-    pub address_spaces_link: C2RustUnnamed_2,
-    pub max_bounce_buffer_size: size_t,
-    pub bounce_buffer_size: size_t,
-    pub map_client_list_lock: QemuMutex,
-    pub map_client_list: C2RustUnnamed_0,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
 pub struct C2RustUnnamed_0 {
     pub lh_first: *mut AddressSpaceMapClient,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct AddressSpaceMapClient {
-    pub bh: *mut QEMUBH,
-    pub link: C2RustUnnamed_1,
 }
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -231,71 +212,6 @@ pub union C2RustUnnamed_3 {
 }
 #[derive(Copy, Clone)]
 #[repr(C)]
-pub struct MemoryListener {
-    pub begin: Option<unsafe extern "C" fn(*mut MemoryListener) -> ()>,
-    pub commit: Option<unsafe extern "C" fn(*mut MemoryListener) -> ()>,
-    pub region_add:
-        Option<unsafe extern "C" fn(*mut MemoryListener, *mut MemoryRegionSection) -> ()>,
-    pub region_del:
-        Option<unsafe extern "C" fn(*mut MemoryListener, *mut MemoryRegionSection) -> ()>,
-    pub region_nop:
-        Option<unsafe extern "C" fn(*mut MemoryListener, *mut MemoryRegionSection) -> ()>,
-    pub log_start: Option<
-        unsafe extern "C" fn(
-            *mut MemoryListener,
-            *mut MemoryRegionSection,
-            ::core::ffi::c_int,
-            ::core::ffi::c_int,
-        ) -> (),
-    >,
-    pub log_stop: Option<
-        unsafe extern "C" fn(
-            *mut MemoryListener,
-            *mut MemoryRegionSection,
-            ::core::ffi::c_int,
-            ::core::ffi::c_int,
-        ) -> (),
-    >,
-    pub log_sync: Option<unsafe extern "C" fn(*mut MemoryListener, *mut MemoryRegionSection) -> ()>,
-    pub log_sync_global: Option<unsafe extern "C" fn(*mut MemoryListener, bool) -> ()>,
-    pub log_clear:
-        Option<unsafe extern "C" fn(*mut MemoryListener, *mut MemoryRegionSection) -> ()>,
-    pub log_global_start:
-        Option<unsafe extern "C" fn(*mut MemoryListener, *mut *mut Error) -> bool>,
-    pub log_global_stop: Option<unsafe extern "C" fn(*mut MemoryListener) -> ()>,
-    pub log_global_after_sync: Option<unsafe extern "C" fn(*mut MemoryListener) -> ()>,
-    pub eventfd_add: Option<
-        unsafe extern "C" fn(
-            *mut MemoryListener,
-            *mut MemoryRegionSection,
-            bool,
-            uint64_t,
-            *mut EventNotifier,
-        ) -> (),
-    >,
-    pub eventfd_del: Option<
-        unsafe extern "C" fn(
-            *mut MemoryListener,
-            *mut MemoryRegionSection,
-            bool,
-            uint64_t,
-            *mut EventNotifier,
-        ) -> (),
-    >,
-    pub coalesced_io_add: Option<
-        unsafe extern "C" fn(*mut MemoryListener, *mut MemoryRegionSection, hwaddr, hwaddr) -> (),
-    >,
-    pub coalesced_io_del: Option<
-        unsafe extern "C" fn(*mut MemoryListener, *mut MemoryRegionSection, hwaddr, hwaddr) -> (),
-    >,
-    pub priority: ::core::ffi::c_uint,
-    pub name: *const ::core::ffi::c_char,
-    pub address_space: *mut AddressSpace,
-    pub link: C2RustUnnamed_5,
-    pub link_as: C2RustUnnamed_4,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
 pub union C2RustUnnamed_4 {
     pub tqe_next: *mut MemoryListener,
     pub tqe_circ: QTailQLink,
@@ -315,113 +231,14 @@ const _: () = {
 };
 #[derive(Copy, Clone)]
 #[repr(C)]
-pub struct MemoryRegionSection {
-    pub size: Int128,
-    pub mr: *mut MemoryRegion,
-    pub fv: *mut FlatView,
-    pub offset_within_region: hwaddr,
-    pub offset_within_address_space: hwaddr,
-    pub readonly: bool,
-    pub nonvolatile: bool,
-    pub unmergeable: bool,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct FlatView {
-    pub rcu: rcu_head,
-    pub ref_0: ::core::ffi::c_uint,
-    pub ranges: *mut FlatRange,
-    pub nr: ::core::ffi::c_uint,
-    pub nr_allocated: ::core::ffi::c_uint,
-    pub dispatch: *mut AddressSpaceDispatch,
-    pub root: *mut MemoryRegion,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct MemoryRegion {
-    pub parent_obj: Object,
-    pub romd_mode: bool,
-    pub ram: bool,
-    pub subpage: bool,
-    pub readonly: bool,
-    pub nonvolatile: bool,
-    pub rom_device: bool,
-    pub flush_coalesced_mmio: bool,
-    pub lockless_io: bool,
-    pub unmergeable: bool,
-    pub dirty_log_mask: uint8_t,
-    pub is_iommu: bool,
-    pub ram_block: *mut RAMBlock,
-    pub owner: *mut Object,
-    pub dev: *mut DeviceState,
-    pub ops: *const MemoryRegionOps,
-    pub opaque: *mut ::core::ffi::c_void,
-    pub container: *mut MemoryRegion,
-    pub mapped_via_alias: ::core::ffi::c_int,
-    pub size: Int128,
-    pub addr: hwaddr,
-    pub destructor: Option<unsafe extern "C" fn(*mut MemoryRegion) -> ()>,
-    pub align: uint64_t,
-    pub terminates: bool,
-    pub ram_device: bool,
-    pub enabled: bool,
-    pub vga_logging_count: uint8_t,
-    pub alias: *mut MemoryRegion,
-    pub alias_offset: hwaddr,
-    pub priority: int32_t,
-    pub subregions: C2RustUnnamed_12,
-    pub subregions_link: C2RustUnnamed_11,
-    pub coalesced: C2RustUnnamed_10,
-    pub name: *const ::core::ffi::c_char,
-    pub ioeventfd_nb: ::core::ffi::c_uint,
-    pub ioeventfds: *mut MemoryRegionIoeventfd,
-    pub rdm: *mut RamDiscardManager,
-    pub disable_reentrancy_guard: bool,
-    pub ram_device_skip_iommu_map: bool,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct RamDiscardManager {
-    pub parent: Object,
-    pub mr: *mut MemoryRegion,
-    pub source_list: C2RustUnnamed_8,
-    pub min_granularity: uint64_t,
-    pub rdl_list: C2RustUnnamed_6,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
 pub struct C2RustUnnamed_6 {
     pub lh_first: *mut RamDiscardListener,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct RamDiscardListener {
-    pub notify_populate: NotifyRamPopulate,
-    pub notify_discard: NotifyRamDiscard,
-    pub section: *mut MemoryRegionSection,
-    pub next: C2RustUnnamed_7,
 }
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct C2RustUnnamed_7 {
     pub le_next: *mut RamDiscardListener,
     pub le_prev: *mut *mut RamDiscardListener,
-}
-pub type NotifyRamDiscard =
-    Option<unsafe extern "C" fn(*mut RamDiscardListener, *const MemoryRegionSection) -> ()>;
-pub type NotifyRamPopulate = Option<
-    unsafe extern "C" fn(*mut RamDiscardListener, *const MemoryRegionSection) -> ::core::ffi::c_int,
->;
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct C2RustUnnamed_8 {
-    pub lh_first: *mut RamDiscardSourceEntry,
-}
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct RamDiscardSourceEntry {
-    pub rds: *mut RamDiscardSource,
-    pub next: C2RustUnnamed_9,
 }
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -451,37 +268,6 @@ pub union C2RustUnnamed_12 {
     pub tqh_circ: QTailQLink,
 }
 pub type Int128 = __int128_t;
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct MemoryRegionOps {
-    pub read: Option<
-        unsafe extern "C" fn(*mut ::core::ffi::c_void, hwaddr, ::core::ffi::c_uint) -> uint64_t,
-    >,
-    pub write: Option<
-        unsafe extern "C" fn(*mut ::core::ffi::c_void, hwaddr, uint64_t, ::core::ffi::c_uint) -> (),
-    >,
-    pub read_with_attrs: Option<
-        unsafe extern "C" fn(
-            *mut ::core::ffi::c_void,
-            hwaddr,
-            *mut uint64_t,
-            ::core::ffi::c_uint,
-            MemTxAttrs,
-        ) -> MemTxResult,
-    >,
-    pub write_with_attrs: Option<
-        unsafe extern "C" fn(
-            *mut ::core::ffi::c_void,
-            hwaddr,
-            uint64_t,
-            ::core::ffi::c_uint,
-            MemTxAttrs,
-        ) -> MemTxResult,
-    >,
-    pub endianness: device_endian,
-    pub valid: C2RustUnnamed_14,
-    pub impl_0: C2RustUnnamed_13,
-}
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct C2RustUnnamed_13 {
@@ -1758,17 +1544,6 @@ pub const PCI_REQ_ID_MAX: PCIReqIDType = 3;
 pub const PCI_REQ_ID_SECONDARY_BUS: PCIReqIDType = 2;
 pub const PCI_REQ_ID_BDF: PCIReqIDType = 1;
 pub const PCI_REQ_ID_INVALID: PCIReqIDType = 0;
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct QEMUTimer {
-    pub expire_time: int64_t,
-    pub timer_list: *mut QEMUTimerList,
-    pub cb: Option<QEMUTimerCB>,
-    pub opaque: *mut ::core::ffi::c_void,
-    pub next: *mut QEMUTimer,
-    pub attributes: ::core::ffi::c_int,
-    pub scale: ::core::ffi::c_int,
-}
 pub type QEMUTimerCB = unsafe extern "C" fn(*mut ::core::ffi::c_void) -> ();
 pub type module_init_type = ::core::ffi::c_uint;
 pub const MODULE_INIT_MAX: module_init_type = 9;

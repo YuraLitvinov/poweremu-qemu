@@ -20,5 +20,6 @@ hwcore-sys = { path = "../../../bindings/hwcore-sys" }
 qom-sys = { path = "../../../bindings/qom-sys" }
 migration-sys = { path = "../../../bindings/migration-sys" }
 util-sys = { path = "../../../bindings/util-sys" }
+system-sys = { path = "../../../bindings/system-sys" }
 display-sys = { path = "../../../bindings/display-sys" }
 ash = "0.37"

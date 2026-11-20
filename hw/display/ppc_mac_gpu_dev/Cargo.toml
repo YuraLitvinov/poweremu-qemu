@@ -22,6 +22,7 @@ hwcore-sys = { path = "../../../rust/bindings/hwcore-sys" }
 qom-sys = { path = "../../../rust/bindings/qom-sys" }
 migration-sys = { path = "../../../rust/bindings/migration-sys" }
 util-sys = { path = "../../../rust/bindings/util-sys" }
+system-sys = { path = "../../../rust/bindings/system-sys" }
 display-sys = { path = "../../../rust/bindings/display-sys" }
 ash = "0.37"
 

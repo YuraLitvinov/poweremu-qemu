@@ -217,6 +217,18 @@ pub fn pci_raw_ref(parent: &qom::ParentField<pci::PCIDevice>) -> &super::dev_ns:
     unsafe { &*parent.as_ptr() }
 }
 
+// Sizes of the QEMU structs the device embeds or allocates, from a C program built against the same
+// headers (sizeof in system/memory.h and qemu/timer.h).  They come from QEMU's bindgen crates now, so a
+// QEMU change that moves them fails the build here instead of corrupting the device state.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<super::dev_ns::MemoryRegion>() == 272);
+    assert!(size_of::<super::dev_ns::AddressSpace>() == 160);
+    assert!(size_of::<super::dev_ns::MemoryRegionOps>() == 80);
+    assert!(size_of::<super::dev_ns::QEMUTimer>() == 48);
+    assert!(size_of::<super::dev_ns::MemoryRegionSection>() == 64);
+};
+
 // PPCMacGPUState is a QOM object whose parent is `pci-device` and whose first field is the PCIDevice
 // (asserted above), so QEMU's `qom` and `pci` crates can treat it as one: this is what lets the safe
 // `PCIDeviceMethods` (add_capability, config accessors, ...) be called on the device.

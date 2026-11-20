@@ -112,14 +112,14 @@ pub static ppc_mac_gpu_vga_bank_ops: MemoryRegionOps = unsafe {
         ),
         read_with_attrs: None,
         write_with_attrs: None,
-        endianness: DEVICE_LITTLE_ENDIAN,
-        valid: C2RustUnnamed_14 {
+        endianness: system_sys::device_endian::DEVICE_LITTLE_ENDIAN,
+        valid: system_sys::MemoryRegionOps__bindgen_ty_1 {
             min_access_size: 1 as ::core::ffi::c_uint,
             max_access_size: 4 as ::core::ffi::c_uint,
             unaligned: false,
             accepts: None,
         },
-        impl_0: C2RustUnnamed_13 {
+        impl_: system_sys::MemoryRegionOps__bindgen_ty_2 {
             min_access_size: 1 as ::core::ffi::c_uint,
             max_access_size: 4 as ::core::ffi::c_uint,
             unaligned: false,
@@ -613,14 +613,14 @@ pub static ppc_mac_gpu_mmio_ops: MemoryRegionOps = unsafe {
         ),
         read_with_attrs: None,
         write_with_attrs: None,
-        endianness: DEVICE_LITTLE_ENDIAN,
-        valid: C2RustUnnamed_14 {
+        endianness: system_sys::device_endian::DEVICE_LITTLE_ENDIAN,
+        valid: system_sys::MemoryRegionOps__bindgen_ty_1 {
             min_access_size: 1 as ::core::ffi::c_uint,
             max_access_size: 4 as ::core::ffi::c_uint,
             unaligned: false,
             accepts: None,
         },
-        impl_0: C2RustUnnamed_13 {
+        impl_: system_sys::MemoryRegionOps__bindgen_ty_2 {
             min_access_size: 1 as ::core::ffi::c_uint,
             max_access_size: 4 as ::core::ffi::c_uint,
             unaligned: false,
@@ -649,14 +649,14 @@ pub static r300_watch_ops: MemoryRegionOps = unsafe {
         ),
         read_with_attrs: None,
         write_with_attrs: None,
-        endianness: DEVICE_BIG_ENDIAN,
-        valid: C2RustUnnamed_14 {
+        endianness: system_sys::device_endian::DEVICE_BIG_ENDIAN,
+        valid: system_sys::MemoryRegionOps__bindgen_ty_1 {
             min_access_size: 1 as ::core::ffi::c_uint,
             max_access_size: 8 as ::core::ffi::c_uint,
             unaligned: false,
             accepts: None,
         },
-        impl_0: C2RustUnnamed_13 {
+        impl_: system_sys::MemoryRegionOps__bindgen_ty_2 {
             min_access_size: 1 as ::core::ffi::c_uint,
             max_access_size: 8 as ::core::ffi::c_uint,
             unaligned: false,
