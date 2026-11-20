@@ -14,6 +14,11 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 r300 = { path = "../r300_rs" }
 system = { path = "../../../rust/system" }
+qom = { path = "../../../rust/qom" }
+pci = { path = "../../../rust/hw/pci" }
+hwcore = { path = "../../../rust/hw/core" }
+pci-sys = { path = "../../../rust/bindings/pci-sys" }
+display-sys = { path = "../../../rust/bindings/display-sys" }
 ash = "0.37"
 
 # The C types (renderer vtable, R300 draw packet, uniforms, ...) are

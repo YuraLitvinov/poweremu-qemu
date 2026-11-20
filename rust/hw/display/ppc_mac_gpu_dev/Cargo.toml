@@ -12,4 +12,9 @@ path = "lib.rs"
 [dependencies]
 r300 = { path = "../r300" }
 system = { path = "../../../system" }
+qom = { path = "../../../qom" }
+pci = { path = "../../../hw/pci" }
+hwcore = { path = "../../../hw/core" }
+pci-sys = { path = "../../../bindings/pci-sys" }
+display-sys = { path = "../../../bindings/display-sys" }
 ash = "0.37"
