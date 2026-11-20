@@ -6,6 +6,8 @@ members = [
     "rust/hw/display/r300",
     "rust/hw/timer/hpet",
     "rust/tests",
+    "rust/bindings/display-sys",
+    "rust/bindings/pci-sys",
 ]
 
 [workspace.package]

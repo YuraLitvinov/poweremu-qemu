@@ -8,6 +8,8 @@ bindgen_dirs = [
   'chardev-sys',
   'hwcore-sys',
   'system-sys',
+  'display-sys',
+  'pci-sys',
 ]
 bindgen_args_file = configure_file(
   command: [files('generate_bindgen_args.py'),
@@ -35,3 +37,5 @@ subdir('qom-sys')
 subdir('chardev-sys')
 subdir('hwcore-sys')
 subdir('system-sys')
+subdir('display-sys')
+subdir('pci-sys')
